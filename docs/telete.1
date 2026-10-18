@@ -607,6 +607,20 @@ It does not authorize another launch under the same execution identity.
 Use the Telete version that owns existing runtime state.
 Incompatible runtime schemas are rejected; Telete does not automatically migrate
 active queues.
+.SH PROJECT USAGE
+We assume projects use Telete through an agent.
+Add guidance like this to the project's
+.BR AGENTS.md :
+.PP
+.RS
+Read the
+.BR telete (1)
+manual before using Telete.
+Use Telete to submit CI runs and create worktrees for code changes.
+Clean up those worktrees after successful completion.
+While Telete is running, set a 3-minute heartbeat, if available, to monitor
+actionable emissions from the queue.
+.RE
 .SH EXAMPLES
 Configure a repository with an executable, committed
 .B ci/check.sh
