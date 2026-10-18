@@ -4,10 +4,18 @@ Do not overcomplicate or overarchitect things.
 
 Telete runs a serial queue for committed repository workflows on macOS. Every
 public command selects a project config. The config owns the source repository,
-commands, parameters, and initial runtime path. Worktree creation binds the Git
-common directory to one runtime path; all linked worktrees and configs then use
-that shared queue. Create private runtime state on demand; no init command or
-pre-existing state is required.
+commands, parameters, and initial runtime path. The first queue mutation binds
+the Git common directory to one runtime path; all linked worktrees and configs
+then use that shared queue. Worktree creation only creates a Git branch and
+worktree; it does not inspect or change queue state. Create private runtime state
+on demand; no init command or pre-existing state is required.
+
+Telete manages worker startup and shutdown. Submission runs in the background;
+following only observes work, and interrupting observation does not cancel it.
+Keep one worker while unfinished work exists, including paused or blocked work,
+and stop it after settlement and cleanup. Users do not manage a worker lifecycle.
+A private supervisor restarts its worker; losing that supervisor or restarting
+the machine requires a later queue mutation to arrange execution again.
 
 Run the selected committed revision directly, defaulting to HEAD resolved at
 submission. Do not add integration, accepted baselines, source acceptance, or

@@ -1,4 +1,4 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.1.1" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.2.0" "General Commands Manual"
 .SH NAME
 telete \- run a serial queue of committed repository workflows
 .SH SYNOPSIS
@@ -30,17 +30,20 @@ Later changes to HEAD or the configuration do not alter a submitted job.
 Telete runs the selected commit directly; it does not merge source or update
 project branches.
 .PP
-Submission queues work; a separately started foreground worker executes it.
+Submission queues work and arranges background execution.
+Telete manages the worker while unfinished work exists and stops it after
+settlement and cleanup.
 No initialization command or pre-existing runtime directory is required.
-Mutating commands create private runtime state on demand.
+Queue mutations create private runtime state on demand.
 Every operation must select a project configuration, including when inspecting
 an existing queue.
 Help and version requests do not require a configuration.
 .PP
-Creating a development worktree binds the Git common directory to one queue.
+The first queue mutation binds the Git common directory to one queue.
 The original checkout, every linked worktree, and alternate configurations then
 share that queue, including worktrees created directly with Git.
 Separate clones retain independent queues.
+Creating a development worktree does not inspect or change queue state.
 .SH INSTALLATION
 From this repository, run:
 .PP
@@ -87,7 +90,6 @@ Its workflow runs
 and then
 .B ci/install.sh
 from the submitted commit, installing only after checks succeed.
-Restart running workers to use an upgraded executable.
 See RECOVERY for runtime version compatibility.
 .SS Release versions
 .B Cargo.toml
@@ -138,18 +140,17 @@ The branch name is the normalized destination's last path component, which
 must be a valid literal Git branch name.
 An existing destination or branch is an error; no existing worktree is adopted.
 Uncommitted changes remain in the source checkout.
-This command neither submits work nor starts a worker.
+This command uses Git alone.
+It does not submit work, inspect runtime state, bind a queue, or coordinate with
+a worker.
 The result includes the absolute
 .BR path ,
 new
 .BR branch ,
-full
-.BR commit ,
-and shared runtime
-.BR state .
-See SHARED QUEUE for queue binding and failure behavior.
+and full
+.BR commit .
 .TP
-.B submit \fR[\fIrevision\fR]
+.B submit \fR[\fIrevision\fR] [\fB\-\-follow\fR]
 Queue a new job for a Git revision that resolves to a local commit.
 The default is HEAD.
 The result includes the job's
@@ -161,7 +162,20 @@ Before reporting success, Telete retains the commit and creates its private
 execution checkout.
 Removing the submitting linked worktree does not change this retained source;
 the shared Git repository and runtime must remain available.
-It does not start a worker or wait for completion.
+Submission arranges background execution without waiting for completion.
+The job receipt is printed before following.
+If worker startup fails after admission, the receipt includes
+.B worker_error
+and the command reports an error with a nonzero exit status.
+The job remains admitted; inspect it using the returned ID rather than
+submitting it again.
+With
+.BR \-\-follow ,
+also observe the submitted job until it succeeds, fails, is cancelled, or
+becomes blocked.
+A second JSON result reports that observation.
+Press Ctrl-C to stop following without cancelling the job.
+Closing the observing terminal does not stop the managed worker.
 .TP
 .B status \fR[\fIjob\fR]
 Display the queue, active job, retained failure, settled-job markers, operator
@@ -172,9 +186,11 @@ An unavailable or pruned job is an operation error.
 .BI "wait " "job " "\fR[\fB\-\-timeout \fIseconds\fR]"
 Observe a job until it succeeds, fails, is cancelled, becomes blocked, or the
 observation times out.
-The timeout is a positive integer number of seconds; the default is 60.
+The timeout is a positive integer number of seconds.
+By default, observation has no timeout.
 This timeout limits observation, not execution.
 The command does not advance work or cancel the job.
+Press Ctrl-C to stop observing without cancelling the job.
 The result has
 .B observation
 set to
@@ -190,12 +206,14 @@ Inspect the result to determine workflow success; see EXIT STATUS.
 .B pause
 Prevent the worker from claiming new jobs.
 Submissions are still accepted, and an already active job can continue.
-Pausing does not stop the worker or drain the queue.
+Pausing does not drain the queue.
+The managed worker waits while new claims are prevented.
 .TP
 .B resume
 Clear the operator pause.
 Claims remain prevented while any maintenance hold exists.
 An unresolved active job must be recovered before resuming.
+Eligible work continues automatically without a worker restart.
 .TP
 .BI "cancel " job
 Request cancellation at a safe boundary.
@@ -209,22 +227,11 @@ resolve uncertain work.
 Reconcile a blocked job using its retained command, context, and terminal
 process evidence.
 Only blocked jobs can be recovered.
-Stop the foreground worker before invoking this command; recovery requires
-exclusive worker ownership.
-Stopping the worker may leave an admitted command running; wait for its
-execution ownership to clear before recovery.
+Telete coordinates the exclusive ownership needed for recovery with its managed
+worker.
 Recovery fails if matching terminal evidence is unavailable.
 It does not repeat an uncertain command.
-Run the worker afterward to continue remaining work.
-.TP
-.B worker \fR[\fB\-\-once\fR]
-Run the foreground queue worker until stopped or an operation error occurs.
-Only one worker can own a queue at a time.
-With
-.BR \-\-once ,
-advance one lifecycle tick and print the resulting job or idle state.
-A tick may run a selected stage to completion; it does not necessarily finish
-the entire job.
+Remaining eligible work continues automatically after successful recovery.
 .TP
 .BI "maintenance hold \-\-owner " owner
 Add a maintenance hold preventing new claims.
@@ -248,6 +255,8 @@ Release the named hold.
 Releasing an absent owner is harmless.
 Release only the owner acquired by the maintenance operation.
 This command does not clear operator pause or resolve interrupted work.
+Eligible work continues automatically when no remaining hold or pause prevents
+claims.
 .TP
 .B gates
 Inspect retained command execution gate records for current diagnostics.
@@ -270,8 +279,7 @@ HEAD is resolved there regardless of the invocation's current directory.
 .TP
 .B state
 Required initial path to the private runtime directory identifying this queue.
-Until a shared queue is bound, use the same state directory for queue
-operations.
+The first queue mutation binds Git's common directory to this runtime path.
 After binding, the recorded shared runtime path takes precedence; changing this
 field cannot redirect the queue.
 A populated directory is bound to its repository and runtime path and cannot
@@ -345,9 +353,8 @@ On timeout, Telete terminates the command's process group and records failure.
 .PP
 Programs, arguments, and environment values cannot contain NUL.
 .SH SHARED QUEUE
-The first
-.B worktree
-invocation binds Git's common directory to the selected configuration's absolute
+The first queue mutation binds Git's common directory to the selected
+configuration's absolute
 .B state
 path, recording the private binding at
 .IR G/telete/queue.json .
@@ -355,16 +362,14 @@ Here
 .I G
 is the common Git directory shared by the original checkout and linked
 worktrees.
-Every Telete command selecting one of those checkouts then uses this runtime
+Every queue operation selecting one of those checkouts then uses this runtime
 directory, including commands using another config or a manually created
 worktree.
 Separate clones have different Git common directories and independent queues.
 .PP
-Initial binding requires exclusive repository selection.
-If a worker or operation is using an unbound repository, stop existing workers
-and retry after the operation finishes.
-Once bound, the repository permits worktree creation while its shared worker
-runs.
+Telete coordinates initial binding and queue ownership internally.
+Development worktree creation is independent of runtime state before and after
+binding.
 .PP
 The selected configuration still chooses the source repository, commands, and
 parameters.
@@ -382,13 +387,10 @@ holds, cancellation, recovery, diagnostics, and retention limits.
 An unresolved command blocks subsequent work from every checkout.
 Telete rejects conflicting existing runtime state instead of combining queues.
 .PP
-The queue binding can remain if Git worktree creation fails.
-Inspect the reported branch and destination before retrying; Telete does not
-remove pre-existing branches or worktrees to recover a failed creation.
 Preserve the shared Git repository, binding, and runtime directory while work
 is queued, active, or unresolved.
 If the binding survives but the runtime directory or queue database is missing,
-all operations fail and require restoration of that operational state.
+queue operations fail and require restoration of that operational state.
 Telete does not create an empty replacement queue behind an existing binding.
 .SH EXECUTION
 Stages run in this order: check, optional preparation, optional deployment.
@@ -402,8 +404,11 @@ The configured commands own their checks, output formats, credentials,
 deployment effects, and any stronger claim of domain success.
 .PP
 All stages use the same private checkout as their working directory.
-They inherit the environment at launch, with configured overrides and Telete's
-execution context.
+They inherit the managed worker's environment at launch, with configured
+overrides and Telete's execution context.
+The private supervisor inherits the environment of the invocation that starts
+it, and its workers inherit that environment.
+Later jobs joining an existing worker use that worker's environment.
 The inherited environment is not frozen with the submission or retained.
 Commands run with ordinary user permissions.
 Configure any required toolchain, caches, credentials, or environment in the
@@ -451,15 +456,28 @@ cleanup.
 Operation results are JSON on standard output.
 Operation errors are written to standard error.
 Help and version requests print text instead.
-Operation results include the effective absolute runtime directory as the
+Queue operation results include the effective absolute runtime directory as the
 top-level
 .B state_root
 field.
-The foreground worker normally runs without printing progress; inspect it
-from another terminal using
+Use
 .B status
-or
-.BR wait .
+to inspect work or
+.B wait
+to follow a job.
+Worker startup and shutdown are internal; there is no public worker command.
+One worker owns the queue while unfinished work exists, including paused,
+held, or blocked work.
+It exits after settlement and cleanup.
+Retained failure diagnostics and settled-job markers alone do not keep it
+running.
+The private supervisor restarts its worker if it exits unexpectedly while work
+remains.
+Both processes exit after settlement and cleanup.
+It is not a login service: after supervisor loss, logout, or reboot, the next
+queue mutation arranges execution again.
+Read-only observation does not restart execution.
+Restarting a worker does not authorize replay of uncertain command effects.
 .PP
 Job phases are
 .BR queued ,
@@ -479,20 +497,21 @@ Settled jobs may instead have only a small completion marker; see FILES.
 .B 0
 The requested operation completed successfully, or help or version was printed.
 This does not establish that a workflow succeeded.
-In particular,
+For
 .B wait
-returns zero for failed, cancelled, and blocked jobs and for observation
-timeout; inspect
-.B observation
 and
-.BR job.phase .
-.B worker \-\-once
-can also return zero while reporting a failed or blocked job.
+.BR "submit \-\-follow" ,
+zero means the observed job succeeded.
 .TP
 .B 1
 An operation failed, including a missing configuration selection, invalid
 configuration, unavailable job, conflicting ownership, or recovery without
 matching terminal evidence.
+For
+.B wait
+and
+.BR "submit \-\-follow" ,
+a failed, cancelled, or blocked job, or observation timeout, also uses exit 1.
 With
 .BR \-\-json ,
 the error object has
@@ -504,6 +523,12 @@ string.
 .B 2
 Invalid command-line syntax, such as an unknown option or missing required
 command argument.
+.TP
+.B 130
+Observation was interrupted with Ctrl-C.
+The submitted job remains queued or active; use
+.B cancel
+to request cancellation explicitly.
 .SH ENVIRONMENT
 .TP
 .B TELETE_CONTEXT
@@ -526,11 +551,11 @@ It is separate from runtime state.
 .TP
 .I G/telete/queue.json
 Private binding from Git's common directory to the shared runtime directory,
-created by the first worktree command.
+created by the first queue mutation.
 .TP
 .I G/telete/queue.lock
-Repository selection lock coordinating ordinary queue operations with initial
-shared binding.
+Repository selection lock coordinating queue operations with initial shared
+binding.
 This lock can exist before the queue binding is established.
 .TP
 .I state/queue.sqlite3
@@ -543,6 +568,9 @@ command output directories for a retained job.
 .TP
 .I state/broker/
 Current execution gate records and terminal process evidence.
+.TP
+.IR state/supervisor.lock ", " state/worker.json
+Private supervisor ownership and current worker diagnostics.
 .TP
 .IR state/tmp/ ", " state/deployments/ ", " state/*.lock
 Temporary files and execution coordination locks managed by Telete.
@@ -598,8 +626,9 @@ Deleting or editing evidence can prevent safe reconciliation.
 Inspect
 .BR "status job" ,
 .BR gates ,
-and retained diagnostics before stopping the worker and running
+and retained diagnostics before running
 .BR "recover job" .
+Telete coordinates recovery with its worker and resumes eligible work afterward.
 Recovery uses the saved invocation, including its context, explicit environment
 overrides, and timeout, rather than current command settings.
 It does not authorize another launch under the same execution identity.
@@ -649,7 +678,7 @@ in Git:
 .fi
 .RE
 .PP
-Submit HEAD and start the worker in the foreground.
+Submit HEAD and follow its execution.
 Omit the
 .B prepare
 and
@@ -658,8 +687,7 @@ fields for a check-only workflow:
 .PP
 .RS
 .nf
-telete \-\-config telete.json submit
-telete \-\-config telete.json worker
+telete \-\-config telete.json submit \-\-follow
 .fi
 .RE
 .PP
@@ -705,15 +733,13 @@ telete \-\-config telete.json maintenance release \-\-owner upgrade
 .fi
 .RE
 .PP
-After stopping the worker, inspect and reconcile a blocked job, then continue
-execution:
+Inspect and reconcile a blocked job; eligible work continues automatically:
 .PP
 .RS
 .nf
 telete \-\-config telete.json status JOB
 telete \-\-config telete.json gates
 telete \-\-config telete.json recover JOB
-telete \-\-config telete.json worker
 .fi
 .RE
 .SH SEE ALSO

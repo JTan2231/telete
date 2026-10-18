@@ -34,12 +34,14 @@ Build the development CLI, then run this repository's workflow:
 
 ```sh
 cargo build --locked --bin telete
-./ci.sh submit
-./ci.sh worker
+./ci.sh submit --follow
 ```
 
 `submit` defaults to the project's current `HEAD`. Supply a revision to run
-another commit. No initialization or prior runtime directory is required.
+another commit. Submission starts execution in the background; `--follow` also
+observes the job until it settles or becomes blocked. Press Ctrl-C to stop
+following without cancelling the job. No initialization or prior runtime
+directory is required.
 
 Create a development worktree and a branch named after its destination:
 
@@ -48,19 +50,23 @@ telete worktree ../feature-a --config ci/workflow.json
 ```
 
 The branch starts at the configured repository's `HEAD` when invoked. Worktree
-creation binds the repository's queue to the selected runtime directory. The
-original checkout and all linked worktrees then share that queue, including
-worktrees created with Git. Submit from each checkout using its corresponding
-config to select its own commit and workflow. Separate clones keep separate
-queues. Operation results report the effective runtime directory as `state_root`.
+creation is independent of the queue and does not create or inspect runtime
+state. The first queue mutation binds the Git common directory to the selected
+runtime directory. The original checkout and all linked worktrees then share
+that queue, including worktrees created with Git. Submit from each checkout using
+its corresponding config to select its own commit and workflow. Separate clones
+keep separate queues. Queue operation results report the effective runtime
+directory as `state_root`.
 
 The wrapper selects `ci/workflow.json`, which points to this repository and
 `.telete/`. Its check stage runs formatting, Clippy, tests, and a CLI build; its
 deployment stage runs `ci/install.sh` only after checks succeed. Both stages run
 the submitted commit. Set `TELETE_BIN` to an absolute built executable when using
 another target directory. Run `./ci.sh status` or `./ci.sh wait JOB` in another
-terminal to inspect work. `worker --once` advances one lifecycle tick, not a
-complete job.
+terminal to inspect work. `wait` follows indefinitely unless given `--timeout`.
+Use `cancel JOB` to request cancellation explicitly. Telete manages the worker
+while unfinished work exists and stops it after the queue settles and cleanup
+finishes.
 
 Before committing a release, bump its version:
 
@@ -74,12 +80,11 @@ The helper updates the package version in `Cargo.toml`, the package's lockfile
 entry, and the manual together. Minor and major bumps reset lower components.
 Review and commit the changes before submitting: deployment installs the
 committed version without bumping it. Check the installed version with
-`telete --version`. Restart running workers to use an upgrade. Use the Telete
-version that owns existing runtime state; incompatible runtime schemas are
-rejected rather than migrated automatically.
+`telete --version`. Use the Telete version that owns existing runtime state;
+incompatible runtime schemas are rejected rather than migrated automatically.
 
-For another project, run `telete --config path/to/telete.json submit` and
-`telete --config path/to/telete.json worker`. Read the
+For another project, run `telete --config path/to/telete.json submit`, optionally
+with `--follow`. Read the
 [queue contract](docs/queue-operate.md) for configuration, execution, and recovery.
 The [source layout](docs/source-layout.md) describes the standalone Rust package.
 

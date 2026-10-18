@@ -3,29 +3,27 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
     pub(crate) root: PathBuf,
-    // Prevent establishing a shared binding while an unbound operation is live.
-    repository_selection: Option<Arc<FileLock>>,
 }
 
 impl Paths {
+    pub(crate) fn discovery(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub(crate) fn selected(root: PathBuf, create: bool) -> Result<Self> {
         if let Some(config) = crate::store::probe_config(&root)? {
             ensure!(config.state_root == root, "queue state directory changed");
         }
-        let paths = Self {
-            root,
-            repository_selection: None,
-        };
+        let paths = Self::discovery(root);
         if create {
             paths.create_directories()?;
         }
@@ -38,10 +36,6 @@ impl Paths {
             "queue state directory changed"
         );
         Ok(())
-    }
-
-    pub(crate) fn retain_repository_selection(&mut self, lock: FileLock) {
-        self.repository_selection = Some(Arc::new(lock));
     }
 
     fn create_directories(&self) -> Result<()> {
@@ -141,18 +135,32 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 #[derive(Debug)]
 pub(crate) struct FileLock {
-    _file: File,
+    file: File,
+}
+
+impl FileLock {
+    /// Lifecycle owners must not leak into workflow commands.
+    pub(crate) fn close_on_exec(&self) -> Result<()> {
+        rustix::io::fcntl_setfd(&self.file, rustix::io::FdFlags::CLOEXEC)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn try_lock(path: &Path) -> Result<Option<FileLock>> {
+    match lock(path, false) {
+        Ok(owner) => Ok(Some(owner)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn lock(path: &Path, blocking: bool) -> Result<FileLock> {
-    file_lock(path, blocking, false)
-}
-
-pub(crate) fn shared_lock(path: &Path) -> Result<FileLock> {
-    file_lock(path, true, true)
-}
-
-fn file_lock(path: &Path, blocking: bool, shared: bool) -> Result<FileLock> {
     ensure_private(path.parent().context("lock has no parent")?)?;
     let file = OpenOptions::new()
         .read(true)
@@ -168,17 +176,16 @@ fn file_lock(path: &Path, blocking: bool, shared: bool) -> Result<FileLock> {
             && file.metadata()?.mode() & 0o777 == 0o600,
         "lock must be a private user-owned regular file"
     );
-    if shared {
-        FileExt::lock_shared(&file)?;
-    } else if blocking {
+    if blocking {
         file.lock_exclusive()?;
-    } else if let Err(error) = file.try_lock_exclusive() {
-        bail!("operation already owned: {}: {error}", path.display());
+    } else {
+        file.try_lock_exclusive()
+            .with_context(|| format!("operation already owned: {}", path.display()))?;
     }
     // Retain process ownership through child execution. Closing the parent's
     // descriptor does not release an inherited flock while a child holds it.
     rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())?;
-    Ok(FileLock { _file: file })
+    Ok(FileLock { file })
 }
 
 #[cfg(test)]

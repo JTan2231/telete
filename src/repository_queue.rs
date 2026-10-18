@@ -126,32 +126,39 @@ fn shared_runtime(
 pub(crate) fn select(project: &ProjectConfig, create: bool) -> Result<Paths> {
     project.workflow.validate()?;
     // Git discovery does not write process records or initialize this path.
-    let discovery = Paths::selected(project.state.clone(), false)?;
+    let discovery = Paths::discovery(project.state.clone());
     let repository = git::repository(&discovery, &project.repo)?;
     let common = git::common(&discovery, &repository)?;
+    if !create {
+        return if let Some(binding) = binding(&common)? {
+            shared_runtime(project, &repository, &common, &binding, false)
+        } else {
+            runtime(project, &project.state, &repository, &common, false, false)
+        };
+    }
+
+    // Serialize first admission across all linked worktrees and configs. The
+    // complete runtime is published before its immutable shared binding.
     let directory = metadata_directory(&common);
-    let selection = if create || paths::private_directory_exists(&directory)? {
-        Some(paths::shared_lock(&directory.join("queue.lock"))?)
-    } else {
-        None
-    };
+    let _selection = paths::lock(&directory.join("queue.lock"), true)?;
     if let Some(binding) = binding(&common)? {
-        return shared_runtime(project, &repository, &common, &binding, create);
+        return shared_runtime(project, &repository, &common, &binding, true);
     }
-    let mut selected = runtime(project, &project.state, &repository, &common, false, create)?;
-    if create && let Some(selection) = selection {
-        // A first binding must wait until old selections have finished. In
-        // particular it cannot redirect a foreground worker to another queue.
-        selected.retain_repository_selection(selection);
-    }
+    let selected = runtime(project, &project.state, &repository, &common, true, true)?;
+    store::atomic_json(
+        &directory.join("queue.json"),
+        &Binding {
+            version: 1,
+            common_git_dir: common,
+            state: selected.root.clone(),
+        },
+    )?;
     Ok(selected)
 }
 
 pub(crate) fn create_worktree(project: &ProjectConfig, target: &Path) -> Result<Value> {
-    project.workflow.validate()?;
-    let discovery = Paths::selected(project.state.clone(), false)?;
+    let discovery = Paths::discovery(project.state.clone());
     let repository = git::repository(&discovery, &project.repo)?;
-    let common = git::common(&discovery, &repository)?;
     let commit = git::commit(&discovery, &repository, "HEAD")?;
     ensure!(
         !target.as_os_str().is_empty(),
@@ -195,40 +202,13 @@ pub(crate) fn create_worktree(project: &ProjectConfig, target: &Path) -> Result<
         "worktree branch already exists or could not be checked: {branch}"
     );
 
-    let directory = metadata_directory(&common);
-    // Bound repositories never change their selection, so development
-    // worktrees can be created while their shared worker is running.
-    let existing = binding(&common)?;
-    let _selection = if existing.is_some() {
-        paths::shared_lock(&directory.join("queue.lock"))?
-    } else {
-        paths::lock(&directory.join("queue.lock"), false)
-            .context("cannot establish shared queue while an unbound operation is active; stop existing workers and retry")?
-    };
-    let paths = if let Some(binding) = binding(&common)? {
-        shared_runtime(project, &repository, &common, &binding, true)?
-    } else {
-        let selected = runtime(project, &project.state, &repository, &common, true, true)?;
-        store::atomic_json(
-            &directory.join("queue.json"),
-            &Binding {
-                version: 1,
-                common_git_dir: common,
-                state: selected.root.clone(),
-            },
-        )?;
-        selected
-    };
     git::value(
-        &paths,
+        &discovery,
         &repository,
         &["worktree", "add", "-b", branch, destination, &commit.0],
     ).with_context(|| format!(
-        "worktree creation failed; shared queue remains at {}; inspect branch {branch} and destination {} for partial Git creation before retrying",
-        paths.root.display(), target.display()
+        "worktree creation failed; inspect branch {branch} and destination {} for partial Git creation before retrying",
+        target.display()
     ))?;
-    Ok(
-        json!({"path":target,"branch":branch,"commit":commit,"state":paths.root,
-        "state_root":paths.root}),
-    )
+    Ok(json!({"path":target,"branch":branch,"commit":commit}))
 }

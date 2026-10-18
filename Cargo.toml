@@ -1,6 +1,6 @@
 [package]
 name = "telete"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -23,7 +23,7 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.20"
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53", features = ["macros", "rt", "signal", "time"] }
 uuid = { version = "1.18", features = ["v7"] }
 
 [lints.rust]

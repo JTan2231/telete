@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -46,6 +47,43 @@ impl Project {
             .args(["--json", "--config", "telete.json"])
             .args(args);
         command
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        // Assertions must not leave detached workers behind after their
+        // temporary repository disappears.
+        let Ok(status) = checked_json(self.command(&["status"])) else {
+            return;
+        };
+        let mut ids = status["queue"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|job| job["id"].as_str())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if let Some(id) = status["active"]["id"].as_str() {
+            ids.push(id.to_owned());
+        }
+        for id in ids {
+            let _ = checked(self.command(&["cancel", &id]));
+        }
+        for owner in status["maintenance_owners"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let _ = checked(self.command(&["maintenance", "release", "--owner", owner]));
+        }
+        if status["paused"] == true {
+            let _ = checked(self.command(&["resume"]));
+        }
+        if let Some(state) = status["state_root"].as_str() {
+            let _ = wait_for_worker_ownership(Path::new(state), false);
+        }
     }
 }
 
@@ -172,56 +210,88 @@ fn commit_source(worktree: &Path, source: &str) -> TestResult<String> {
 }
 
 fn finish_jobs(directory: &Path, config: &Path, ids: &[String]) -> TestResult {
-    for _ in 0..48 {
-        checked(configured_command(directory, config, &["worker", "--once"]))?;
-        let status = checked_json(configured_command(directory, config, &["status"]))?;
-        let succeeded = ids.iter().all(|id| {
-            status["completions"].as_array().is_some_and(|jobs| {
-                jobs.iter()
-                    .any(|job| job["id"] == *id && job["phase"] == "succeeded")
-            })
-        });
-        if succeeded {
-            return Ok(());
-        }
-        if !status["failure"].is_null() {
-            return Err(format!("workflow failed: {}", status["failure"]).into());
-        }
+    for id in ids {
+        let result = checked_json(configured_command(directory, config, &["wait", id]))?;
+        assert_eq!(result["observation"], "terminal");
+        assert_eq!(result["job"]["phase"], "succeeded");
     }
-    Err("shared queue did not finish successfully".into())
+    Ok(())
 }
 
-struct RunningWorker(Child);
-
-impl Drop for RunningWorker {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_worker(worker: &mut RunningWorker, state: &Path) -> TestResult {
+fn wait_for_worker_ownership(state: &Path, expected: bool) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Some(status) = worker.0.try_wait()? {
-            return Err(format!("foreground worker exited early: {status}").into());
-        }
-        match fs::OpenOptions::new()
+        let owned = match fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(state.join("worker.lock"))
+            .open(state.join("supervisor.lock"))
         {
             Ok(lock) => match lock.try_lock_exclusive() {
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
                 Err(error) => return Err(error.into()),
-                Ok(()) => FileExt::unlock(&lock)?,
+                Ok(()) => {
+                    FileExt::unlock(&lock)?;
+                    false
+                }
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
+        };
+        if owned == expected {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    Err("foreground worker did not acquire its ownership lock".into())
+    Err(format!("worker ownership did not become {expected}").into())
+}
+
+fn wait_for_file(path: &Path) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(format!("file was not created: {}", path.display()).into())
+}
+
+fn wait_for_worker_pid(state: &Path, previous: Option<i32>) -> TestResult<i32> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(bytes) = fs::read(state.join("worker.json"))
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && let Some(pid) = value["worker_pid"].as_i64()
+        {
+            let pid = i32::try_from(pid)?;
+            if Some(pid) != previous {
+                return Ok(pid);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("supervisor did not identify a new running worker".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn gated_workflow(project: &Project) -> TestResult {
+    fs::write(
+        project.root.join("telete.json"),
+        serde_json::to_vec(&json!({
+            "repo": "repo", "state": "state", "check": {
+                "program": "/bin/sh",
+                "args": ["-c", "set -eu; printf 'started\\n' >> \"$STARTED\"; while [ ! -e \"$RELEASE\" ]; do sleep 0.05; done; printf finished > \"$FINISHED\""],
+                "env": {
+                    "STARTED": project.root.join("started"),
+                    "RELEASE": project.root.join("release"),
+                    "FINISHED": project.root.join("finished")
+                },
+                "timeout_seconds": 15
+            }
+        }))?,
+    )?;
+    Ok(())
 }
 
 #[test]
@@ -236,19 +306,11 @@ fn cold_project_runs_head_and_keeps_only_success_marker() -> TestResult {
     assert!(submitted.contains(&format!("\"commit\":\"{}\"", project.commit)));
     assert!(submitted.contains("\"phase\":\"queued\""));
 
-    let mut succeeded = false;
-    for _ in 0..8 {
-        let result = checked(project.command(&["worker", "--once"]))?;
-        if result.contains("\"phase\":\"succeeded\"") {
-            succeeded = true;
-            break;
-        }
-    }
-    assert!(succeeded, "workflow did not finish successfully");
-
-    let result = checked(project.command(&["wait", id, "--timeout", "1"]))?;
+    let result = checked(project.command(&["wait", id]))?;
     assert!(result.contains("\"observation\":\"terminal\""));
     assert!(result.contains("\"phase\":\"succeeded\""));
+    wait_for_worker_ownership(&project.state, false)?;
+    let result = checked(project.command(&["status", id]))?;
     assert!(!result.contains("\"commit\""));
     assert!(!result.contains("\"command\""));
     assert!(!project.state.join("jobs").join(id).exists());
@@ -296,6 +358,8 @@ fn configured_repository_wins_over_ambient_git_selectors() -> TestResult {
         .trim()
         .is_empty()
     );
+    checked(project.command(&["wait", job_id(&submitted)?]))?;
+    wait_for_worker_ownership(&project.state, false)?;
     Ok(())
 }
 
@@ -324,19 +388,19 @@ fn concurrent_first_submissions_publish_one_complete_queue() -> TestResult {
         assert!(ids.insert(job_id(&submitted)?.to_owned()));
     }
     assert_eq!(ids.len(), 6);
-    let status = checked(project.command(&["status"]))?;
-    assert_eq!(status.matches("\"phase\":\"queued\"").count(), 6);
-    for id in ids {
-        assert!(status.contains(&format!("\"id\":\"{id}\"")));
-    }
-    assert_eq!(
+    finish_jobs(
+        &project.root,
+        &project.root.join("telete.json"),
+        &ids.into_iter().collect::<Vec<_>>(),
+    )?;
+    wait_for_worker_ownership(&project.state, false)?;
+    assert!(
         checked(git(
             &project.repo,
             &["for-each-ref", "--format=%(refname)", "refs/telete/jobs/"],
         ))?
-        .lines()
-        .count(),
-        6
+        .trim()
+        .is_empty()
     );
     Ok(())
 }
@@ -359,7 +423,10 @@ fn worktree_uses_configured_head_and_resolves_destination_from_invocation() -> T
     assert_eq!(result["path"], json!(destination));
     assert_eq!(result["branch"], "feature-a");
     assert_eq!(result["commit"], project.commit);
-    assert_eq!(result["state"], json!(project.state));
+    assert!(result.get("state").is_none());
+    assert!(result.get("state_root").is_none());
+    assert!(!project.state.exists());
+    assert!(!project.repo.join(".git/telete").exists());
     assert_eq!(
         checked(git(&destination, &["rev-parse", "HEAD"]))?.trim(),
         project.commit
@@ -401,6 +468,7 @@ fn worktree_uses_configured_head_and_resolves_destination_from_invocation() -> T
 #[test]
 fn worktrees_share_order_controls_and_frozen_workflows() -> TestResult {
     let project = Project::new()?;
+    checked(project.command(&["pause"]))?;
     let audit = project.root.join("audit");
     let mut configs = Vec::new();
     let mut submissions = Vec::new();
@@ -469,20 +537,20 @@ fn worktrees_share_order_controls_and_frozen_workflows() -> TestResult {
     let member = |index: usize, args: &[&str]| {
         configured_command(&configs[index].0, &configs[index].1, args)
     };
-    checked(member(0, &["pause"]))?;
     let paused = checked_json(member(1, &["status"]))?;
     assert_eq!(paused["paused"], true);
-    checked(member(2, &["worker", "--once"]))?;
+    wait_for_worker_ownership(&project.state, true)?;
     assert!(!audit.exists());
     checked(member(1, &["maintenance", "hold", "--owner", "test"]))?;
     checked(member(2, &["resume"]))?;
     let held = checked_json(project.command(&["maintenance", "status"]))?;
     assert_eq!(held["held"], true);
     assert_eq!(held["owners"], json!(["test"]));
-    checked(project.command(&["worker", "--once"]))?;
+    std::thread::sleep(Duration::from_millis(150));
     assert!(!audit.exists());
     checked(project.command(&["maintenance", "release", "--owner", "test"]))?;
     finish_jobs(&configs[2].0, &configs[2].1, &ids)?;
+    wait_for_worker_ownership(&project.state, false)?;
     assert_eq!(
         fs::read_to_string(audit)?.lines().collect::<Vec<_>>(),
         expected_lines
@@ -502,6 +570,7 @@ fn worktrees_share_order_controls_and_frozen_workflows() -> TestResult {
 #[test]
 fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -> TestResult {
     let project = Project::new()?;
+    checked(project.command(&["pause"]))?;
     checked(project.command(&["worktree", "child"]))?;
     let child = project.root.join("child");
     let child_config = write_worktree_config(&child)?;
@@ -512,7 +581,7 @@ fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -
         &["worktree", "../nested"],
     ))?;
     assert_eq!(nested["commit"], selected);
-    assert_eq!(nested["state"], json!(project.state));
+    assert!(nested.get("state_root").is_none());
     let nested_path = project.root.join("nested");
     let nested_config = write_worktree_config(&nested_path)?;
     let manual = project.root.join("manual");
@@ -541,7 +610,9 @@ fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -
         assert_eq!(status["commit"], selected);
         assert!(!directory.join(".telete").exists());
     }
+    checked(configured_command(&manual, &manual_config, &["resume"]))?;
     finish_jobs(&manual, &manual_config, &[original_id, id])?;
+    wait_for_worker_ownership(&project.state, false)?;
     assert_eq!(
         checked(git(&nested_path, &["rev-parse", "HEAD"]))?.trim(),
         selected
@@ -550,36 +621,40 @@ fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -
 }
 
 #[test]
-fn sharing_rejects_a_discovered_independent_populated_runtime() -> TestResult {
+fn first_queue_mutation_binds_the_runtime_for_all_worktrees() -> TestResult {
     let project = Project::new()?;
     let manual = project.root.join("independent");
     let mut add_manual = git(&project.repo, &["worktree", "add", "-b", "independent"]);
     add_manual.arg(&manual).arg(&project.commit);
     checked(add_manual)?;
     let config = write_worktree_config(&manual)?;
-    let independent = checked_json(configured_command(&manual, &config, &["submit"]))?;
-    let independent_id = independent["id"].as_str().ok_or("missing job ID")?;
-    assert!(manual.join(".telete").exists());
+    checked_json(configured_command(&manual, &config, &["status"]))?;
+    assert!(!manual.join(".telete").exists());
+    assert!(!project.repo.join(".git/telete").exists());
     checked(project.command(&["worktree", "bound-child"]))?;
-    let output = bounded_output(spawn(configured_command(&manual, &config, &["submit"]))?)?;
-    assert!(
-        !output.status.success(),
-        "populated independent queue was silently abandoned"
-    );
-    assert!(manual.join(".telete/jobs").join(independent_id).exists());
+    assert!(!project.state.exists());
+    assert!(!project.repo.join(".git/telete").exists());
+    checked(configured_command(&manual, &config, &["pause"]))?;
+    let selected_state = manual.join(".telete");
+    let binding: Value =
+        serde_json::from_slice(&fs::read(project.repo.join(".git/telete/queue.json"))?)?;
+    assert_eq!(binding["state"], json!(selected_state));
+    let submitted = checked_json(project.command(&["submit"]))?;
+    let id = submitted["id"].as_str().ok_or("missing job ID")?;
+    assert_eq!(submitted["state_root"], json!(selected_state));
     let shared = checked_json(project.command(&["status"]))?;
-    assert!(
-        shared["queue"]
-            .as_array()
-            .ok_or("missing queue")?
-            .is_empty()
-    );
+    assert_eq!(shared["queue"][0]["id"], id);
+    assert!(!project.state.exists());
+    checked(project.command(&["resume"]))?;
+    checked(configured_command(&manual, &config, &["wait", id]))?;
+    wait_for_worker_ownership(&selected_state, false)?;
     Ok(())
 }
 
 #[test]
 fn shared_binding_failures_never_fall_back_to_a_local_runtime() -> TestResult {
     let project = Project::new()?;
+    checked(project.command(&["pause"]))?;
     checked(project.command(&["worktree", "child"]))?;
     let child = project.root.join("child");
     let config = write_worktree_config(&child)?;
@@ -606,12 +681,15 @@ fn shared_binding_failures_never_fall_back_to_a_local_runtime() -> TestResult {
     wrong_repository["common_git_dir"] = json!(project.root.join("foreign.git"));
     let mut relative_state = valid;
     relative_state["state"] = json!("relative-state");
-    for contents in [
+    for (index, contents) in [
         b"invalid JSON".to_vec(),
         serde_json::to_vec(&wrong_version)?,
         serde_json::to_vec(&wrong_repository)?,
         serde_json::to_vec(&relative_state)?,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         fs::write(&binding, &contents)?;
         for operation in ["status", "submit"] {
             let output = bounded_output(spawn(configured_command(&child, &config, &[operation]))?)?;
@@ -622,9 +700,10 @@ fn shared_binding_failures_never_fall_back_to_a_local_runtime() -> TestResult {
             assert!(!child.join(".telete").exists());
             assert_eq!(fs::read(&binding)?, contents);
         }
-        let output = bounded_output(spawn(project.command(&["worktree", "blocked-child"]))?)?;
-        assert!(!output.status.success());
-        assert!(!project.root.join("blocked-child").exists());
+        let name = format!("unaffected-child-{index}");
+        checked(project.command(&["worktree", &name]))?;
+        assert!(project.root.join(name).is_dir());
+        assert_eq!(fs::read(&binding)?, contents);
     }
     fs::write(&binding, saved_binding)?;
     let status = checked_json(configured_command(&child, &config, &["status"]))?;
@@ -639,66 +718,49 @@ fn shared_binding_failures_never_fall_back_to_a_local_runtime() -> TestResult {
 }
 
 #[test]
-fn first_binding_requires_unbound_worker_to_stop_but_bound_worker_allows_worktrees() -> TestResult {
+fn worktree_creation_ignores_running_workers_and_queue_locks() -> TestResult {
     let project = Project::new()?;
-    let mut unbound = RunningWorker(spawn(project.command(&["worker"]))?);
-    wait_for_worker(&mut unbound, &project.state)?;
-    let output = bounded_output(spawn(project.command(&["worktree", "blocked"]))?)?;
-    assert!(!output.status.success());
-    assert!(unbound.0.try_wait()?.is_none());
-    assert!(!project.repo.join(".git/telete/queue.json").exists());
-    assert!(!project.root.join("blocked").exists());
-    assert!(
-        checked(git(
-            &project.repo,
-            &["for-each-ref", "--format=%(refname)", "refs/heads/blocked"]
-        ))?
-        .trim()
-        .is_empty()
-    );
-    drop(unbound);
-
+    checked(project.command(&["pause"]))?;
+    let submitted = checked(project.command(&["submit"]))?;
+    let id = job_id(&submitted)?;
+    wait_for_worker_ownership(&project.state, true)?;
+    let selection = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(project.repo.join(".git/telete/queue.lock"))?;
+    selection.try_lock_exclusive()?;
     checked(project.command(&["worktree", "child"]))?;
     let child = project.root.join("child");
     let config = write_worktree_config(&child)?;
-    let mut bound = RunningWorker(spawn(project.command(&["worker"]))?);
-    wait_for_worker(&mut bound, &project.state)?;
     let result = checked_json(configured_command(
         &child,
         &config,
         &["worktree", "../sibling"],
     ))?;
-    assert_eq!(result["state"], json!(project.state));
+    assert!(result.get("state_root").is_none());
     assert!(project.root.join("sibling").is_dir());
-    assert!(bound.0.try_wait()?.is_none());
-    let output = bounded_output(spawn(configured_command(
-        &child,
-        &config,
-        &["worker", "--once"],
-    ))?)?;
-    assert!(
-        !output.status.success(),
-        "second worktree acquired worker ownership"
-    );
     assert!(!child.join(".telete").exists());
+    FileExt::unlock(&selection)?;
+    checked(project.command(&["cancel", id]))?;
+    wait_for_worker_ownership(&project.state, false)?;
     Ok(())
 }
 
 #[test]
-fn git_creation_failure_preserves_binding_and_existing_git_lock() -> TestResult {
+fn git_creation_failure_preserves_existing_git_lock_without_queue_state() -> TestResult {
     let project = Project::new()?;
     let git_lock = project.repo.join(".git/refs/heads/blocked.lock");
     fs::write(&git_lock, "another Git operation owns this lock")?;
     let output = bounded_output(spawn(project.command(&["worktree", "blocked"]))?)?;
     assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)?.contains("shared queue remains"));
     assert_eq!(
         fs::read_to_string(&git_lock)?,
         "another Git operation owns this lock"
     );
     assert!(!project.root.join("blocked").exists());
     let binding = project.repo.join(".git/telete/queue.json");
-    let saved_binding = fs::read(&binding)?;
+    assert!(!binding.exists());
+    assert!(!project.state.exists());
     let status = checked_json(project.command(&["status"]))?;
     assert_eq!(status["state_root"], json!(project.state));
     assert!(
@@ -708,8 +770,225 @@ fn git_creation_failure_preserves_binding_and_existing_git_lock() -> TestResult 
             .is_empty()
     );
     fs::remove_file(git_lock)?;
-    let result = checked_json(project.command(&["worktree", "blocked"]))?;
-    assert_eq!(result["state"], json!(project.state));
-    assert_eq!(fs::read(binding)?, saved_binding);
+    checked_json(project.command(&["worktree", "blocked"]))?;
+    assert!(!binding.exists());
+    assert!(!project.state.exists());
+    Ok(())
+}
+
+#[test]
+fn default_submission_returns_before_background_work_finishes() -> TestResult {
+    let project = Project::new()?;
+    gated_workflow(&project)?;
+    let receipt = checked(project.command(&["submit"]))?;
+    let id = job_id(&receipt)?;
+    wait_for_file(&project.root.join("started"))?;
+    assert!(!project.root.join("finished").exists());
+    fs::write(project.root.join("release"), "continue")?;
+    checked(project.command(&["wait", id]))?;
+    assert!(project.root.join("finished").exists());
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
+fn follow_prints_the_submission_receipt_and_final_observation() -> TestResult {
+    let project = Project::new()?;
+    let output = checked(project.command(&["submit", "--follow"]))?;
+    let values = output
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(values.len(), 2, "expected receipt and final observation");
+    assert_eq!(values[0]["phase"], "queued");
+    assert_eq!(values[0]["commit"], project.commit);
+    assert_eq!(values[1]["observation"], "terminal");
+    assert_eq!(values[1]["job"]["id"], values[0]["id"]);
+    assert_eq!(values[1]["job"]["phase"], "succeeded");
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
+fn failed_and_cancelled_jobs_make_wait_unsuccessful() -> TestResult {
+    let project = Project::new()?;
+    fs::write(
+        project.root.join("telete.json"),
+        r#"{"repo":"repo","state":"state","check":{"program":"/usr/bin/false"}}"#,
+    )?;
+    let receipt = checked(project.command(&["submit"]))?;
+    let failed = bounded_output(spawn(project.command(&["wait", job_id(&receipt)?]))?)?;
+    assert!(!failed.status.success());
+    let observation: Value = serde_json::from_slice(&failed.stdout)?;
+    assert_eq!(observation["observation"], "terminal");
+    assert_eq!(observation["job"]["phase"], "failed");
+    wait_for_worker_ownership(&project.state, false)?;
+
+    checked(project.command(&["pause"]))?;
+    let receipt = checked(project.command(&["submit"]))?;
+    let id = job_id(&receipt)?;
+    checked(project.command(&["cancel", id]))?;
+    let cancelled = bounded_output(spawn(project.command(&["wait", id]))?)?;
+    assert!(!cancelled.status.success());
+    let observation: Value = serde_json::from_slice(&cancelled.stdout)?;
+    assert_eq!(observation["job"]["phase"], "cancelled");
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
+fn optional_wait_timeout_leaves_the_job_queued() -> TestResult {
+    let project = Project::new()?;
+    checked(project.command(&["pause"]))?;
+    let receipt = checked(project.command(&["submit"]))?;
+    let id = job_id(&receipt)?;
+    let observed = bounded_output(spawn(project.command(&["wait", id, "--timeout", "1"]))?)?;
+    assert!(!observed.status.success());
+    let observation: Value = serde_json::from_slice(&observed.stdout)?;
+    assert_eq!(observation["observation"], "timeout");
+    let status = checked_json(project.command(&["status", id]))?;
+    assert_eq!(status["phase"], "queued");
+    assert_eq!(status["cancel_requested"], false);
+    checked(project.command(&["resume"]))?;
+    checked(project.command(&["wait", id]))?;
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
+fn interrupting_follow_or_wait_does_not_signal_or_cancel_the_job() -> TestResult {
+    for follow in [true, false] {
+        let project = Project::new()?;
+        gated_workflow(&project)?;
+        let receipt = if follow {
+            None
+        } else {
+            Some(checked(project.command(&["submit"]))?)
+        };
+        let mut command = if let Some(receipt) = receipt.as_deref() {
+            project.command(&["wait", job_id(receipt)?])
+        } else {
+            project.command(&["submit", "--follow"])
+        };
+        // A terminal sends SIGINT to the whole foreground process group.
+        command.process_group(0);
+        let child = spawn(command)?;
+        wait_for_file(&project.root.join("started"))?;
+        std::thread::sleep(Duration::from_millis(150));
+        let foreground = rustix::process::Pid::from_child(&child);
+        rustix::process::kill_process_group(foreground, rustix::process::Signal::INT)?;
+        let output = bounded_output(child)?;
+        // Release before asserting, so a failed assertion still lets cleanup
+        // settle the independent command promptly.
+        fs::write(project.root.join("release"), "continue")?;
+        assert_eq!(output.status.code(), Some(130));
+        let output = String::from_utf8(output.stdout)?;
+        let id = job_id(receipt.as_deref().unwrap_or(&output))?;
+        checked(project.command(&["wait", id]))?;
+        assert_eq!(
+            fs::read_to_string(project.root.join("finished"))?,
+            "finished"
+        );
+        wait_for_worker_ownership(&project.state, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn supervisor_replaces_a_worker_while_queued_work_is_paused() -> TestResult {
+    let project = Project::new()?;
+    checked(project.command(&["pause"]))?;
+    let receipt = checked(project.command(&["submit"]))?;
+    let id = job_id(&receipt)?;
+    wait_for_worker_ownership(&project.state, true)?;
+    let record = project.state.join("worker.json");
+    let previous = wait_for_worker_pid(&project.state, None)?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(previous).ok_or("invalid worker PID")?,
+        rustix::process::Signal::KILL,
+    )?;
+    wait_for_worker_pid(&project.state, Some(previous))?;
+    assert_eq!(
+        checked_json(project.command(&["status", id]))?["phase"],
+        "queued"
+    );
+    checked(project.command(&["resume"]))?;
+    checked(project.command(&["wait", id]))?;
+    wait_for_worker_ownership(&project.state, false)?;
+    assert!(!record.exists());
+    Ok(())
+}
+
+#[test]
+fn replacing_a_worker_preserves_the_running_command_without_replaying_it() -> TestResult {
+    let project = Project::new()?;
+    gated_workflow(&project)?;
+    let receipt = checked(project.command(&["submit"]))?;
+    let id = job_id(&receipt)?;
+    wait_for_file(&project.root.join("started"))?;
+    let previous = wait_for_worker_pid(&project.state, None)?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(previous).ok_or("invalid worker PID")?,
+        rustix::process::Signal::KILL,
+    )?;
+    wait_for_worker_pid(&project.state, Some(previous))?;
+    assert!(!project.root.join("finished").exists());
+    fs::write(project.root.join("release"), "continue")?;
+    checked(project.command(&["wait", id]))?;
+    assert_eq!(
+        fs::read_to_string(project.root.join("finished"))?,
+        "finished"
+    );
+    assert_eq!(
+        fs::read_to_string(project.root.join("started"))?
+            .lines()
+            .count(),
+        1,
+        "replacement worker replayed an already admitted command"
+    );
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
+fn startup_failure_keeps_the_accepted_job_and_reports_its_id() -> TestResult {
+    let project = Project::new()?;
+    gated_workflow(&project)?;
+    checked(project.command(&["pause"]))?;
+    let log = project.state.join("supervisor.log");
+    fs::create_dir(&log)?;
+    let output = bounded_output(spawn(project.command(&["submit"]))?)?;
+    assert!(!output.status.success());
+    let receipt: Value = serde_json::from_slice(&output.stdout)?;
+    let id = receipt["id"].as_str().ok_or("missing accepted job ID")?;
+    assert!(receipt["worker_error"].is_string());
+    assert_eq!(receipt["phase"], "queued");
+    assert_eq!(
+        checked_json(project.command(&["status", id]))?["phase"],
+        "queued"
+    );
+    assert!(!project.root.join("started").exists());
+    fs::remove_dir(log)?;
+    fs::write(project.root.join("release"), "continue")?;
+    checked(project.command(&["resume"]))?;
+    checked(project.command(&["wait", id]))?;
+    assert_eq!(
+        fs::read_to_string(project.root.join("started"))?
+            .lines()
+            .count(),
+        1
+    );
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
+fn worker_lifecycle_is_not_a_public_command() -> TestResult {
+    let project = Project::new()?;
+    for args in [&["worker"][..], &["worker", "--once"][..]] {
+        let output = bounded_output(spawn(project.command(args))?)?;
+        assert!(!output.status.success());
+    }
+    assert!(!project.state.exists());
     Ok(())
 }

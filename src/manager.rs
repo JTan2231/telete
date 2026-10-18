@@ -143,16 +143,17 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
     )
 }
 
-pub(crate) async fn wait(paths: &Paths, id: &str, timeout_seconds: u64) -> Result<Value> {
-    ensure!(timeout_seconds > 0, "wait timeout must be positive");
-    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+pub(crate) async fn wait(paths: &Paths, id: &str, timeout_seconds: Option<u64>) -> Result<Value> {
+    ensure!(timeout_seconds != Some(0), "wait timeout must be positive");
+    let started = Instant::now();
     loop {
         let value = status(paths, Some(id))?;
         let phase = value["phase"].as_str().context("job has no phase")?;
         if matches!(phase, "succeeded" | "failed" | "cancelled" | "blocked") {
             return Ok(json!({"observation":"terminal","job":value}));
         }
-        if Instant::now() >= deadline {
+        if timeout_seconds.is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
+        {
             return Ok(json!({"observation":"timeout","job":value}));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -239,7 +240,7 @@ fn maintenance(paths: &Paths, owner: Option<&str>, action: &str) -> Result<Value
 }
 
 pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
-    let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
+    let _worker = store::lock(&paths.root.join("worker.lock"), true)?;
     let (store, config) = configured(paths)?;
     let mut job = store.job(id)?;
     ensure!(
@@ -269,6 +270,7 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
     job_status(&worker.store, id)
 }
 
+#[cfg(test)]
 pub(crate) fn worker_once(paths: &Paths) -> Result<Value> {
     let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
     let (store, config) = configured(paths)?;
@@ -281,7 +283,8 @@ pub(crate) fn worker_once(paths: &Paths) -> Result<Value> {
 }
 
 pub(crate) async fn worker(paths: &Paths) -> Result<()> {
-    let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
+    let owner = store::lock(&paths.root.join("runner.lock"), true)?;
+    owner.close_on_exec()?;
     let (store, config) = configured(paths)?;
     let mut worker = Worker {
         paths,
@@ -289,9 +292,28 @@ pub(crate) async fn worker(paths: &Paths) -> Result<()> {
         config,
     };
     loop {
-        worker.tick()?;
+        {
+            // Keep this lock inheritable: after a worker crash, an admitted
+            // command must settle before replacement or recovery takes over.
+            let _execution = store::lock(&paths.root.join("worker.lock"), true)?;
+            worker.tick()?;
+            if !needs_worker(paths)? {
+                return Ok(());
+            }
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Retained failure details alone do not keep execution alive. Other settled
+/// records still need cleanup before the runtime may stop.
+pub(crate) fn needs_worker(paths: &Paths) -> Result<bool> {
+    let (store, _) = configured(paths)?;
+    let latest = store.get::<u64>("latest_finished_sequence")?;
+    Ok(store
+        .jobs()?
+        .iter()
+        .any(|job| job.phase != Phase::Failed || Some(job.sequence) != latest))
 }
 
 struct Worker<'a> {

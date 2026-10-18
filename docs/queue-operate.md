@@ -26,18 +26,19 @@ Paths are normalized to absolute paths.
 }
 ```
 
-Submit committed source and start a foreground worker:
+Submit committed source for background execution:
 
 ```sh
 telete --config telete.json submit
-telete --config telete.json worker
 ```
 
-No initialization command or pre-existing runtime directory is needed. Mutating
-operations create runtime state on demand, and a fresh queue permits admission.
-Until a shared queue is bound, use the same configured state directory to
-operate that queue. Telete rejects reusing a populated runtime directory with a
-different repository.
+Add `--follow` to observe the submitted job. Ctrl-C stops observation without
+cancelling work. Use `cancel JOB` for an explicit cancellation request.
+
+No initialization command or pre-existing runtime directory is needed. The first
+queue mutation creates runtime state on demand and binds Git's common directory
+to the selected config's absolute `state` path. A fresh queue permits admission.
+Telete rejects reusing a populated runtime directory with a different repository.
 
 The private state directory holds the operational queue, private checkouts,
 command records, output files, and Telete's temporary files. Ignore it in Git
@@ -49,7 +50,7 @@ runtime state. Without a shared queue binding, a missing runtime directory has
 no queued work. If a binding exists but its runtime directory or queue database
 is missing, operations fail and require restoration of the operational state.
 
-## Create worktrees and share a queue
+## Create worktrees
 
 ```sh
 telete worktree ../feature-a --config telete.json
@@ -61,28 +62,27 @@ against the invocation's current directory. The branch name is the destination's
 last normalized path component and must be a valid literal Git branch name:
 `../feature-a` creates `feature-a`. An existing destination or branch is an
 error; Telete does not adopt an existing worktree. Uncommitted
-changes stay in the source checkout. This command neither submits a job nor
-starts a worker.
+changes stay in the source checkout. This command uses Git alone: it does not
+submit work, inspect runtime state, bind a queue, or coordinate with a worker.
+Its result contains only `path`, `branch`, and `commit`.
 
-The first `worktree` invocation binds the Git common directory to the selected
-config's absolute `state` path. Telete keeps the private binding at
+## Share a queue
+
+The first queue mutation binds the Git common directory to the selected config's
+absolute `state` path. Telete keeps the private binding at
 `G/telete/queue.json`, where `G` is Git's common directory. From then on, the
 original checkout, all linked worktrees, and all configs selecting those
 checkouts use this one runtime directory. This includes manually created Git
 worktrees. Separate clones have separate Git common directories and keep
 independent queues.
 
-Initial binding requires exclusive repository selection. If an existing worker
-or operation is using an unbound repository, stop its workers and retry after
-the operation finishes. Once the repository is bound, creating another worktree
-can proceed while the shared worker runs.
+Telete coordinates initial binding and queue ownership internally. Development
+worktree creation remains independent of the queue before and after binding.
 
 After binding, `state` remains a required config field but cannot redirect the
 queue. A copied config's relative `.telete` path therefore does not create a
 second queue in its checkout. Telete rejects conflicting existing runtime state
-rather than combining queues. The binding can remain if Git worktree creation
-fails; inspect the reported branch and destination before retrying. Telete does
-not remove pre-existing branches or worktrees to recover a failed creation.
+rather than combining queues.
 
 The selected config still determines the source repository, commands, and
 parameters. Use the config inside each checkout when its `repo` is relative:
@@ -98,10 +98,9 @@ workflows, and parameters. Passing the original checkout's config while standing
 in a child still selects the original repository's `HEAD`. Queue order is the
 order submissions are admitted to the shared queue.
 
-Operation results include the effective absolute runtime directory in the
-top-level `state_root` field. `worktree` also returns `path`, `branch`, `commit`,
-and `state`. Preserve the shared Git repository, queue binding, and runtime
-directory while work is queued, active, or unresolved.
+Queue operation results include the effective absolute runtime directory in the
+top-level `state_root` field. Preserve the shared Git repository, queue binding,
+and runtime directory while work is queued, active, or unresolved.
 If the binding survives but its runtime directory or queue database is missing,
 restore that operational state before continuing. Telete refuses to create an
 empty replacement queue behind an existing binding.
@@ -117,6 +116,17 @@ Before reporting successful submission, Telete retains the commit and creates
 its private execution checkout. Removing the submitting linked worktree does
 not change this retained source; the shared Git repository and runtime must
 remain available.
+
+Submission arranges background execution without waiting for the job to finish.
+Use `submit --follow` to observe the new job as well. Following does not own the
+worker, and closing the terminal or interrupting observation does not cancel
+submitted work.
+
+Submission prints its job receipt before following. If worker startup fails
+after the job was admitted, the receipt still identifies that job and includes
+`worker_error`; the command then reports an error and exits unsuccessfully.
+Inspect the admitted job rather than submitting it again. With `--follow`, a
+second JSON result reports the final observation.
 
 Each job runs that exact commit in a clean private checkout. Telete does not
 merge source, maintain an accepted baseline, accept commits, or advance project
@@ -149,8 +159,11 @@ letter or underscore and contain only ASCII letters, digits, or underscores.
 Programs, arguments, and environment values cannot contain NUL. `TELETE_` names
 are reserved for Telete; other environment variables belong to the project.
 
-Commands inherit the environment at launch and use ordinary permissions, with
-their configured overrides and Telete context. Telete does not select a toolchain,
+Commands inherit the managed worker's environment at launch and use ordinary
+permissions, with their configured overrides and Telete context. The supervisor
+inherits the environment of the invocation that starts it, and its workers
+inherit that environment. Jobs joining an existing worker use that worker's
+environment. Telete does not select a toolchain,
 rewrite home or cache locations, impose a filesystem sandbox, or promise
 reproducible execution. If the project needs a particular environment, cache,
 compiler target directory, or credential reference, select it in its commands
@@ -185,11 +198,28 @@ authorizes another launch under the same execution identity.
 
 ## Operate and recover work
 
-The foreground worker continues until stopped. `worker --once` advances one
-lifecycle tick; it does not complete a whole job. Use `status` or `status JOB`
-to inspect work, and `wait JOB --timeout 60` to observe a job without submitting
-it again. Add `--json` for compact JSON output and structured operation errors.
-Ordinary operation failures use exit 1; CLI syntax errors use exit 2.
+Telete manages a background worker while unfinished work exists. The worker
+waits while pause, maintenance holds, or unresolved work prevent progress, and
+exits after the queue settles and cleanup finishes. Retained failure diagnostics
+and settled-job markers alone do not keep a worker running. Users do not start,
+stop, or restart workers.
+
+A private supervisor restarts its worker if it exits unexpectedly while work
+remains. Both processes exit after settlement and cleanup. This is not a login
+service: if the supervisor itself is lost, or after logout or reboot, the next
+queue mutation arranges execution again. Read-only observation does not restart
+execution. Restarting a worker does not authorize another launch of an uncertain
+command.
+
+Use `status` or `status JOB` to inspect work, and `wait JOB` to observe a job
+without submitting it again. Waiting has no timeout by default; supply
+`--timeout 60` to limit observation. Both `wait` and `submit --follow` stop
+observing when the job succeeds, fails, is cancelled, or becomes blocked.
+Ctrl-C stops observation without cancelling the job. Add `--json` for compact
+JSON output and structured operation errors. `wait` and `submit --follow` exit 0
+only when the observed job succeeded; failure, cancellation, blockage, and an
+observation timeout use exit 1. Ctrl-C uses exit 130. Ordinary operation failures
+use exit 1; CLI syntax errors use exit 2.
 
 For a bound repository, these operations act on the shared queue from every
 linked checkout. Only one worker can own it. Pause, maintenance holds,
@@ -204,7 +234,8 @@ an admitted command.
 Use `recover JOB` to reconcile retained work. Recovery uses the saved command,
 context, and terminal evidence. An existing execution identity can join only an
 equal command, including context, explicit overrides, and timeout. Process disappearance
-does not establish completion.
+does not establish completion. Telete coordinates recovery with its worker and
+continues remaining eligible work automatically; no worker restart is required.
 
 An interrupted command without terminal evidence remains unresolved. Telete does
 not automatically repeat or roll back its effects. Preserve the runtime
@@ -235,4 +266,5 @@ Use `maintenance hold --owner OWNER`, `maintenance status`, and
 `maintenance release --owner OWNER` to coordinate queue admission during
 maintenance. Release only the owner acquired by that operation. A release does
 not clear operator pause or resolve an interrupted job. Pausing admission does
-not drain the queue or stop its worker.
+not drain the queue. Resuming or releasing the final hold allows eligible work
+to continue automatically.

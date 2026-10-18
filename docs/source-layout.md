@@ -10,7 +10,9 @@ Invocation, process, and broker modules resolve commands, supervise execution,
 and correlate results. Path helpers manage private local storage. The workflow
 module validates project JSON configuration and resolves its repository and
 initial runtime paths. The repository queue module resolves the shared queue
-binding in Git's common directory and creates development worktrees.
+binding in Git's common directory. Development worktree creation uses Git
+without opening or changing runtime state. Queue operations manage a private
+supervisor and worker, including startup, ownership, and shutdown.
 
 `ci.sh` selects this repository's `ci/workflow.json` project config, which points
 to `.telete/` for runtime state. `ci/check.sh` runs formatting, Clippy, tests, and a
