@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "id": "explain-unix-socket-01",
+  "label": "Explain a Unix socket",
+  "requester": {
+    "program": "example-client",
+    "id": "run-01"
+  },
+  "instructions": "Answer the user directly, use no tools, and keep the response to one short line.",
+  "prompt": "Explain in one sentence what a Unix socket is.",
+  "invocation": {
+    "version": 1,
+    "harness": "codex",
+    "model": "gpt-5.6-terra",
+    "reasoningEffort": "low",
+    "cwd": "/Users/joey/rust/cell/infrastructure/nucleus",
+    "workspaceAccess": "none",
+    "builtinTools": {
+      "localExecution": false,
+      "webSearch": false
+    },
+    "timeoutSeconds": 90
+  }
+}

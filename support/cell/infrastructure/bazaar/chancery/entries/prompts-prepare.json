@@ -1,0 +1,142 @@
+{
+  "id": "bazaar.prompts.prepare",
+  "contract_version": 1,
+  "kind": "capability",
+  "mode": "use",
+  "support": "supported",
+  "title": "Prepare selected Bazaar prompt text",
+  "summary": "Load one prompt selection and its exact component versions, render templates once, and expand trusted instructions and descriptions through the in-process Rust API.",
+  "manual": "manuals/prompts-prepare.md",
+  "interfaces": [
+    {
+      "label": "Load current or exact prompt selection",
+      "invocation": "bazaar::prompts::Prompts::load(owner), at(owner, version), open(database, owner, version)"
+    },
+    {
+      "label": "Read or prepare selected text",
+      "invocation": "bazaar::prompts::Prompts::text(id), render(id, values), expand(text), descriptions(value)"
+    },
+    {
+      "label": "Render an explicit template",
+      "invocation": "bazaar::prompts::render(template, values)"
+    },
+    {
+      "label": "Map selection and historical version numbers",
+      "invocation": "bazaar::prompts::Prompts::toolset_version(historical_max), for_toolset_version(owner, version, historical_max)"
+    },
+    {
+      "label": "Select the default prompt database",
+      "invocation": "bazaar::prompts::database_path()"
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "bazaar.string.read",
+      "min_contract": 2,
+      "max_contract_exclusive": 3
+    }
+  ],
+  "use_when": [
+    "A product needs selected instruction, template, library-document, or description text from Bazaar.",
+    "A product must recover the exact prompt selection for a retained request or historical toolset identity."
+  ],
+  "do_not_use_when": [
+    "The caller needs raw opaque string reads; use bazaar.string.read.",
+    "The caller wants to publish content, execute a request, select permissions or models, or interpret domain success."
+  ],
+  "outcome": "One complete selected component set and prepared text, or an explicit preparation error.",
+  "effects": [
+    "Reads private Bazaar selections and exact component versions into memory without modifying state.",
+    "Description preparation mutates the caller-supplied JSON value in memory. No database handle remains after loading."
+  ],
+  "authority": [
+    "Bazaar owns selection format, exact text resolution, rendering, and trusted expansion. Products own the meaning and authority of the request, runtime data, schema and tool structure, and durable outcome."
+  ],
+  "success": [
+    "The complete selected component set loads and requested text preparation succeeds before the product admits its request."
+  ],
+  "failure_and_recovery": [
+    "Missing or unsupported state, selections, components, and invalid templates remain errors. Readers create no fallback state.",
+    "Description expansion can partially mutate the supplied value on error; rebuild it before retrying or admitting a request. Preserve exact selections and requests under product recovery rules."
+  ],
+  "privacy": [
+    "Loaded text and rendered output can contain private prompts or runtime input. Keep them within the product boundary. Direct Rust calls record no CLI usage."
+  ],
+  "does_not_authorize": [
+    "Content appends, caller migration, library assignment, schema or toolset registration, model execution, permission changes, or external disclosure."
+  ],
+  "promise": {
+    "consumers": [
+      {
+        "status": "declared",
+        "statement": "Local Rust products use bazaar::prompts for shared prompt text preparation and recovery of exact selections."
+      }
+    ],
+    "preconditions": [
+      {
+        "status": "declared",
+        "statement": "The selected database is initialized private Bazaar schema one. A nonempty schema-one cell.prompts.OWNER selection names every required existing component at a positive exact version. Trusted expansion is applied only to caller-owned instruction or description fields."
+      }
+    ],
+    "inputs": [
+      {
+        "status": "declared",
+        "statement": "Methods take an owner, optional exact selection version, optional explicit absolute database path, selected component ID, trusted text, caller-formatted named values, or caller-owned JSON. load and at use absolute CELL_BAZAAR_DATABASE or the default derived from absolute HOME."
+      }
+    ],
+    "outputs": [
+      {
+        "status": "declared",
+        "statement": "Prompts contains its selected Record and all selected component records in memory. text, render, expand and the standalone render return String or typed Error. descriptions updates string description fields in the supplied serde_json::Value. Selection contains schema_version: u32 and entries: BTreeMap<String, i64>. Numeric compatibility helpers return a derived version or the corresponding Prompts selection."
+      }
+    ],
+    "data_semantics": [
+      {
+        "status": "declared",
+        "statement": "Selection format one names exact immutable component versions. Templates support named and positional placeholders, escaped braces, and caller-formatted values. Rendering and trusted reference expansion are one pass; inserted text is not interpreted again. Only string fields named description are expanded during JSON traversal."
+      }
+    ],
+    "identity_and_units": [
+      {
+        "status": "declared",
+        "statement": "cell.prompts.OWNER and its positive Bazaar version identify one immutable selected set. Component ID and version identify exact text. Selection version one is the historical migration baseline. Numeric compatibility adds selection version above the caller-supplied historical range; older toolset numbers resolve to baseline one. No measurement unit is defined."
+      }
+    ],
+    "completeness_and_freshness": [
+      {
+        "status": "declared",
+        "statement": "Each load reads one latest or exact selection, then every named component at its exact version. An existing Prompts retains that complete set despite later appends. Separate database queries do not share a snapshot and emit no timestamps. Publish components before their selection."
+      }
+    ],
+    "access": [
+      {
+        "status": "declared",
+        "statement": "The API runs in process using the current user's filesystem-protected read-only Bazaar access. It invokes no CLI, daemon, model, or Nucleus interface and creates no state."
+      }
+    ],
+    "lifecycle_and_consistency": [
+      {
+        "status": "declared",
+        "statement": "Loading fails rather than returning a partial component set. Runtime reads never initialize, migrate, repair, or substitute seed content. New selections affect new preparations; products retain exact requests or selection versions for recovery. Historical IDs and versions remain intact."
+      }
+    ],
+    "operational_limits": [
+      {
+        "status": "declared",
+        "statement": "Private-path and SQLite limits of raw reads apply, including a five-second contention wait. Whole selected text and rendered output use proportional memory. No capacity, throughput, content-size, or wall-clock completion guarantee is supplied. No external execution or schema validation is provided."
+      }
+    ],
+    "compatibility_and_evolution": [
+      {
+        "status": "declared",
+        "statement": "Database schema one, selection format one, string versions, product release, capability version, and requester schema/toolset identities are separate. This feature preserves existing IDs, selected text, version mappings, and raw API behavior. Products own structural schema changes and historical decoders."
+      }
+    ],
+    "reliances": [
+      {
+        "status": "not_applicable",
+        "statement": "Prompt preparation uses local Bazaar state only. No external service, model, Nucleus library, or installed catalog is a runtime dependency."
+      }
+    ]
+  }
+}

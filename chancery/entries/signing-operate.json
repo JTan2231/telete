@@ -1,0 +1,188 @@
+{
+  "id": "telete.signing.operate",
+  "contract_version": 1,
+  "kind": "capability",
+  "mode": "operate",
+  "support": "supported",
+  "title": "Configure Cell storage and native signing",
+  "summary": "Select the shared external APFS workspace and explicitly create, inspect or select the persistent native macOS signing identity through Telete.",
+  "use_when": [
+    "Set up or inspect the shared Cell work volume.",
+    "Create the first local signing identity or inspect or deliberately change the selected certificate, Keychain or code-identifier namespace."
+  ],
+  "do_not_use_when": [
+    "Renew or replace an unavailable identity implicitly.",
+    "Infer application health, fleet-wide signer consistency or a macOS permission grant from signing completion."
+  ],
+  "outcome": "The validated host selection is published, or signing status reports the exact selected policy and code-signing usability at the current observation.",
+  "effects": [
+    "Storage configuration creates the private external Cell directory and publishes the shared host selector only when absent.",
+    "Initial signing creates and imports one certificate and private key, authorizes codesign key use and adds user code-signing trust.",
+    "Explicit configuration preflights the requested exact identity before publishing the shared host policy or a selected Telete state override."
+  ],
+  "authority": [
+    "Telete owns current-user Cell host storage and signing selectors and maintenance checks.",
+    "macOS owns volume observation, Keychain private-key authority, native authorization, trust and code signing.",
+    "Product installers own program selection and recovery; a signing receipt does not establish product health."
+  ],
+  "success": [
+    "Storage matches the exact valid requested volume identity; an identical valid selection is reused without rewriting.",
+    "Signing configuration publishes only after identity preflight, or status reports a usable selected identity at that observation."
+  ],
+  "failure_and_recovery": [
+    "A different storage selection is refused. Restore an unavailable selected volume rather than create another queue scope.",
+    "Failed preflight preserves prior policy. Initial creation and policy publication are not one transaction; inspect retained Keychain effects and select the exact imported identity once its key is usable.",
+    "Missing keys, expiry, locked Keychain and failed signing stop work. No unsigned, ad hoc, alternate-name, generated-identity or renewal fallback is supplied.",
+    "Sequential rotation can leave prior releases selected. Inspect retained installation results and prepare historical source as a new release under the current policy."
+  ],
+  "privacy": [
+    "Mode-0600 selectors in mode-0700 directories contain no private-key bytes or password.",
+    "Private external generation staging is removed on ordinary completion or failure; Keychain retains the private key. Abrupt termination can leave staging for explicit inspection and cleanup.",
+    "The current-user boundary does not isolate the key from hostile code running with the same user authority."
+  ],
+  "does_not_authorize": [
+    "Formatting or mounting a volume, enabling ownership, data migration, implicit identity rotation, automatic program recovery or unrelated credential changes."
+  ],
+  "interfaces": [
+    {
+      "label": "Configure shared work storage",
+      "invocation": "telete storage configure --volume /Volumes/CellWork"
+    },
+    {
+      "label": "Inspect work storage",
+      "invocation": "telete storage status"
+    },
+    {
+      "label": "Inspect selected signing identity",
+      "invocation": "telete signing status"
+    },
+    {
+      "label": "Create initial shared signing identity",
+      "invocation": "telete signing create-local"
+    },
+    {
+      "label": "Select shared signing identity",
+      "invocation": "telete signing configure --host --certificate-sha1 FINGERPRINT --keychain /absolute/login.keychain-db --identifier-namespace local.cell"
+    },
+    {
+      "label": "Select Telete state signing override",
+      "invocation": "telete signing configure --certificate-sha1 FINGERPRINT --keychain /absolute/login.keychain-db --identifier-namespace local.cell"
+    }
+  ],
+  "dependencies": [],
+  "promise": {
+    "consumers": [
+      {
+        "status": "declared",
+        "statement": "Current-user operators and Cell native production preparation use the selected host workspace and signing identity."
+      }
+    ],
+    "preconditions": [
+      {
+        "status": "declared",
+        "statement": "Storage requires a mounted external writable APFS volume with ownership enabled. Signing requires configured storage, macOS Security, codesign and OpenSSL tools, and usable current-user Keychain access. No initialized queue is required for first setup."
+      },
+      {
+        "status": "declared",
+        "statement": "Signing maintenance requires paused drained selected Telete work, a stopped worker and settled release publication, Telete recovery, and retained legacy manual deployment effects. Other independently configured consumers must be settled by the operator."
+      }
+    ],
+    "inputs": [
+      {
+        "status": "declared",
+        "statement": "Storage selects an exact mount path and observed volume UUID. Signing selects a 40-digit hexadecimal certificate fingerprint, an absolute owned regular Keychain file and a dotted lowercase namespace. Fingerprints normalize to lowercase; certificate-name, per-product identity and environment signer overrides are unsupported."
+      }
+    ],
+    "outputs": [
+      {
+        "status": "declared",
+        "statement": "Shared workspace.json uses schema_version 1 with volume, volume_uuid and directory cell; signing.json uses schema 1 with macos profile local, certificate_sha1, keychain and identifier_namespace. Workspace status returns configuration, selection and current root; signing status returns policy, ready and selection source."
+      }
+    ],
+    "data_semantics": [
+      {
+        "status": "declared",
+        "statement": "Signing status probes the exact selected certificate, private key and dry-run code-signing usability. Readiness describes that observation only. Signing is packaging evidence, not application health or a macOS permission grant."
+      },
+      {
+        "status": "declared",
+        "statement": "Policy covers declared Cell native production commands, daemons, helpers and installers. Scripts, tests, compiler scratch output and third-party runtimes receive no Cell native process identity. Assets retain product manifest ownership and signing does not combine products permission boundaries."
+      }
+    ],
+    "identity_and_units": [
+      {
+        "status": "declared",
+        "statement": "The certificate uses RSA 3072, SHA-256, 3650-day validity and critical CA:false, digital-signature and code-signing extensions. SHA-1 fingerprint selects the exact certificate, not its signature algorithm. The initial namespace is local.cell."
+      },
+      {
+        "status": "declared",
+        "statement": "Code identity is NAMESPACE.PRODUCT.EXECUTABLE using the declared release-binary name and canonical krisis identity for the former decisions product. Versions, commits and paths do not enter the identifier. The designated requirement pins that identifier and exact leaf certificate. Reissue changes fingerprint even when the private key is reused."
+      }
+    ],
+    "completeness_and_freshness": [
+      {
+        "status": "declared",
+        "statement": "Status changes no signing policy or product selection. Missing or unusable identity fails with exit 1; CLI syntax errors use exit 2. --json selects compact output and structured failure diagnostics."
+      },
+      {
+        "status": "unspecified",
+        "statement": "No continual readiness observation, lasting key-usability guarantee, full installed-fleet signer audit or macOS permission-prompt suppression is supplied."
+      }
+    ],
+    "access": [
+      {
+        "status": "declared",
+        "statement": "The account database selects the current-user home independently of HOME and --state. Host selectors are owned private mode-0600 files in mode-0700 directories; state overrides have precedence. Keychain or trust operations may require native user authorization."
+      }
+    ],
+    "lifecycle_and_consistency": [
+      {
+        "status": "declared",
+        "statement": "Storage selection is create-only, repeats an identical valid selection without rewriting and never selects an internal fallback. Host setup serializes shared writers. Shared signing holds selected Telete admission, worker and deployment locks and the retained legacy manual-deployment lock; it checks both retained deployment markers and native release-publication sentinels."
+      },
+      {
+        "status": "declared",
+        "statement": "Signing preflight precedes atomic policy publication. Creation refuses existing shared or selected override policy and an existing Cell Local Signing certificate. Keychain import and policy publication are not one transaction; setup never deletes an imported identity to retry."
+      },
+      {
+        "status": "declared",
+        "statement": "Builds, repairs, cache resets, reinstallations and upgrades do not replace the selected certificate. New jobs freeze normalized policy; reused request keys retain it. Preparation and deployment reject changed selection. Fresh staged copies are signed; immutable releases are not re-signed in place."
+      }
+    ],
+    "operational_limits": [
+      {
+        "status": "declared",
+        "statement": "The local profile supplies no Developer ID distribution, notarization, installer-package signing, Hardened Runtime, added entitlements, network timestamp or permission grant. Signing failures do not request model repair; repair agents receive no private-key material or policy writer. Deployment does not audit historical signatures before publication."
+      },
+      {
+        "status": "declared",
+        "statement": "No automatic renewal, atomic fleet rotation, retro-signing, private-key escrow, completion deadline, volume formatting or mounting, ownership change, journal migration or automatic Keychain-effect recovery is supplied."
+      }
+    ],
+    "compatibility_and_evolution": [
+      {
+        "status": "declared",
+        "statement": "Shared host workspace and signing formats remain schema one. Configure --host writes shared policy; omitting it writes a selected Telete override. Existing policy and Keychain identity remain selected until explicitly changed."
+      },
+      {
+        "status": "unspecified",
+        "statement": "No future signing profile support or signing-policy migration window is supplied."
+      }
+    ],
+    "reliances": [
+      {
+        "status": "declared",
+        "statement": "macOS owns APFS observations, account selection, Keychain import, trust, key authorization and code signing.",
+        "target": "macos",
+        "kind": "external"
+      },
+      {
+        "status": "declared",
+        "statement": "Initial certificate generation and fingerprint extraction use installed OpenSSL.",
+        "target": "openssl",
+        "kind": "external"
+      }
+    ]
+  },
+  "manual": "manuals/signing-operate.md"
+}

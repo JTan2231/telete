@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "product": "bazaar",
+  "order": 0,
+  "steps": [
+    {
+      "id": "install",
+      "kind": "run",
+      "argv": [
+        "{candidate_dir}/bin/bazaar-install",
+        "deploy"
+      ],
+      "stdin": "deployment_request"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+PIPELINE_SCHEMA=1
+PRODUCT_ID=telete
+PRODUCT_NAME=Telete
+PRODUCT_DIR=infrastructure/telete
+RELEASE_BRANCH=main
+CARGO_MANIFEST=infrastructure/telete/Cargo.toml
+CARGO_PACKAGES=telete
+CARGO_OFFLINE=0
+CLIPPY_KEEP_GOING=1
+RELEASE_UNITS='telete|Telete|manifest-package|infrastructure/telete/Cargo.toml|telete-|1'
+RELEASE_BINARY_CHECKS='telete|target/release/telete|telete'
+PROVIDERS='telete|telete|infrastructure/telete/chancery|2'

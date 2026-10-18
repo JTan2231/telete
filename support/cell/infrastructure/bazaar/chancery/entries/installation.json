@@ -1,0 +1,154 @@
+{
+  "id": "bazaar.installation",
+  "contract_version": 5,
+  "kind": "capability",
+  "mode": "operate",
+  "support": "supported",
+  "title": "Understand Bazaar installation and private state",
+  "summary": "Read program and provider publication guarantees, private database initialization, integrity checks, supported state, and program recovery boundaries.",
+  "manual": "manuals/installation.md",
+  "interfaces": [
+    {
+      "label": "Initialize state",
+      "invocation": "bazaar init"
+    },
+    {
+      "label": "Check state",
+      "invocation": "bazaar doctor"
+    },
+    {
+      "label": "Use Rust state operations",
+      "invocation": "bazaar::api::Writer::initialize(database), Reader::open(database), Reader::check()"
+    },
+    {
+      "label": "Install sealed programs and provider",
+      "invocation": "bazaar-install install --binary ABSOLUTE_BINARY --bundle ABSOLUTE_BUNDLE"
+    },
+    {
+      "label": "Inspect installation",
+      "invocation": "bazaar-install inspect"
+    },
+    {
+      "label": "Recover retained programs",
+      "invocation": "bazaar-install recover --release ABSOLUTE_RELEASE"
+    },
+    {
+      "label": "Run product deployment recipe",
+      "invocation": "bazaar-install deploy < SCHEMA_TWO_RECIPE_REQUEST.json"
+    }
+  ],
+  "promise": {
+    "consumers": [
+      {
+        "status": "declared",
+        "statement": "Local programs use the in-process bazaar::api Rust API. People and authorized agents use the Bazaar CLI."
+      }
+    ],
+    "preconditions": [
+      {
+        "status": "declared",
+        "statement": "Program installation requires an authorized supplied Bazaar program/provider candidate; program-only inspection or recovery does not require initialized data. Init requires an absolute private path and absent, empty, or compatible state and can create missing paths. Doctor requires initialized schema-one state."
+      }
+    ],
+    "data_semantics": [
+      {
+        "status": "declared",
+        "statement": "Initialization creates only the versions table, its constraints and database identity. It creates no string versions. Program installation does not select or interpret content."
+      }
+    ],
+    "identity_and_units": [
+      {
+        "status": "declared",
+        "statement": "Opaque UUID release IDs select retained program archives. Executable files run at fixed actual paths beneath Bazaar/install/runtime. Database schema, release version and string versions are independent."
+      }
+    ],
+    "access": [
+      {
+        "status": "declared",
+        "statement": "The current user owns filesystem-protected programs and private state. The absolute database path requires a private regular immediate parent and private regular database file; symlinks and group/other permissions are refused. Initialization creates missing directories with 0700 and the file with 0600; readers support read-only permissions. CLI usage recording is separate and best effort; direct API calls record no usage."
+      }
+    ],
+    "operational_limits": [
+      {
+        "status": "declared",
+        "statement": "SQLite waits up to five seconds for contention. A connection is not shared concurrently between threads; callers open separate handles. There is no daemon, schedule, state migration, deletion, pruning, or data restoration command, and no capacity, throughput, or hard latency guarantee."
+      },
+      {
+        "status": "declared",
+        "statement": "Deploy accepts one bounded schema-two recipe request on stdin. The product command owns its setup; the shared executor uses process exit status only. Deployment runs no application execution probe, native-signature audit, maintenance hold, drain, or automatic rollback."
+      }
+    ],
+    "compatibility_and_evolution": [
+      {
+        "status": "declared",
+        "statement": "Bazaar accepts database schema one. New releases use cell-install-v4; retained earlier formats remain readable. Foreign, nonempty uninitialized, and unsupported databases are refused without migration. Program rollback does not restore older data."
+      }
+    ],
+    "reliances": [
+      {
+        "status": "not_applicable",
+        "statement": "Core state operations use local SQLite and files. No external service, model, or installed catalog is a runtime dependency."
+      },
+      {
+        "status": "declared",
+        "statement": "The Cell manifest executor runs declared instructions in product order and checks their exit status. Bazaar owns file selection and default-state initialization. The executor imposes no application readiness, maintenance, or recovery policy.",
+        "target": "cell-deployment",
+        "kind": "control"
+      }
+    ],
+    "inputs": [
+      {
+        "status": "declared",
+        "statement": "Initialization and integrity checks select an absolute private database path. Direct installation takes matching absolute --binary and --bundle paths and optional --home and --expected-current. Recovery takes an exact owned release. The schema-two deploy request supplies candidate and source paths and accepts no Bazaar settings."
+      }
+    ],
+    "outputs": [
+      {
+        "status": "declared",
+        "statement": "The immutable release contains bazaar, bazaar-install, its recovery installer, and the matching provider. Init and doctor print short readable results by default. Global --json selects their existing schema-one JSON on stdout with no string content. Operational errors exit 1: text on stderr by default, or schema-one ok:false with error.detail on stdout with --json. Syntax errors remain text on stderr with exit 2. Rust Writer::initialize returns a Writer; Reader::check returns () or a typed error. The deployment recipe initializes compatible schema-one state; installation adds no separate program-integrity or SQLite-integrity gate."
+      }
+    ],
+    "completeness_and_freshness": [
+      {
+        "status": "declared",
+        "statement": "Installation reads selectors and metadata without integrity checks. Doctor checks local database identity and SQLite quick_check; it establishes no future availability or content correctness."
+      }
+    ],
+    "lifecycle_and_consistency": [
+      {
+        "status": "declared",
+        "statement": "Shared cell-install-v4 file transactions select matching programs and provider. Direct installation does not initialize data. The Bazaar deployment recipe initializes only default state. Init preserves existing versions and can finish interrupted empty initialization. Compatible program upgrade and recovery preserve the separate database. Reader::open and Writer::open create no state; Reader::check reads integrity without content in its result."
+      },
+      {
+        "status": "declared",
+        "statement": "Program recovery preserves every committed string version. No data restoration is supported."
+      }
+    ]
+  },
+  "use_when": [
+    "A caller needs the guarantees and limits of Bazaar program publication, private state initialization, integrity checks, or compatible recovery."
+  ],
+  "do_not_use_when": [
+    "An installation or state-care procedure is required; use bazaar.install.operate.",
+    "Reading or editing an individual string, migrating caller configurations, or executing agents."
+  ],
+  "outcome": "Matched programs and provider, initialized compatible private state, a read-only integrity result, or compatible program recovery without rewriting history.",
+  "effects": [
+    "Installation changes owned program/provider selectors. The Bazaar deployment recipe initializes an absent database. Existing content is preserved; no version is appended."
+  ],
+  "authority": [
+    "Bazaar owns its program selection and private database. The Cell manifest executor owns declared instruction ordering and exit-status tracking."
+  ],
+  "success": [
+    "For a program operation, owned programs and provider selectors select the supplied release. For a database operation, selected schema-one identity and integrity checks pass. Coordinated deployment performs setup without an additional verification gate."
+  ],
+  "failure_and_recovery": [
+    "Refuse foreign selectors, stale expected selections and unsupported state. Retained-release program recovery leaves database history intact. After an interrupted initialization, repeat init only against the same empty or compatible state."
+  ],
+  "privacy": [
+    "The default database is ~/.local/share/bazaar/bazaar.sqlite3. State stays outside source and release files."
+  ],
+  "does_not_authorize": [
+    "Writing string content, migrating callers, deleting or restoring data, executing a model, or activating a schedule."
+  ]
+}

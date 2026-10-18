@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "id": "todo.create-todo.result.v1",
+  "name": "Todo create_todo result",
+  "schemaVersion": "1",
+  "mediaType": "application/schema+json",
+  "producer": "todo",
+  "schema": {"type":"object","additionalProperties":false,"required":["created","todo"],"properties":{"created":{"const":true},"todo":{"type":"object","additionalProperties":false,"required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"}}}}},
+  "digest": "sha256:148bc34e8093614a46d560121c5b7f2082fa8dcdbcda1ccf4f7911c747d146ff"
+}

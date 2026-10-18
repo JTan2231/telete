@@ -1,0 +1,11 @@
+{
+  "check": {
+    "program": "ci/check.sh",
+    "args": [],
+    "env": {},
+    "timeout_seconds": null
+  },
+  "parameters": {
+    "suite": "telete"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "id": "annals-model-run-01K5Z8K3Q2J7",
+  "label": "Examine Annals work w17 at corpus revision 204",
+  "requester": {
+    "program": "annals",
+    "id": "model-run-01K5Z8K3Q2J7"
+  },
+  "instructions": "Act as Annals's liaison. Use only the supplied nine Annals tools.",
+  "developerInstructions": "Complete by recording exactly one reconciliation. A successful partial submit or revision is not terminal; correct only named operations until a tool reports recorded true.",
+  "prompt": "Examine retained work w17 against frozen corpus revision 204 using only the supplied Annals tools.",
+  "invocation": {
+    "version": 1,
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "reasoningEffort": "max",
+    "cwd": "/Users/joey/rust/cell/products/annals",
+    "workspaceAccess": "none",
+    "builtinTools": {
+      "localExecution": false,
+      "webSearch": false
+    },
+    "timeoutSeconds": 3600,
+    "toolset": {
+      "provider": "annals",
+      "name": "liaison",
+      "version": 1
+    }
+  }
+}

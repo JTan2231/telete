@@ -1,0 +1,477 @@
+//! Git owns merge and patch interpretation. Telete owns only its private refs.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+
+use crate::model::CommitId;
+use crate::paths::Paths;
+use crate::process::{self, CommandSpec, ProcessResult};
+
+pub(crate) const ACCEPTED: &str = "refs/telete/accepted";
+pub(crate) const PROJECT_ACCEPTED: &str = "refs/telete/project-accepted";
+
+pub(crate) fn run(
+    paths: &Paths,
+    repo: &Path,
+    args: &[String],
+    stdin: Option<String>,
+    extra: BTreeMap<String, String>,
+) -> Result<ProcessResult> {
+    let repo = repo
+        .canonicalize()
+        .context("Git repository directory is unavailable")?;
+    let mut arguments = vec![
+        "-c".into(),
+        "core.hooksPath=/dev/null".into(),
+        "-c".into(),
+        "commit.gpgSign=false".into(),
+        "-C".into(),
+        repo.display().to_string(),
+    ];
+    arguments.extend_from_slice(args);
+    let mut environment = paths.environment();
+    environment.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
+    environment.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
+    environment.extend(extra);
+    process::run(
+        paths,
+        &CommandSpec {
+            program: PathBuf::from("/usr/bin/git"),
+            args: arguments,
+            cwd: repo.clone(),
+            env: environment,
+            timeout_seconds: Some(120),
+            stdin,
+            confined: false,
+            context: None,
+        },
+    )
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|value| (*value).to_owned()).collect()
+}
+
+pub(crate) fn value(paths: &Paths, repo: &Path, args: &[&str]) -> Result<String> {
+    let result = run(paths, repo, &strings(args), None, BTreeMap::new())?;
+    ensure!(result.success(), "Git failed: {}", result.stderr.trim());
+    Ok(result.stdout.trim().to_owned())
+}
+
+pub(crate) fn commit(paths: &Paths, repo: &Path, revision: &str) -> Result<CommitId> {
+    let result = value(
+        paths,
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{revision}^{{commit}}"),
+        ],
+    )?;
+    ensure!(
+        (result.len() == 40 || result.len() == 64)
+            && result
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "Git returned an invalid commit identity"
+    );
+    CommitId::new(result)
+}
+
+pub(crate) fn common(paths: &Paths, repo: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(value(
+        paths,
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?)
+    .canonicalize()?)
+}
+
+pub(crate) fn repository(paths: &Paths, repo: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(value(paths, repo, &["rev-parse", "--show-toplevel"])?).canonicalize()?)
+}
+
+pub(crate) fn private_ref(job: &str, name: &str) -> Result<String> {
+    ensure!(
+        !job.is_empty()
+            && job
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "invalid private Git job identity"
+    );
+    ensure!(
+        ["input", "candidate"].contains(&name),
+        "invalid private Git ref kind"
+    );
+    Ok(format!("refs/telete/jobs/{job}/{name}"))
+}
+
+pub(crate) fn ref_value(paths: &Paths, repo: &Path, reference: &str) -> Result<Option<CommitId>> {
+    ensure!(
+        reference == ACCEPTED
+            || reference == PROJECT_ACCEPTED
+            || reference.starts_with("refs/telete/jobs/"),
+        "Telete cannot read another manager's refs"
+    );
+    let result = run(
+        paths,
+        repo,
+        &strings(&["rev-parse", "--verify", reference]),
+        None,
+        BTreeMap::new(),
+    )?;
+    if result.success() {
+        Ok(Some(CommitId::new(result.stdout.trim())?))
+    } else {
+        ensure!(result.exited_with(&[128, 1]), "Git ref observation failed");
+        Ok(None)
+    }
+}
+
+pub(crate) fn advance(
+    paths: &Paths,
+    repo: &Path,
+    reference: &str,
+    old: Option<&CommitId>,
+    new: &CommitId,
+) -> Result<()> {
+    ensure!(
+        reference == ACCEPTED
+            || reference == PROJECT_ACCEPTED
+            || reference.starts_with("refs/telete/jobs/"),
+        "Telete cannot mutate another manager's refs"
+    );
+    let observed = ref_value(paths, repo, reference)?;
+    if observed.as_ref() == Some(new) {
+        return Ok(());
+    }
+    ensure!(
+        observed.as_ref() == old,
+        "private Git ref changed before promotion: {reference}"
+    );
+    let missing = "0".repeat(new.0.len());
+    value(
+        paths,
+        repo,
+        &[
+            "update-ref",
+            reference,
+            &new.0,
+            old.map_or(missing.as_str(), |value| value.0.as_str()),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn ancestor(
+    paths: &Paths,
+    repo: &Path,
+    older: &CommitId,
+    newer: &CommitId,
+) -> Result<bool> {
+    let result = run(
+        paths,
+        repo,
+        &strings(&["merge-base", "--is-ancestor", &older.0, &newer.0]),
+        None,
+        BTreeMap::new(),
+    )?;
+    ensure!(
+        result.exited_with(&[0, 1]),
+        "Git ancestry observation failed"
+    );
+    Ok(result.exit_code == Some(0))
+}
+
+fn private_worktree(paths: &Paths, path: &Path) -> Result<()> {
+    ensure!(
+        path.is_absolute()
+            && path.starts_with(paths.root.join("jobs"))
+            && path.file_name().is_some_and(|name| name == "worktree"),
+        "worktree is outside Telete's jobs"
+    );
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "symbolic candidate worktree"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_worktree(
+    paths: &Paths,
+    repo: &Path,
+    path: &Path,
+    revision: &CommitId,
+) -> Result<()> {
+    private_worktree(paths, path)?;
+    crate::paths::ensure_private(path.parent().context("candidate has no job directory")?)?;
+    if !path.exists() {
+        value(
+            paths,
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &path.display().to_string(),
+                &revision.0,
+            ],
+        )?;
+    }
+    ensure!(
+        common(paths, path)? == common(paths, repo)?,
+        "candidate belongs to another repository"
+    );
+    value(paths, path, &["reset", "--hard", &revision.0])?;
+    value(paths, path, &["clean", "-ffd"])?;
+    Ok(())
+}
+
+pub(crate) fn clean_candidate(paths: &Paths, path: &Path, revision: &CommitId) -> Result<()> {
+    ensure!(
+        commit(paths, path, "HEAD")? == *revision
+            && value(
+                paths,
+                path,
+                &["status", "--porcelain", "--untracked-files=all"]
+            )?
+            .is_empty(),
+        "candidate changed outside its recorded operation"
+    );
+    Ok(())
+}
+
+pub(crate) fn merge(paths: &Paths, path: &Path, input: &CommitId) -> Result<ProcessResult> {
+    run(
+        paths,
+        path,
+        &strings(&[
+            "-c",
+            "merge.autoStash=false",
+            "merge",
+            "--no-commit",
+            "--no-ff",
+            &input.0,
+        ]),
+        None,
+        BTreeMap::new(),
+    )
+}
+
+pub(crate) fn commit_tree(
+    paths: &Paths,
+    repo: &Path,
+    tree: &str,
+    parents: &[CommitId],
+    job: &str,
+    stamp: u64,
+    message: &str,
+) -> Result<CommitId> {
+    let mut arguments = vec!["commit-tree".into(), tree.into()];
+    for parent in parents {
+        arguments.extend(["-p".into(), parent.0.clone()]);
+    }
+    let mut env = BTreeMap::new();
+    for key in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
+        env.insert(key.into(), "Telete".into());
+    }
+    for key in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
+        env.insert(key.into(), "telete@cell.local".into());
+    }
+    for key in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
+        env.insert(key.into(), format!("{stamp} +0000"));
+    }
+    let result = run(
+        paths,
+        repo,
+        &arguments,
+        Some(format!("{message}\n\nTelete-Job: {job}\n")),
+        env,
+    )?;
+    ensure!(
+        result.success(),
+        "Git could not record private candidate: {}",
+        result.stderr.trim()
+    );
+    CommitId::new(result.stdout.trim())
+}
+
+pub(crate) fn patch_tree(
+    paths: &Paths,
+    repo: &Path,
+    parent: &CommitId,
+    raw: &str,
+    index: &Path,
+) -> Result<String> {
+    ensure!(
+        index.is_absolute() && index.starts_with(&paths.root),
+        "private index is outside Telete state"
+    );
+    if let Ok(metadata) = fs::symlink_metadata(index) {
+        ensure!(!metadata.file_type().is_symlink(), "symbolic private index");
+        fs::remove_file(index)?;
+    }
+    let mut env = BTreeMap::new();
+    env.insert("GIT_INDEX_FILE".into(), index.display().to_string());
+    let result = (|| {
+        let initialized = run(
+            paths,
+            repo,
+            &strings(&["read-tree", &parent.0]),
+            None,
+            env.clone(),
+        )?;
+        ensure!(
+            initialized.success(),
+            "Git could not initialize private patch index"
+        );
+        let applied = run(
+            paths,
+            repo,
+            &strings(&["apply", "--cached", "--recount", "--whitespace=nowarn", "-"]),
+            Some(if raw.ends_with('\n') {
+                raw.to_owned()
+            } else {
+                format!("{raw}\n")
+            }),
+            env.clone(),
+        )?;
+        ensure!(
+            applied.success(),
+            "Git rejected patch: {}",
+            applied.stderr.trim()
+        );
+        let tree = run(paths, repo, &strings(&["write-tree"]), None, env)?;
+        ensure!(tree.success(), "Git could not write patched tree");
+        Ok(tree.stdout.trim().to_owned())
+    })();
+    if index.exists() {
+        fs::remove_file(index)?;
+    }
+    result
+}
+
+fn validate_registration(
+    paths: &Paths,
+    repo: &Path,
+    worktree: &Path,
+    registration: &Path,
+) -> Result<()> {
+    let parent = common(paths, repo)?.join("worktrees");
+    ensure!(
+        registration.is_absolute() && registration.parent() == Some(parent.as_path()),
+        "candidate registration is outside linked-worktree metadata"
+    );
+    for path in [&parent, registration] {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "symbolic candidate registration"
+            );
+        }
+    }
+    let marker = registration.join("gitdir");
+    if marker.exists() {
+        ensure!(
+            !fs::symlink_metadata(&marker)?.file_type().is_symlink(),
+            "symbolic registration marker"
+        );
+        ensure!(
+            Path::new(fs::read_to_string(marker)?.trim()) == worktree.join(".git"),
+            "registration belongs to another worktree"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn registration(paths: &Paths, repo: &Path, worktree: &Path) -> Result<Option<PathBuf>> {
+    private_worktree(paths, worktree)?;
+    let marker = worktree.join(".git");
+    if marker.exists() {
+        ensure!(
+            !fs::symlink_metadata(&marker)?.file_type().is_symlink(),
+            "symbolic candidate Git marker"
+        );
+        let text = fs::read_to_string(marker)?;
+        let registration = PathBuf::from(
+            text.trim()
+                .strip_prefix("gitdir: ")
+                .context("invalid worktree Git marker")?,
+        );
+        validate_registration(paths, repo, worktree, &registration)?;
+        return Ok(Some(registration));
+    }
+    let parent = common(paths, repo)?.join("worktrees");
+    if parent.exists() {
+        ensure!(
+            !fs::symlink_metadata(&parent)?.file_type().is_symlink(),
+            "symbolic linked-worktree directory"
+        );
+        for entry in fs::read_dir(parent)? {
+            let path = entry?.path();
+            let marker = path.join("gitdir");
+            if marker.is_file()
+                && !fs::symlink_metadata(&marker)?.file_type().is_symlink()
+                && fs::read_to_string(&marker)?.trim()
+                    == worktree.join(".git").display().to_string()
+            {
+                validate_registration(paths, repo, worktree, &path)?;
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn remove_worktree(
+    paths: &Paths,
+    repo: &Path,
+    worktree: &Path,
+    retained: Option<&Path>,
+) -> Result<()> {
+    private_worktree(paths, worktree)?;
+    let inventory = value(paths, repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let trees = inventory
+        .split('\0')
+        .filter_map(|record| record.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    ensure!(
+        trees.first().is_none_or(|path| path != worktree),
+        "cannot remove primary worktree"
+    );
+    let registration = if let Some(path) = retained {
+        validate_registration(paths, repo, worktree, path)?;
+        Some(path.to_path_buf())
+    } else {
+        registration(paths, repo, worktree)?
+    };
+    if worktree.exists() {
+        fs::remove_dir_all(worktree)?;
+    }
+    if trees.iter().any(|path| path == worktree) {
+        value(
+            paths,
+            repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                &worktree.display().to_string(),
+            ],
+        )?;
+    }
+    if let Some(path) = registration
+        && path.exists()
+    {
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}

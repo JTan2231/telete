@@ -1,0 +1,46 @@
+{
+  "schema_version": 4,
+  "provider": {
+    "id": "telete",
+    "name": "Telete",
+    "release": "0.1.0"
+  },
+  "promise_scope": {
+    "authoritative_for": [
+      "Telete frozen project workflows, queue and command records, private candidates, and selected guarded advancement of refs/telete/project-accepted for project workflows or refs/telete/accepted for Cell.",
+      "Shared Cell external-workspace selection and native signing policy under Telete maintenance guards.",
+      "The retained local workspace binding of a newly initialized project queue and its controlled runtime paths."
+    ],
+    "not_authoritative_for": [
+      "Provider runtime outcomes, product domain state, and final inbox delivery."
+    ],
+    "inventory": {
+      "covers": [
+        "Telete project workflow submission, exact candidate checking, selected integration and acceptance, preparation, deployment, repair, notification, and installation commands, including Cell native CI.",
+        "Initial shared host storage selection, storage inspection, initial signing-certificate creation, and explicit shared signing selection."
+      ],
+      "completeness": "complete",
+      "excludes": [
+        "A public Rust CI client, Iatreion status probes, checked evidence types, and remote Git publication."
+      ]
+    },
+    "shared_access_and_trust": [
+      "Local current-user commands. New explicitly initialized project queues select private local state; Cell and existing queues retain the shared external APFS workspace selection.",
+      "Host setup selects the current account home independently of HOME and --state; Keychain retains private-key authority."
+    ],
+    "shared_privacy_and_retention": [
+      "Retained source, prompts, diagnostics, requests, and receipts are private operational records."
+    ],
+    "compatibility_and_retirement": [
+      "Telete journal and receipt schemas are checked explicitly; the shared host workspace and signing formats remain schema one."
+    ],
+    "operational_limits": [
+      "One delivery lifecycle, one heavy gate, two light gates; no completion-time guarantee."
+    ]
+  },
+  "overview": "overview.md",
+  "entries": [
+    "entries/queue-operate.json",
+    "entries/signing-operate.json"
+  ]
+}

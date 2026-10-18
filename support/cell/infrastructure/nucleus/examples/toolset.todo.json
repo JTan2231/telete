@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "toolset": {
+    "provider": "todo",
+    "name": "research-liaison",
+    "version": 1
+  },
+  "definitionsSchemaId": "nucleus.toolset-definitions.v1",
+  "definitions": {
+    "version": 1,
+    "tools": [
+      {
+        "name": "create_todo",
+        "description": "Durably create the one researched todo for this session. Call exactly once, after research is complete. The host supplies provenance, status, and timestamps.",
+        "inputSchemaId": "todo.create-todo.arguments.v1",
+        "inputSchema": {"type":"object","additionalProperties":false,"required":["title","note"],"properties":{"title":{"type":"string","minLength":1,"description":"A concise, specific title drawn from the work itself."},"note":{"type":"string","minLength":1,"description":"The self-contained, actionable todo note, using Markdown where useful."}}}
+      }
+    ]
+  },
+  "digest": "sha256:47bdc839a43faeaa007e36e5e34d99e1f4cc66773b980868e15c4ac4d110014d"
+}

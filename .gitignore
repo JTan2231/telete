@@ -1,0 +1,4 @@
+/target/
+/.telete/
+__pycache__/
+.DS_Store
