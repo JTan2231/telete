@@ -1,30 +1,30 @@
 {
   "id": "telete.queue.operate",
-  "contract_version": 10,
+  "contract_version": 11,
   "kind": "capability",
   "mode": "operate",
   "support": "supported",
   "title": "Operate the Telete source workflow queue",
-  "summary": "Submit committed source with a frozen project workflow for checks and selected delivery stages, or use Cell native validation, signed preparation, deployment, repair, and notification.",
+  "summary": "Submit committed source with a frozen project workflow for checks and selected delivery stages, or use Cell native validation, signed preparation, and deployment.",
   "use_when": [
     "Check an exact commit in another repository with a separate project queue, caller-supplied workflow, and selected optional stages.",
     "Operate an explicitly initialized Telete installation.",
     "Configure the shared external work volume or explicitly create or select the shared Cell signing identity through Rust host setup."
   ],
   "do_not_use_when": [
-    "Infer product health or final inbox delivery from CI completion."
+    "Infer product health from CI completion."
   ],
-  "outcome": "Telete retains the exact selected source workflow outcome and its separate acceptance, deployment, and notification observations, or records the selected host configuration.",
+  "outcome": "Telete retains the exact selected source workflow outcome and its separate acceptance and deployment observations, or records the selected host configuration.",
   "effects": [
     "Creates private Git candidates and conditionally advances the selected accepted ref: refs/telete/project-accepted for project workflows or refs/telete/accepted for Cell.",
-    "Runs frozen project check and selected trusted preparation and deployment commands; enabled Cell integrations add provider calls, native signing, and product deployment instructions.",
+    "Runs frozen project check and selected trusted preparation and deployment commands; Cell stages add native signing and product deployment instructions.",
     "Explicit storage and signing commands publish shared current-user Cell host settings; initial signing imports one certificate and private key and adds user code-signing trust.",
-    "Guarded cancellation retains the original blocked Cell validation operation in an abandonment record before clearing unresolved intent and setting the job phase to cancelled. The failure, process identities, receipts, notification, and queue pause remain retained; cancellation starts no new invocation."
+    "Guarded cancellation retains the original blocked Cell validation operation in an abandonment record before clearing unresolved intent and setting the job phase to cancelled. The failure, process identities, receipts, and queue pause remain retained; cancellation starts no new invocation."
   ],
   "authority": [
     "Telete records and runtime correlation checks decide source acceptance.",
     "The caller selects the frozen project workflow. Candidate source supplies its relative check executable; trusted host paths select preparation and deployment. Generic stage success requires the exact retained command completion; commands own stronger domain claims.",
-    "Each provider and product retains its own execution, transport, installation, and domain authority.",
+    "Each provider and product retains its own documentation, recognition, installation, and domain authority.",
     "Telete owns the shared current-user storage and signing selectors; Keychain retains private-key authority."
   ],
   "success": [
@@ -33,15 +33,15 @@
   ],
   "failure_and_recovery": [
     "Uncertain admitted effects remain retained and block admission until their exact operation is reconciled.",
-    "Service stop also permits a paused blocked deployment with an exact successful receipt, unchanged accepted source, settled notification and exclusive settled compiler and deployment resources; the job remains retained for explicit recovery without deployment replay.",
-    "Service stop permits one paused Cell queue with a blocked unaccepted failed preparation, an exact unresolved production-generation/candidate/owned-path operation, no final receipt, notification disabled or settled, unchanged accepted base and private candidate, a clean same-repository worktree, and exclusive settled compiler and deployment resources. Other queued, unresolved, model, preparation, acceptance, or deployment work is absent. Stop preserves all job records and performs no replay; use guarded acknowledge-preparation, correct the failure, and submit a new request. Project workflows are excluded. Jobs with frozen command policy also require the exact outer preparation request and correlated ordinary failed terminal completion under commands/production-N, without timeout, signal, start error, or output-capture error. Missing outer completion and present, dangling, or inaccessible final receipt or active deployment records block stop. Legacy jobs without the outer command retain their existing evidence requirements.",
+    "Service stop also permits a paused blocked deployment with an exact successful receipt, unchanged accepted source, and exclusive settled compiler and deployment resources; the job remains retained for explicit recovery without deployment replay.",
+    "Service stop permits one paused Cell queue with a blocked unaccepted failed preparation, an exact unresolved production-generation/candidate/owned-path operation, no final receipt, unchanged accepted base and private candidate, a clean same-repository worktree, and exclusive settled compiler and deployment resources. Other queued, unresolved, preparation, acceptance, or deployment work is absent. Stop preserves all job records and performs no replay; use guarded acknowledge-preparation, correct the failure, and submit a new request. Project workflows are excluded. Jobs with frozen command policy also require the exact outer preparation request and correlated ordinary failed terminal completion under commands/production-N, without timeout, signal, start error, or output-capture error. Missing outer completion and present, dangling, or inaccessible final receipt or active deployment records block stop. Legacy jobs without the outer command retain their existing evidence requirements.",
     "Service stop permits one paused blocked validation with exact completed Autofix evidence and settled resources; it preserves the unresolved job for explicit recovery without validator replay.",
     "A different storage selection is refused. Failed signing preflight preserves existing policy; interrupted certificate creation can leave Keychain effects without a policy and requires explicit inspection and selection.",
-    "Cancellation may abandon one paused blocked unaccepted Cell checking job without an aggregate report after either an exact terminal timed-out bounded legacy dispatcher or an exact failed candidate-validator bootstrap with a normal nonzero exit and no timeout, signal, start error, or output-capture error. The bootstrap path requires no dispatcher admission in any supported identity family. Both paths retain all guards: terminal settled children, exclusive resources, unchanged accepted base and exact private candidate, a clean worktree, an accepted settled failure notice, and no other queued work, preparation, source acceptance, deployment, or unresolved model work. Project workflow jobs are excluded. Cancellation starts no invocation, replays no validation, and claims no pass.",
+    "Cancellation may abandon one paused blocked unaccepted Cell checking job without an aggregate report after either an exact terminal timed-out bounded legacy dispatcher or an exact failed candidate-validator bootstrap with a normal nonzero exit and no timeout, signal, start error, or output-capture error. The bootstrap path requires no dispatcher admission in any supported identity family. Both paths retain all guards: terminal settled children, exclusive resources, unchanged accepted base and exact private candidate, a clean worktree, and no other queued work, preparation, source acceptance, or deployment. Project workflow jobs are excluded. Cancellation starts no invocation, replays no validation, and claims no pass.",
     "Only explicit new project initialization can create local state. Missing, foreign, incomplete, corrupt or mismatched journals do not imply local mode. Worker subprocesses reopen the same retained workspace binding. No relocation or new recovery workflow is supplied."
   ],
   "privacy": [
-    "Source, workflow parameters, command environments, outputs, diagnostics, and receipts remain private operational records. Enabled repair can send source and diagnostics to the selected Nucleus model; enabled notification can send frozen outcome text to Email's configured provider and recipient.",
+    "Source, workflow parameters, command environments, outputs, diagnostics, and receipts remain private operational records.",
     "Signing policy retains only the public fingerprint, Keychain path, profile and namespace. Private external generation files are removed on ordinary completion; Keychain retains the key."
   ],
   "does_not_authorize": [
@@ -87,21 +87,6 @@
   ],
   "dependencies": [
     {
-      "id": "nucleus.requester.integrate",
-      "min_contract": 3,
-      "max_contract_exclusive": 4
-    },
-    {
-      "id": "bazaar.string.read",
-      "min_contract": 2,
-      "max_contract_exclusive": 3
-    },
-    {
-      "id": "email.message.send",
-      "min_contract": 4,
-      "max_contract_exclusive": 5
-    },
-    {
       "id": "chancery.bundle.validate",
       "min_contract": 3,
       "max_contract_exclusive": 4
@@ -127,15 +112,11 @@
     "preconditions": [
       {
         "status": "declared",
-        "statement": "New local project queues require explicit --state and init --project, a private normalized local directory, an initialized queue, and supported macOS tools. Cell and existing queues without a local workspace binding retain configured external APFS storage. Provider state is required only for enabled integrations. Check execution uses the macOS filesystem sandbox; Linux execution is not supplied."
+        "statement": "New local project queues require explicit --state and init --project, a private normalized local directory, an initialized queue, and supported macOS tools. Cell and existing queues without a local workspace binding retain configured external APFS storage. Check execution uses the macOS filesystem sandbox; Linux execution is not supplied."
       },
       {
         "status": "declared",
         "statement": "Project workflows require a separate project queue; use the same --state directory for every command. Cell submissions require a Cell queue. Cross-mode submissions are rejected. New local queues derive worktrees, temporary files, Cargo downloads, targets and caches from their selected state root; existing queues retain their prior layout."
-      },
-      {
-        "status": "declared",
-        "statement": "New notifying jobs require the public Email command to resolve to the regular Email/install/runtime/bin/email file. Install Email with fixed runtime support before submitting these jobs."
       },
       {
         "status": "declared",
@@ -145,11 +126,11 @@
     "inputs": [
       {
         "status": "declared",
-        "statement": "Exact committed source and frozen job policy. A project workflow is read from an absolute regular JSON file and contains a required check command, optional integrate and accept selections, optional trusted prepare and deploy commands, parameters, and repair and notification opt-ins. Cell jobs retain selected product declarations and optional settings from an absolute regular JSON file mapping explicitly selected canonical product IDs to objects."
+        "statement": "Exact committed source and frozen job policy. A project workflow is read from an absolute regular JSON file and contains a required check command, optional integrate and accept selections, optional trusted prepare and deploy commands, and parameters. Cell jobs retain selected product declarations and optional settings from an absolute regular JSON file mapping explicitly selected canonical product IDs to objects."
       },
       {
         "status": "declared",
-        "statement": "Project commands contain program, optional literal args, optional env overrides, and optional timeout_seconds. Check programs are absolute or normalized relative paths below the exact candidate checkout; prepare and deploy programs are absolute host paths. All commands run in the candidate checkout. integrate, accept, repair, and notify default to false; parameters defaults to an empty object. Acceptance requires integration and deployment requires preparation. --workflow conflicts with Cell test, deployment, and settings flags; --no-repair and --no-notify can disable workflow opt-ins."
+        "statement": "Project commands contain program, optional literal args, optional env overrides, and optional timeout_seconds. Check programs are absolute or normalized relative paths below the exact candidate checkout; prepare and deploy programs are absolute host paths. All commands run in the candidate checkout. integrate and accept default to false; parameters defaults to an empty object. Acceptance requires integration and deployment requires preparation. --workflow conflicts with Cell test, deployment, and settings flags."
       },
       {
         "status": "declared",
@@ -159,7 +140,7 @@
     "outputs": [
       {
         "status": "declared",
-        "statement": "Retained job, gate, preparation, deployment, repair, and notification records."
+        "statement": "Retained job, gate, preparation, and deployment records."
       },
       {
         "status": "declared",
@@ -173,7 +154,7 @@
       },
       {
         "status": "declared",
-        "statement": "The fixed order is optional integration, check, optional preparation, optional acceptance, and optional deployment. A stage not selected is not a successful execution. The journal distinguishes submitted source, captured integration base, and tested candidate; merged and repaired candidate results do not claim the submitted tree passed unchanged."
+        "statement": "The fixed order is optional integration, check, optional preparation, optional acceptance, and optional deployment. A stage not selected is not a successful execution. The journal distinguishes submitted source, captured integration base, and tested candidate; merged candidate results do not claim the submitted tree passed unchanged."
       },
       {
         "status": "declared",
@@ -181,7 +162,7 @@
       },
       {
         "status": "declared",
-        "statement": "Checking, source acceptance, preparation, instruction completion, generic command completion, and Email acceptance have distinct meanings."
+        "statement": "Checking, source acceptance, preparation, instruction completion, and generic command completion have distinct meanings."
       },
       {
         "status": "declared",
@@ -198,6 +179,14 @@
       {
         "status": "declared",
         "statement": "Project contexts identify submitted source in source.input, the captured base in source.base (null without integration), and the tested candidate in source.candidate. parameters is the frozen supplied object. outputs.directory is the private absolute job outputs/OPERATION directory. inputs.preparation is null or names the same-candidate successful prepare receipt with stage, candidate, operation, command, result, and stamp; command.context.value.outputs.directory identifies its outputs. Commands own output layout and meaning; Telete supplies no generic package or output schema."
+      },
+      {
+        "status": "declared",
+        "statement": "Cell retains deterministic formatting and Clippy autofix. Remaining check and compilation failures stay failed; correct the source and submit a new job."
+      },
+      {
+        "status": "declared",
+        "statement": "prompts/repair-instructions.txt and prompts/repair-prompt.txt retain authored text as plain inactive source assets. No workflow reads or executes them."
       }
     ],
     "identity_and_units": [
@@ -237,7 +226,7 @@
       },
       {
         "status": "declared",
-        "statement": "Project integration captures refs/telete/project-accepted when the worker claims the job. Repairs retain that base. Selected project acceptance uses an expected-old update of that ref; a ref conflict does not select a new base inside that job. Disabled acceptance performs no ref advancement. Cell retains refs/telete/accepted and its native acceptance rules."
+        "statement": "Project integration captures refs/telete/project-accepted when the worker claims the job. Candidate merges retain that base. Selected project acceptance uses an expected-old update of that ref; a ref conflict does not select a new base inside that job. Disabled acceptance performs no ref advancement. Cell retains refs/telete/accepted and its native acceptance rules."
       },
       {
         "status": "declared",
@@ -253,19 +242,19 @@
       },
       {
         "status": "declared",
-        "statement": "For Cell validation, process completion and a correlated aggregate report are both required for validation. Preparation's existing record identifies its staged-output handoff and compilation-only repair outcome. Deployment instruction receipts remain authoritative when the outer command subsequently fails; recovery preserves completed effects without instruction replay. Output-collection failures do not erase known terminal process evidence."
+        "statement": "For Cell validation, process completion and a correlated aggregate report are both required for validation. Preparation's existing record identifies its staged-output handoff. Deployment instruction receipts remain authoritative when the outer command subsequently fails; recovery preserves completed effects without instruction replay. Output-collection failures do not erase known terminal process evidence."
       },
       {
         "status": "declared",
-        "statement": "A paused service may stop with one blocked deployment only after its exact successful receipt, unchanged accepted source, settled notification and exclusive settled compiler and deployment resources are proved. The job and receipts remain unchanged for explicit recovery; installation and signing still require a drained queue."
+        "statement": "A paused service may stop with one blocked deployment only after its exact successful receipt, unchanged accepted source, and exclusive settled compiler and deployment resources are proved. The job and receipts remain unchanged for explicit recovery; installation and signing still require a drained queue."
       },
       {
         "status": "declared",
-        "statement": "A paused Cell service may stop with one blocked unaccepted failed preparation only when its unresolved operation matches the current production generation, exact candidate, and owned result path; both final preparation receipts are absent; notification is disabled or accepted and settled; accepted base and private candidate are unchanged; and the same-repository worktree is clean. Other queued or unresolved jobs, model work, preparation results, source acceptance, and deployment are absent. Existing stop ownership holds exclusive settled compiler and deployment resources. Stop changes no job, operation, outcome, notification, or receipt and replays nothing. Guarded acknowledge-preparation and a fresh submission remain separate actions. Project workflows are excluded; installation and signing maintenance still require a drained queue. Jobs with frozen command policy require commands/production-N to retain the exact expected preparation request and correlated terminal ordinary nonzero exit with no timeout, signal, start error, or output-capture error. Missing or abnormal completion blocks stop. Present, dangling, or inaccessible final receipt or active deployment records block stop. Legacy jobs without that outer command retain their existing evidence requirements."
+        "statement": "A paused Cell service may stop with one blocked unaccepted failed preparation only when its unresolved operation matches the current production generation, exact candidate, and owned result path; both final preparation receipts are absent; accepted base and private candidate are unchanged; and the same-repository worktree is clean. Other queued or unresolved jobs, preparation results, source acceptance, and deployment are absent. Existing stop ownership holds exclusive settled compiler and deployment resources. Stop changes no job, operation, outcome, or receipt and replays nothing. Guarded acknowledge-preparation and a fresh submission remain separate actions. Project workflows are excluded; installation and signing maintenance still require a drained queue. Jobs with frozen command policy require commands/production-N to retain the exact expected preparation request and correlated terminal ordinary nonzero exit with no timeout, signal, start error, or output-capture error. Missing or abnormal completion blocks stop. Present, dangling, or inaccessible final receipt or active deployment records block stop. Legacy jobs without that outer command retain their existing evidence requirements."
       },
       {
         "status": "declared",
-        "statement": "A paused service may stop with one blocked validation only after matching job and canonical Autofix reports, its exact successful unbounded dispatcher, exact retained patch, unchanged accepted base and private candidate, clean worktree and settled accepted failure notice are proved. Preparation, acceptance, deployment, unresolved model work and other queued work are absent. Stop holds exclusive settled compiler and deployment resources and changes no job or receipt; installation and signing still require a drained queue."
+        "statement": "A paused service may stop with one blocked validation only after matching job and canonical Autofix reports, its exact successful unbounded dispatcher, exact retained patch, unchanged accepted base and private candidate, and clean worktree are proved. Preparation, acceptance, deployment, and other queued work are absent. Stop holds exclusive settled compiler and deployment resources and changes no job or receipt; installation and signing still require a drained queue."
       },
       {
         "status": "declared",
@@ -273,11 +262,11 @@
       },
       {
         "status": "declared",
-        "statement": "Guarded Cell validation abandonment retains the original Operation in validation-N.abandoned.json before clearing unresolved intent and setting the job phase to cancelled. It requires either exact timed-out bounded legacy dispatcher evidence or an exact normal failed bootstrap with no dispatcher admission under any supported identity family, plus all source, notification, queue, and resource guards. It preserves the failed outcome, accepted notification, process identities, receipts, and queue pause; advances no accepted source; starts no invocation; and requires a new request ID for another delivery job. Project workflow jobs cannot use this abandonment."
+        "statement": "Guarded Cell validation abandonment retains the original Operation in validation-N.abandoned.json before clearing unresolved intent and setting the job phase to cancelled. It requires either exact timed-out bounded legacy dispatcher evidence or an exact normal failed bootstrap with no dispatcher admission under any supported identity family, plus all source, queue, and resource guards. It preserves the failed outcome, process identities, receipts, and queue pause; advances no accepted source; starts no invocation; and requires a new request ID for another delivery job. Project workflow jobs cannot use this abandonment."
       },
       {
         "status": "declared",
-        "statement": "An admitted generic check, preparation, or deployment without terminal evidence remains unresolved. Recovery reconciles exact retained broker terminal evidence without reconstructing or replaying the command. Telete supplies no generic abandonment or acknowledgement for missing terminal evidence and does not roll back uncertain effects. Notification failure does not repeat deployment or change a successful check result."
+        "statement": "An admitted generic check, preparation, or deployment without terminal evidence remains unresolved. Recovery reconciles exact retained broker terminal evidence without reconstructing or replaying the command. Telete supplies no generic abandonment or acknowledgement for missing terminal evidence and does not roll back uncertain effects."
       }
     ],
     "operational_limits": [
@@ -287,7 +276,7 @@
       },
       {
         "status": "unspecified",
-        "statement": "No completion deadline, total refunded-repair invocation ceiling, or inbox-delivery guarantee is supplied."
+        "statement": "No completion deadline is supplied."
       },
       {
         "status": "declared",
@@ -310,10 +299,6 @@
       {
         "status": "declared",
         "statement": "Contract 2 narrows product selection and adds shared platform tests. Validation receipts remain schema 1; retained receipts keep their recorded scope without migration or reinterpretation."
-      },
-      {
-        "status": "declared",
-        "statement": "Contract 6 saves the fixed Email runtime path for new notifying jobs without freezing Email release bytes. Existing jobs retain their saved command paths and policies, including archive paths; request-ID replay returns the original job without selecting a new provider path."
       },
       {
         "status": "unspecified",
@@ -350,30 +335,13 @@
       {
         "status": "declared",
         "statement": "An optional initialization-derived workspace path in queue configuration selects local storage only for a project queue and must equal its normalized state root. An absent field preserves legacy external storage, including older project queues. Reinitialization cannot add or change the binding. Journal, receipt and contract versions remain unchanged."
+      },
+      {
+        "status": "declared",
+        "statement": "Contract 11 removes model repair, outcome notification, and the runtime prompt-store integration. Project workflows no longer accept repair or notify selections."
       }
     ],
     "reliances": [
-      {
-        "status": "declared",
-        "statement": "When enabled, repair uses Nucleus execution without transferring source acceptance authority.",
-        "target": "nucleus",
-        "kind": "control",
-        "contract": "nucleus.requester.integrate"
-      },
-      {
-        "status": "declared",
-        "statement": "When enabled, repair reads dedicated immutable Bazaar prompt versions.",
-        "target": "bazaar",
-        "kind": "data",
-        "contract": "bazaar.string.read"
-      },
-      {
-        "status": "declared",
-        "statement": "When enabled, notification uses fixed-recipient Email transport.",
-        "target": "email",
-        "kind": "control",
-        "contract": "email.message.send"
-      },
       {
         "status": "declared",
         "statement": "Cell validation: provider checks use Chancery's owned bundle codecs and validator.",

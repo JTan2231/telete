@@ -2,8 +2,8 @@
 
 Telete orchestrates checks and delivery of committed source in Rust. A project
 workflow supplies a check command and optional trusted preparation and deployment
-commands. Integration, acceptance, repair, and notification are explicit
-selections. Telete owns the executable, journal, private worktrees, Git references,
+commands. Integration and acceptance are explicit selections.
+Telete owns the executable, journal, private worktrees, Git references,
 command records, and Cell's explicitly installed user service.
 
 A check-only job starts from the submitted commit and needs no accepted-source
@@ -43,11 +43,14 @@ and configured native signing. The deployment executor performs product-owned
 instructions in order. Cell validation requires process completion and its
 correlated aggregate report.
 
-When selected, Nucleus owns agent execution, Bazaar owns versioned repair prompt
-text, and Email owns
-message transport. Chancery owns provider document formats. Usher owns Cell
+Chancery owns provider document formats. Usher owns Cell
 membership recognition. Telete uses their supported Rust interfaces and retains
 its own domain decisions.
+
+Cell retains deterministic formatting and Clippy autofix. Remaining check and
+compilation failures stay failed; correct the source and submit a new job.
+`prompts/repair-instructions.txt` and `prompts/repair-prompt.txt` retain authored
+text as inactive assets. No workflow reads or executes them.
 
 New project queues initialized with explicit `--state` and `init --project` use
 that private local directory as their working area. Worktrees, temporary files,

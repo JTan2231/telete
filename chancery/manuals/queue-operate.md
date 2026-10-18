@@ -120,25 +120,24 @@ show one of these conditions:
 
 Both paths require terminal settled child evidence, exclusive compiler and
 deployment resources, an unchanged accepted base and exact private candidate,
-a clean worktree, and an accepted settled failure notice. There must be no
-other queued work, preparation, source acceptance, deployment, or unresolved
-model work. Project workflow jobs cannot use this abandonment.
+a clean worktree, and no other queued work, preparation, source acceptance, or
+deployment. Project workflow jobs cannot use this abandonment.
 
 The command retains the original operation in `validation-N.abandoned.json`,
 clears its unresolved intent, and sets the job phase to `cancelled`. The failed
-outcome, process identities, receipts, notification, and queue pause remain
+outcome, process identities, receipts, and queue pause remain
 retained. Cancellation starts no invocation, replays no validation, and claims
 no pass. Submit the corrected source with a new request ID for another delivery
 job. Use a matching executor for this recovery; building it does not install
 Telete.
 
 Reuse `--request-id KEY` only for the same frozen submission. A changed input,
-workflow, command, parameter, test policy, deployment selection, setting, repair
-policy, or notification policy needs a new key. Reuse returns the original job
+workflow, command, parameter, test policy, deployment selection, or setting
+needs a new key. Reuse returns the original job
 with its original selections.
 
-Cell jobs skip tests unless `--run-tests` is supplied. `--no-repair`,
-`--no-deploy`, and `--no-notify` freeze explicit choices for Cell jobs.
+Cell jobs skip tests unless `--run-tests` is supplied. `--no-deploy` freezes
+the choice to skip Cell deployment.
 
 ## Select a project workflow
 
@@ -160,8 +159,7 @@ workflow and command fields are rejected. For example:
 ```
 
 The check executable must be an absolute path or a normalized relative path
-below the exact candidate checkout. Each repaired candidate supplies its own
-relative executable. An absolute path selects a host executable. An executable
+below the exact candidate checkout. An absolute path selects a host executable. An executable
 path does not freeze the executable's bytes.
 
 Each command has `program`, optional literal `args`, optional `env` overrides,
@@ -179,8 +177,6 @@ The workflow has these additional fields:
 | `accept` | `false` | Conditionally advance project accepted source; requires `integrate`. |
 | `deploy` | absent | Run an absolute trusted host command; requires `prepare`. |
 | `parameters` | `{}` | Pass the frozen object unchanged in each command context. |
-| `repair` | `false` | Enable the configured Nucleus and Bazaar repair path. |
-| `notify` | `false` | Enable the configured Email outcome notification. |
 
 The fixed order is optional integration, check, optional preparation, optional
 acceptance, and optional deployment. Telete refuses acceptance without
@@ -200,8 +196,7 @@ directories. Telete reserves all `TELETE_` names, `HOME`, `TMPDIR`, `TMP`, `TEMP
 `CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME`, `XDG_CACHE_HOME`,
 `CLANG_MODULE_CACHE_PATH`, `SWIFT_MODULECACHE_PATH`, and `CHANCERY_USAGE_INTERNAL`.
 
-`--no-repair` and `--no-notify` can disable workflow opt-ins. Do not combine
-`--workflow` with Cell's `--run-tests`, `--skip-tests`, `--deploy`, `--settings`,
+Do not combine `--workflow` with Cell's `--run-tests`, `--skip-tests`, `--deploy`, `--settings`,
 or `--no-deploy` flags. Put project choices in `parameters` and the selected
 commands.
 
@@ -213,17 +208,18 @@ requires the retained successful command completion for that exact candidate.
 It does not establish source acceptance or deployment.
 
 Integration captures `refs/telete/project-accepted` when the worker claims the
-job. All candidate merges and repairs retain that base. The journal distinguishes the
-submitted source, integration base, and tested candidate. A repaired or merged
+job. Candidate merges retain that base. The journal distinguishes the
+submitted source, integration base, and tested candidate. A merged
 candidate's pass does not report that the submitted tree passed unchanged.
 Acceptance uses an expected-old update of the project ref against the captured
 base. A concurrent ref change fails that update; Telete does not select a new
 base inside the job.
 
-Disabled repair performs no Nucleus or Bazaar preflight. Disabled notification
-performs no Email lookup. An absent preparation command performs no signing
-lookup. The declared provider dependencies remain required documentation for
-the corresponding enabled integrations and Cell stages.
+An absent preparation command performs no signing lookup. The declared provider
+dependencies remain required documentation for the corresponding Cell stages.
+
+A failed project check or preparation remains failed. Correct the source and
+submit a new job; Telete does not request model repair or send outcome messages.
 
 Generic preparation passes its retained successful command record and output
 destinations to the next stage through `TELETE_CONTEXT`. Commands own the
@@ -271,18 +267,10 @@ Install the matching Telete before admitting jobs with nonempty settings; older
 Telete cannot read that job option. Telete's own bootstrap and program maintenance
 continue to use its guarded `telete install` procedure below.
 
-## Notify and coordinate maintenance
-
-New jobs with notifications require the public Email command to resolve to the
-regular file at `~/Library/Application Support/Email/install/runtime/bin/email`.
-Telete saves that fixed path in the job policy. Email updates replace the file
-at that path; the policy does not freeze Email release bytes. Install Email with
-fixed runtime support before submitting these jobs. Existing jobs retain their
-saved command paths, including archive paths. Reusing an existing request ID
-returns its original job without selecting a new Email path.
+## Coordinate admission maintenance
 
 Use `telete maintenance hold --owner OWNER`, `maintenance status`, and
-`maintenance release --owner OWNER` to coordinate requester maintenance. Release
+`maintenance release --owner OWNER` to coordinate queue admission during maintenance. Release
 only the owner acquired by that operation. A release does not clear operator
 pause or an unresolved job.
 
@@ -346,8 +334,8 @@ older programs cannot read that policy. Installation remains a separate operatio
 ## Validate Cell source
 
 Each claimed job captures Telete's accepted source as its fixed base and merges
-the submitted commit in a private worktree. Conflicts stop the job. Repairs
-produce new private candidates. Validation compares each candidate to the same
+the submitted commit in a private worktree. Conflicts stop the job. Deterministic
+formatting and Clippy autofix can produce a new private candidate. Validation compares each candidate to the same
 base, including deletions and both rename paths.
 
 The validator loads literal product descriptors and Cargo metadata. Telete's
@@ -381,7 +369,7 @@ production preparation, and signing. Missing candidate support fails explicitly.
 New dispatches run the candidate's regular `pipeline/cell/check.sh` file through
 `/bin/sh`, with the exact compiled validator and validation arguments. A candidate
 without this entry point fails; there is no direct-validator fallback. Telete
-requires a clean checkout of the exact candidate before dispatch. Each repair
+requires a clean checkout of the exact candidate before dispatch. Each deterministic autofix
 selects the script and validator from its new candidate under the frozen policy.
 The script path does not freeze the first candidate's script contents. Telete
 requires both successful command completion and the correlated aggregate report.
@@ -413,29 +401,10 @@ reuse an identity. Missing terminal evidence blocks the resource slot; process
 disappearance is not success. `telete gates` exposes retained diagnostic records.
 No automatic pruning or uncertain-gate replay is supplied.
 
-## Repair through providers
-
-Enabled repair uses `nucleus-core` and `nucleus-client`. Nucleus owns execution
-and its credential. Telete freezes the exact request, requester identity, model policy,
-and dedicated Bazaar prompt versions before admission. Read-only workspace
-access, local execution, and disabled web search are explicit request policy.
-
-Bazaar must contain `cell.prompts.telete`, whose schema-one `entries` map pins
-positive versions of `telete.repair.instructions` and `telete.repair.prompt`.
-The prompt contains `{context}`. Read the source seed at
-`../../prompts/seed.json`; import its reviewed components before its selection.
-Runtime reads do not initialize Bazaar or fall back to source prompt files.
-
-Only the final model response supplies the raw patch. Git decides whether it
-applies to the private parent index. Telete records the resulting candidate
-before refunding that attempt's budget point. Rejected or failed attempts stay
-charged. Refunded attempts retain unique history and can exceed the total
-charged budget's invocation count.
-
-Quota deferral and uncertain admission preserve the same request. Recovery
-observes the exact Nucleus identity. An authoritative `not_found` permits that
-same request; lost or unavailable execution remains blocked. A repair proposal
-does not prove validation or source acceptance.
+Remaining check failures stay failed. Correct the source and submit a new job.
+The plain files `prompts/repair-instructions.txt` and
+`prompts/repair-prompt.txt` retain authored repair text as inactive source assets.
+No workflow reads or executes them.
 
 ## Prepare and execute Cell deployment
 
@@ -446,7 +415,7 @@ request. These commands do not submit work or advance accepted source. They are
 internal worker entry points, not separate delivery interfaces.
 
 The commands have no outer execution deadline. Preparation retains its existing
-compiler gates, staging receipts, and compilation-only repair outcome. Deployment
+compiler gates and staging receipts. Deployment
 retains its existing instruction receipts and uncertainty rules. The manager
 reads those records to decide the next phase; command exit alone cannot establish
 deployment success. No new outer broker gate changes settlement or recovery.
@@ -454,8 +423,8 @@ deployment success. No new outer broker gate changes settlement or recovery.
 Preparation supplies its existing retained preparation record as the deployment
 handoff. Telete checks source, product scope, signing policy, and staged-output
 correlation before source acceptance and deployment. A mutable latest-output path
-does not replace that handoff. Compilation failures can enter repair; signing and
-infrastructure failures cannot use compilation repair.
+does not replace that handoff. Compilation, signing, and infrastructure failures
+remain failures and do not request model repair.
 
 The deployment receipt remains authoritative for completed instruction effects
 if the outer command subsequently fails. Recovery accounts for those effects
@@ -474,16 +443,15 @@ paused, drained Telete work and settled Telete deployment.
 
 Use `telete signing status` to inspect the selected identity. Keychain access or
 native authorization can require the user. Signing and preparation failures
-stop before source acceptance. Compiler failures can use the frozen repair
-budget. There is no alternate certificate or unsigned fallback.
+stop before source acceptance. There is no alternate certificate or unsigned fallback.
 
 Inspect retained gate receipts and staging effects when preparation stops without
 a final receipt. Stop the worker and pause the queue. Use `telete
 acknowledge-preparation JOB` only to abandon that blocked preparation. The command
 requires exclusive worker and resource ownership, exact terminal child receipts,
-unchanged accepted source, and no source acceptance, deployment, or unresolved
-model work. It retains the original operation in an acknowledgement record,
-preserves the failed outcome and its settled notification, and cleans the owned
+unchanged accepted source, and no source acceptance or deployment.
+It retains the original operation in an acknowledgement record,
+preserves the failed outcome, and cleans the owned
 worktree. It does not replay preparation, publish staged candidates, or report
 preparation success. A repeated acknowledgement joins the same record. Submit a
 new commit with a new request ID after correcting the failure.
@@ -513,11 +481,8 @@ uncertainty, and releases the interrupted operation. It does not undo effects,
 run remaining instructions, or establish product health. Then use `telete
 recover JOB` to reconcile the job with that retained outcome.
 
-Accepted source remains accepted after deployment failure. Notification is a
-separate stage. Telete freezes deterministic outcome text and an Email key
-before sending through the supported Email client. Email acceptance means
-provider submission, not final inbox delivery. Notification failure does not
-restart deployment. Private requests, source, diagnostics, and receipts remain
+Accepted source remains accepted after deployment failure.
+Private requests, source, diagnostics, and receipts remain
 retained; settled worktree cleanup does not remove their records.
 
 ## Install only on explicit request
@@ -539,7 +504,7 @@ resume queue admission.
 Use `telete service status`, `service start`, and `service stop` for this service.
 Service stop requires paused, drained work. It also permits one blocked deployment
 whose exact successful receipt matches its unchanged accepted source and product
-scope, with settled notification and no queued work, unresolved model, active
+scope, with no queued work, active
 operation, or live compiler or deployment child. The stop holds exclusive settled
 resource ownership and preserves the job and receipts for `telete recover JOB`;
 it does not repeat deployment.
@@ -547,8 +512,7 @@ it does not repeat deployment.
 Service stop also permits one paused Cell queue with a blocked, unaccepted
 failed preparation. Its unresolved operation must name the exact current
 production generation, candidate, and owned result path. Both final preparation
-receipts must be absent. Notification must be disabled or accepted and settled.
-No other queued or unresolved work, unresolved model work, preparation result,
+receipts must be absent. No other queued or unresolved work, preparation result,
 source acceptance, or deployment may be present. The accepted base and private
 candidate must remain unchanged, and the worktree must be clean and belong to
 the configured repository.
@@ -564,7 +528,7 @@ A present, dangling, or inaccessible final preparation receipt or active
 deployment record blocks this stop exception.
 
 The stop holds exclusive settled compiler and deployment resources. It changes
-no job, operation, outcome, notification, or receipt and does not replay
+no job, operation, outcome, or receipt and does not replay
 preparation. After the worker stops, use the existing guarded
 `telete acknowledge-preparation JOB` to abandon that preparation. Correct the
 failure and submit a new request. Project workflow jobs cannot use this stop
@@ -573,14 +537,14 @@ exception. Installation and signing maintenance still require a drained queue.
 Service stop also permits one paused blocked validation with matching job and
 canonical `autofix` reports. The command requires the exact successful unbounded
 dispatcher, the exact retained `autofix.patch`, unchanged accepted base and
-private candidate, a clean worktree, and an accepted settled failure notice.
-It requires no queued work, preparation, acceptance, deployment, unresolved model
-work, or live compiler or deployment child. The stop holds exclusive settled
+private candidate, and a clean worktree.
+It requires no queued work, preparation, acceptance, deployment,
+or live compiler or deployment child. The stop holds exclusive settled
 resources and preserves the unresolved job, operation, failure, and receipts.
 Use `telete recover JOB` after the service stops to reconcile the retained job.
 Stopping does not settle the job or replay validation.
 
 Program replacement and signing maintenance still require paused, drained work. Installation,
-Semantics project registration, prompt import, queue resume, and live delivery
+Semantics project registration, queue resume, and live delivery
 are separate operations. A source participation marker does not prove project
 registration. No cross-release journal migration window is supplied.

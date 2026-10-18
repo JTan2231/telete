@@ -249,10 +249,6 @@ impl Worker<'_> {
             git::clean_candidate(self.paths, &self.worktree(job), &candidate)?;
         }
         if !success {
-            if stage == "check" && job.options.repair {
-                job.production_diagnostics = Some(diagnostic);
-                return self.save(job, Phase::RepairPrepare);
-            }
             return self.finish(
                 job,
                 Phase::Failed,
@@ -260,7 +256,6 @@ impl Worker<'_> {
                 false,
             );
         }
-        job.production_diagnostics = None;
         self.workflow_next(job, stage)
     }
 

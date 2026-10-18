@@ -11,7 +11,6 @@ mod manager;
 mod model;
 mod paths;
 mod process;
-mod providers;
 mod signing;
 mod store;
 mod validation;
@@ -76,10 +75,6 @@ enum Command {
         settings: Option<PathBuf>,
         #[arg(long)]
         no_deploy: bool,
-        #[arg(long)]
-        no_repair: bool,
-        #[arg(long)]
-        no_notify: bool,
     },
     Status {
         job: Option<String>,
@@ -285,8 +280,6 @@ async fn execute(cli: Cli) -> Result<serde_json::Value> {
             deploy,
             settings,
             no_deploy,
-            no_repair,
-            no_notify,
         } => manager::submit(
             &paths,
             &repo,
@@ -298,8 +291,6 @@ async fn execute(cli: Cli) -> Result<serde_json::Value> {
                 deploy,
                 settings: manager::read_settings(settings.as_deref())?,
                 no_deploy,
-                repair: !no_repair,
-                notify: !no_notify,
             },
         ),
         Command::Status { job } => manager::status(&paths, job.as_deref()),

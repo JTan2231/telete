@@ -25,5 +25,7 @@ under `support/cell`. Preserve the copied package versions and provider interfac
 Do not introduce a dependency on a sibling Cell checkout.
 
 Keep provider authority with each provider. Use the supported Rust interfaces
-for Nucleus, Bazaar, Email, Chancery, and Usher. Keep source and operational
-records private. Test changes with focused local Rust checks.
+for Chancery and Usher. Keep source and operational records private. The two
+plain prompt files under `prompts/` are retained inactive text; Telete has no
+model execution or outcome notification integration. Test changes with focused
+local Rust checks.

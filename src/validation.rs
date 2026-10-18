@@ -2203,18 +2203,15 @@ mod tests {
             "options": crate::manager::SubmitOptions::default(),
             "policy": {
                 "commands": frozen.then_some(commands),
-                "primary_attempts": 3, "escalation_attempts": 1,
-                "primary_model": "primary", "primary_reasoning": "medium",
-                "escalation_model": "secondary", "escalation_reasoning": "high",
-                "model_timeout_seconds": 600, "providers": {}, "prompts": null
+                "signing_policy": null
             },
             "base": "a".repeat(40), "candidate": "b".repeat(40), "accepted": false,
-            "attempts": [], "validations": [], "preparation": null, "preparation_generation": 0,
-            "production_diagnostics": null, "deployment_request": null, "deployment_result": null,
+            "validations": [], "preparation": null, "preparation_generation": 0,
+            "deployment_request": null, "deployment_result": null,
             "operation": null, "outcome": "failed", "outcome_message": "bootstrap failed",
-            "stopped_phase": "checking", "unresolved": true, "model_unresolved": false,
-            "waiting_reason": null, "last_error": null, "notification": null,
-            "outcome_generation": 1, "cleanup": crate::store::Cleanup::default()
+            "stopped_phase": "checking", "unresolved": true,
+            "waiting_reason": null, "last_error": null,
+            "cleanup": crate::store::Cleanup::default()
         }))
         .context("bootstrap proof fixture")
     }

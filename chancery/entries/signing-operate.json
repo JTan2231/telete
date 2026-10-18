@@ -146,13 +146,13 @@
       },
       {
         "status": "declared",
-        "statement": "Builds, repairs, cache resets, reinstallations and upgrades do not replace the selected certificate. New jobs freeze normalized policy; reused request keys retain it. Preparation and deployment reject changed selection. Fresh staged copies are signed; immutable releases are not re-signed in place."
+        "statement": "Builds, cache resets, reinstallations and upgrades do not replace the selected certificate. New jobs freeze normalized policy; reused request keys retain it. Preparation and deployment reject changed selection. Fresh staged copies are signed; immutable releases are not re-signed in place."
       }
     ],
     "operational_limits": [
       {
         "status": "declared",
-        "statement": "The local profile supplies no Developer ID distribution, notarization, installer-package signing, Hardened Runtime, added entitlements, network timestamp or permission grant. Signing failures do not request model repair; repair agents receive no private-key material or policy writer. Deployment does not audit historical signatures before publication."
+        "statement": "The local profile supplies no Developer ID distribution, notarization, installer-package signing, Hardened Runtime, added entitlements, network timestamp or permission grant. Deployment does not audit historical signatures before publication."
       },
       {
         "status": "declared",

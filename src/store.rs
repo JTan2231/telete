@@ -1,4 +1,4 @@
-//! Private durable queue records. Each provider retains its own authority.
+//! Private durable queue records.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
-use nucleus_core::JobRequestV1;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -112,13 +111,9 @@ pub(crate) enum Phase {
     Integrating,
     Checking,
     Autofixing,
-    RepairPrepare,
-    RepairWait,
-    Applying,
     Preparing,
     Accepting,
     Deploying,
-    Notifying,
     Blocked,
     Succeeded,
     Failed,
@@ -139,13 +134,9 @@ impl Phase {
             Self::Integrating => "integrating",
             Self::Checking => "checking",
             Self::Autofixing => "autofixing",
-            Self::RepairPrepare => "repair_prepare",
-            Self::RepairWait => "repair_wait",
-            Self::Applying => "applying",
             Self::Preparing => "preparing",
             Self::Accepting => "accepting",
             Self::Deploying => "deploying",
-            Self::Notifying => "notifying",
             Self::Blocked => "blocked",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -162,21 +153,6 @@ pub(crate) struct Operation {
     pub candidate: CommitId,
     pub result: PathBuf,
     pub started: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct RepairAttempt {
-    pub number: u64,
-    pub request: JobRequestV1,
-    pub parent: CommitId,
-    pub stamp: u64,
-    pub state: String,
-    pub patch: Option<PathBuf>,
-    pub patch_content: Option<String>,
-    pub candidate: Option<CommitId>,
-    pub rejection: Option<String>,
-    pub transport_failures: u32,
-    pub terminal: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,25 +194,8 @@ impl Default for Cleanup {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct SendAttempt {
-    pub started: u64,
-    pub receipt: Option<email::api::Receipt>,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Notification {
-    pub message: email::api::Message,
-    pub created: u64,
-    pub attempts: Vec<SendAttempt>,
-    pub accepted: bool,
-    pub uncertain: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 // Persist orthogonal facts independently of the phase: cancellation, acceptance,
-// and uncertain provider work can coexist and must survive recovery.
-#[allow(clippy::struct_excessive_bools)]
+// and uncertain operations can coexist and must survive recovery.
 pub(crate) struct Job {
     pub id: JobId,
     pub sequence: u64,
@@ -253,13 +212,11 @@ pub(crate) struct Job {
     pub candidate: Option<CommitId>,
     #[serde(default)]
     pub accepted: bool,
-    pub attempts: Vec<RepairAttempt>,
     pub validations: Vec<Validation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_runs: Vec<crate::workflow::StageRun>,
     pub preparation: Option<Preparation>,
     pub preparation_generation: u64,
-    pub production_diagnostics: Option<PathBuf>,
     pub deployment_request: Option<DeploymentRequest>,
     pub deployment_result: Option<DeploymentResult>,
     pub operation: Option<Operation>,
@@ -267,30 +224,14 @@ pub(crate) struct Job {
     pub outcome_message: Option<String>,
     pub stopped_phase: Option<Phase>,
     pub unresolved: bool,
-    pub model_unresolved: bool,
     pub waiting_reason: Option<String>,
     pub last_error: Option<String>,
-    pub notification: Option<Notification>,
-    pub outcome_generation: u64,
     pub cleanup: Cleanup,
 }
 
 impl Job {
-    pub(crate) fn charged_attempts(&self) -> usize {
-        self.attempts
-            .iter()
-            .filter(|attempt| attempt.candidate.is_none())
-            .count()
-    }
-    pub(crate) fn budget(&self) -> serde_json::Value {
-        let total = self.policy.primary_attempts + self.policy.escalation_attempts;
-        let used = self.charged_attempts() as u64;
-        serde_json::json!({"mode":"refund_accepted", "total":total,"used":used,"remaining":total.saturating_sub(used),
-            "refunded":self.attempts.len() - self.charged_attempts(),"invocations":self.attempts.len()})
-    }
     pub(crate) fn output(&self) -> Result<serde_json::Value> {
         let mut value = serde_json::to_value(self)?;
-        value["repair_budget"] = self.budget();
         if let Some(workflow) = &self.options.workflow {
             value["stages"] = serde_json::Value::Array(
                 [

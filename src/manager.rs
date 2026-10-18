@@ -16,12 +16,8 @@ use crate::inventory::Inventory;
 use crate::invocation::CommandPolicy;
 use crate::model::{CommitId, JobId};
 use crate::paths::Paths;
-use crate::providers::{self, Observation, Prompts, Selection};
 use crate::signing::{self, SigningPolicy};
-use crate::store::{
-    self, Cleanup, Config, DeploymentRequest, Job, Notification, Operation, Phase, RepairAttempt,
-    SendAttempt, Store, Validation,
-};
+use crate::store::{self, Cleanup, Config, DeploymentRequest, Job, Operation, Phase, Store, Validation};
 use crate::validation::{self, ValidationReport, ValidationState};
 use crate::workflow::{StageRun, Workflow};
 
@@ -31,7 +27,6 @@ mod workflow_manager;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 // These independent caller choices are frozen together at admission.
-#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct SubmitOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<Workflow>,
@@ -40,8 +35,6 @@ pub(crate) struct SubmitOptions {
     pub deploy: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, Value>,
-    pub repair: bool,
-    pub notify: bool,
     pub no_deploy: bool,
 }
 
@@ -53,8 +46,6 @@ impl Default for SubmitOptions {
             run_tests: false,
             deploy: Vec::new(),
             settings: BTreeMap::new(),
-            repair: true,
-            notify: true,
             no_deploy: false,
         }
     }
@@ -65,19 +56,9 @@ impl Default for SubmitOptions {
 pub(crate) struct Policy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commands: Option<CommandPolicy>,
-    pub primary_attempts: u64,
-    pub escalation_attempts: u64,
-    pub primary_model: String,
-    pub primary_reasoning: nucleus_core::ReasoningEffort,
-    pub escalation_model: String,
-    pub escalation_reasoning: nucleus_core::ReasoningEffort,
-    pub model_timeout_seconds: u64,
-    // Preserve the domain name in the journal alongside repair and provider policy.
     #[allow(clippy::struct_field_names)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_policy: Option<SigningPolicy>,
-    pub providers: Selection,
-    pub prompts: Option<Prompts>,
 }
 
 impl Policy {
@@ -115,19 +96,9 @@ fn freeze_policy(paths: &Paths, options: &SubmitOptions) -> Result<Policy> {
     } else {
         None
     };
-    let (providers, prompts) = providers::select(options.repair, options.notify)?;
     Ok(Policy {
         commands: Some(CommandPolicy::capture(paths)?),
-        primary_attempts: 3,
-        escalation_attempts: 1,
-        primary_model: "gpt-5.6-terra".into(),
-        primary_reasoning: nucleus_core::ReasoningEffort::Medium,
-        escalation_model: "gpt-5.6-sol".into(),
-        escalation_reasoning: nucleus_core::ReasoningEffort::High,
-        model_timeout_seconds: 600,
         signing_policy,
-        providers,
-        prompts,
     })
 }
 
@@ -223,8 +194,6 @@ pub(crate) fn submit(
                 && !options.no_deploy,
             "workflow jobs select their stages instead of Cell options"
         );
-        options.repair &= workflow.repair;
-        options.notify &= workflow.notify;
         if workflow.integrate {
             ensure!(
                 config.accepted_baseline.is_some(),
@@ -332,12 +301,10 @@ fn new_job(
         base: None,
         candidate: None,
         accepted: false,
-        attempts: Vec::new(),
         workflow_runs: Vec::new(),
         validations: Vec::new(),
         preparation: None,
         preparation_generation: 0,
-        production_diagnostics: None,
         deployment_request: None,
         deployment_result: None,
         operation: None,
@@ -345,11 +312,8 @@ fn new_job(
         outcome_message: None,
         stopped_phase: None,
         unresolved: false,
-        model_unresolved: false,
         waiting_reason: None,
         last_error: None,
-        notification: None,
-        outcome_generation: 1,
         cleanup: Cleanup::default(),
     }
 }
@@ -415,10 +379,6 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
     if job.phase == Phase::Blocked
         && job.stopped_phase == Some(Phase::Checking)
         && job.options.workflow.is_none()
-        && job
-            .notification
-            .as_ref()
-            .is_some_and(|notice| notice.accepted && !notice.uncertain)
         && let (Some(operation), Some(base), Some(candidate)) =
             (&job.operation, &job.base, &job.candidate)
         && !operation.result.try_exists()?
@@ -469,23 +429,15 @@ fn abandon_settled_validation(
             && job.stopped_phase == Some(Phase::Checking)
             && job.outcome == Some(Phase::Failed)
             && job.unresolved
-            && !job.model_unresolved
             && !job.accepted
             && job.preparation.is_none()
             && job.preparation_generation == 0
-            && job.production_diagnostics.is_none()
             && job.deployment_request.is_none()
             && job.deployment_result.is_none()
-            && job.options.notify
-            && job
-                .notification
-                .as_ref()
-                .is_some_and(|notice| notice.accepted && !notice.uncertain)
             && store.jobs()?.iter().all(|other| {
-                other.id == job.id
-                    || (other.phase.terminal() && !other.unresolved && !other.model_unresolved)
+                other.id == job.id || (other.phase.terminal() && !other.unresolved)
             }),
-        "validation abandonment requires one paused unaccepted blocked validation with a settled failure notice"
+        "validation abandonment requires one paused unaccepted blocked validation with settled execution"
     );
     let operation = job
         .operation
@@ -595,11 +547,7 @@ fn maintenance(paths: &Paths, owner: Option<&str>, action: &str) -> Result<Value
     }
     let active = store.active()?;
     let owners = store.holds()?;
-    let drained = active.is_none()
-        && store
-            .jobs()?
-            .iter()
-            .all(|job| !job.unresolved && !job.model_unresolved);
+    let drained = active.is_none() && store.jobs()?.iter().all(|job| !job.unresolved);
     Ok(json!({"held":!owners.is_empty(),"drained":drained,
         "owner_held":owner.map(|owner| owners.iter().any(|held| held == owner)),"owners":owners,"active_job":active.map(|job|job.id)}))
 }
@@ -618,7 +566,7 @@ pub(crate) fn require_quiescent(paths: &Paths) -> Result<()> {
         store
             .jobs()?
             .iter()
-            .all(|job| job.phase.terminal() && !job.unresolved && !job.model_unresolved),
+            .all(|job| job.phase.terminal() && !job.unresolved),
         "Telete has queued, active or unresolved work; settle it before maintenance"
     );
     Ok(())
@@ -646,15 +594,8 @@ pub(crate) fn require_service_stoppable(paths: &Paths) -> Result<()> {
             && job.stopped_phase == Some(Phase::Deploying)
             && job.accepted
             && job.operation.is_none()
-            && !job.model_unresolved
-            && (!job.options.notify
-                || job
-                    .notification
-                    .as_ref()
-                    .is_some_and(|notice| notice.accepted && !notice.uncertain))
             && store.jobs()?.iter().all(|other| {
-                other.id == job.id
-                    || (other.phase.terminal() && !other.unresolved && !other.model_unresolved)
+                other.id == job.id || (other.phase.terminal() && !other.unresolved)
             }),
         "service stop requires settled work or one blocked completed deployment"
     );
@@ -693,21 +634,14 @@ fn require_blocked_preparation_stoppable(
             && job.stopped_phase == Some(Phase::Preparing)
             && job.outcome == Some(Phase::Failed)
             && job.unresolved
-            && !job.model_unresolved
             && !job.accepted
             && job.preparation.is_none()
             && job.deployment_request.is_none()
             && job.deployment_result.is_none()
-            && (!job.options.notify
-                || job
-                    .notification
-                    .as_ref()
-                    .is_some_and(|notice| notice.accepted && !notice.uncertain))
             && store.jobs()?.iter().all(|other| {
-                other.id == job.id
-                    || (other.phase.terminal() && !other.unresolved && !other.model_unresolved)
+                other.id == job.id || (other.phase.terminal() && !other.unresolved)
             }),
-        "service stop requires one unaccepted blocked preparation with a settled failure notice"
+        "service stop requires one unaccepted blocked preparation with settled execution"
     );
     let operation = job
         .operation
@@ -786,23 +720,15 @@ fn require_blocked_autofix_stoppable(
             && job.stopped_phase == Some(Phase::Checking)
             && job.outcome == Some(Phase::Failed)
             && job.unresolved
-            && !job.model_unresolved
             && !job.accepted
             && job.preparation.is_none()
             && job.preparation_generation == 0
-            && job.production_diagnostics.is_none()
             && job.deployment_request.is_none()
             && job.deployment_result.is_none()
-            && job.options.notify
-            && job
-                .notification
-                .as_ref()
-                .is_some_and(|notice| notice.accepted && !notice.uncertain)
             && store.jobs()?.iter().all(|other| {
-                other.id == job.id
-                    || (other.phase.terminal() && !other.unresolved && !other.model_unresolved)
+                other.id == job.id || (other.phase.terminal() && !other.unresolved)
             }),
-        "service stop requires one unaccepted blocked autofix with a settled failure notice"
+        "service stop requires one unaccepted blocked autofix with settled execution"
     );
     let operation = job
         .operation
@@ -879,14 +805,6 @@ pub(crate) async fn recover(paths: &Paths, id: &str) -> Result<Value> {
         job.phase == Phase::Blocked,
         "only a blocked Telete job can be recovered"
     );
-    if job
-        .notification
-        .as_ref()
-        .is_some_and(|notice| notice.uncertain)
-        && !job.unresolved
-    {
-        bail!("Email acceptance remains uncertain; recovery cannot send a replacement message");
-    }
     let phase = job
         .stopped_phase
         .context("blocked job has no retained operation phase")?;
@@ -906,32 +824,6 @@ pub(crate) async fn recover(paths: &Paths, id: &str) -> Result<Value> {
                 config: config.clone(),
             };
             inspector.reconcile_workflow(&job)?;
-        }
-        Phase::RepairWait => {
-            let attempt = job
-                .attempts
-                .last_mut()
-                .context("blocked repair has no saved request")?;
-            let client = providers::client(&job.policy.providers)?;
-            match providers::get_job(&client, &attempt.request.id).await {
-                Ok(view) => {
-                    if matches!(
-                        providers::correlate(&view, &attempt.request)?,
-                        Observation::Failed { lost: true, .. }
-                    ) {
-                        bail!(
-                            "Nucleus still reports lost execution; the request cannot be replaced"
-                        );
-                    }
-                    attempt.transport_failures = 0;
-                    job.model_unresolved = true;
-                }
-                Err(error) if providers::absent(&error) => {
-                    attempt.transport_failures = 0;
-                    job.model_unresolved = false;
-                }
-                Err(error) => return Err(error.into()),
-            }
         }
         Phase::Checking | Phase::Preparing => {
             let operation = job
@@ -1007,14 +899,12 @@ pub(crate) async fn recover(paths: &Paths, id: &str) -> Result<Value> {
                 "deployment has interrupted or uncertain instruction effects; inspect its owning operation"
             );
         }
-        Phase::Accepting | Phase::Applying | Phase::Autofixing | Phase::Integrating => {}
+        Phase::Accepting | Phase::Autofixing | Phase::Integrating => {}
         _ => bail!("recovery has no authoritative continuation for this phase"),
     }
     job.phase = phase;
-    job.outcome_generation += 1;
     job.outcome = None;
     job.outcome_message = None;
-    job.notification = None;
     job.unresolved = false;
     job.last_error = None;
     job.waiting_reason = None;
@@ -1101,16 +991,10 @@ pub(crate) fn acknowledge_preparation(paths: &Paths, id: &str) -> Result<Value> 
             && job.stopped_phase == Some(Phase::Preparing)
             && job.outcome == Some(Phase::Failed)
             && job.unresolved
-            && !job.model_unresolved
             && !job.accepted
             && job.preparation.is_none()
             && job.deployment_request.is_none()
-            && job.deployment_result.is_none()
-            && (!job.options.notify
-                || job
-                    .notification
-                    .as_ref()
-                    .is_some_and(|notice| { notice.accepted && !notice.uncertain })),
+            && job.deployment_result.is_none(),
         "only an unaccepted blocked preparation can be acknowledged"
     );
     let operation = job
@@ -1240,10 +1124,7 @@ impl Worker<'_> {
     async fn tick(&mut self) -> Result<Value> {
         self.paths.require_capacity()?;
         for mut job in self.store.jobs()? {
-            if (job.phase.terminal() || job.outcome.is_some())
-                && !job.unresolved
-                && !job.model_unresolved
-            {
+            if (job.phase.terminal() || job.outcome.is_some()) && !job.unresolved {
                 self.cleanup(&mut job)?;
             }
         }
@@ -1255,16 +1136,8 @@ impl Worker<'_> {
         {
             let message = format!("{error:#}");
             job.last_error = Some(message.clone());
-            if job.phase == Phase::Notifying {
-                job.phase = Phase::Blocked;
-                self.store.set("paused", &true)?;
-                self.store.save(&mut job)?;
-            } else {
-                let unresolved = job.model_unresolved
-                    || job.operation.is_some()
-                    || matches!(job.phase, Phase::Deploying);
-                self.finish(&mut job, Phase::Failed, message, unresolved)?;
-            }
+            let unresolved = job.operation.is_some() || matches!(job.phase, Phase::Deploying);
+            self.finish(&mut job, Phase::Failed, message, unresolved)?;
         }
         self.store.job(&job.id.0)?.output()
     }
@@ -1273,10 +1146,7 @@ impl Worker<'_> {
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
         if job.cancel_requested
             && job.operation.is_none()
-            && !matches!(
-                job.phase,
-                Phase::RepairWait | Phase::Deploying | Phase::Notifying | Phase::Blocked
-            )
+            && !matches!(job.phase, Phase::Deploying | Phase::Blocked)
         {
             return self.finish(
                 job,
@@ -1290,20 +1160,12 @@ impl Worker<'_> {
             Phase::Checking if job.options.workflow.is_some() => self.workflow_stage(job, "check"),
             Phase::Checking => self.checking(job),
             Phase::Autofixing => self.autofixing(job),
-            Phase::RepairPrepare => self.repair_prepare(job),
-            Phase::RepairWait => self.repair_wait(job).await,
-            Phase::Applying => self.applying(job),
-            Phase::Preparing if job.options.workflow.is_some() => {
-                self.workflow_stage(job, "prepare")
-            }
+            Phase::Preparing if job.options.workflow.is_some() => self.workflow_stage(job, "prepare"),
             Phase::Preparing => self.preparing(job),
             Phase::Accepting if job.options.workflow.is_some() => self.workflow_accept(job),
             Phase::Accepting => self.accepting(job),
-            Phase::Deploying if job.options.workflow.is_some() => {
-                self.workflow_stage(job, "deploy")
-            }
+            Phase::Deploying if job.options.workflow.is_some() => self.workflow_stage(job, "deploy"),
             Phase::Deploying => self.deploying(job),
-            Phase::Notifying => self.notifying(job).await,
             Phase::Blocked => Ok(()),
             _ => bail!("unexpected active Telete phase: {:?}", job.phase),
         }
@@ -1335,40 +1197,13 @@ impl Worker<'_> {
         if !matches!(outcome, Phase::Succeeded | Phase::AlreadyIncluded) {
             self.store.set("paused", &true)?;
         }
-        if job.options.notify && job.notification.is_none() {
-            let (subject, body) = render_notification(job);
-            job.notification = Some(Notification {
-                message: email::api::Message {
-                    subject,
-                    body,
-                    idempotency_key: Some(format!(
-                        "telete/{}/outcome/{}",
-                        job.id, job.outcome_generation
-                    )),
-                },
-                created: store::now(),
-                attempts: Vec::new(),
-                accepted: false,
-                uncertain: false,
-            });
-        }
-        let phase = if job.options.notify {
-            Phase::Notifying
-        } else if unresolved {
-            Phase::Blocked
-        } else {
-            outcome
-        };
+        let phase = if unresolved { Phase::Blocked } else { outcome };
         self.save(job, phase)?;
         self.cleanup(job)
     }
 
     fn cleanup(&self, job: &mut Job) -> Result<()> {
-        if job.outcome.is_none()
-            || job.unresolved
-            || job.model_unresolved
-            || job.cleanup.state == "removed"
-        {
+        if job.outcome.is_none() || job.unresolved || job.cleanup.state == "removed" {
             return Ok(());
         }
         let worktree = self.worktree(job);
@@ -1620,7 +1455,6 @@ impl Worker<'_> {
             fixed_candidate: None,
         });
         job.operation = None;
-        job.production_diagnostics = None;
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
         if job.cancel_requested {
             return self.finish(
@@ -1633,7 +1467,12 @@ impl Worker<'_> {
         match report.state {
             ValidationState::Passed => self.save(job, Phase::Preparing),
             ValidationState::Autofix => self.save(job, Phase::Autofixing),
-            ValidationState::Failed => self.save(job, Phase::RepairPrepare),
+            ValidationState::Failed => self.finish(
+                job,
+                Phase::Failed,
+                "Required checks failed".into(),
+                false,
+            ),
             ValidationState::Stale => self.finish(
                 job,
                 Phase::Failed,
@@ -1704,375 +1543,6 @@ impl Worker<'_> {
             &self.config.repository,
             &git::private_ref(&job.id.0, "candidate")?,
             Some(&parent),
-            &candidate,
-        )?;
-        job.candidate = Some(candidate.clone());
-        git::ensure_worktree(
-            self.paths,
-            &self.config.repository,
-            &self.worktree(job),
-            &candidate,
-        )?;
-        self.save(job, Phase::Checking)
-    }
-
-    // Freeze the complete request before recording its single charged invocation.
-    #[allow(clippy::too_many_lines)]
-    fn repair_prepare(&self, job: &mut Job) -> Result<()> {
-        self.assert_policy(job)?;
-        if !job.options.repair {
-            return self.finish(
-                job,
-                Phase::Failed,
-                "Required checks failed; automatic repair is disabled".into(),
-                false,
-            );
-        }
-        let used = job.charged_attempts() as u64;
-        if used >= job.policy.primary_attempts + job.policy.escalation_attempts {
-            return self.finish(
-                job,
-                Phase::Failed,
-                "Automatic repair exhausted its unrefunded budget".into(),
-                false,
-            );
-        }
-        let _admission = store::lock(&self.paths.root.join("admission.lock"), true)?;
-        if !self.store.holds()?.is_empty() {
-            job.waiting_reason = Some("requester_maintenance".into());
-            return self.store.save(job);
-        }
-        let number = job.attempts.len() as u64 + 1;
-        let identity = format!("telete-{}-repair-{number}", job.id);
-        let diagnostics = job
-            .production_diagnostics
-            .as_ref()
-            .or_else(|| {
-                job.validations
-                    .last()
-                    .map(|validation| &validation.diagnostics)
-            })
-            .context("repair has no diagnostics")?;
-        let parent = Self::candidate(job)?.clone();
-        let history = job
-            .attempts
-            .iter()
-            .map(|attempt| {
-                json!({"number":attempt.number,
-            "nucleus_job_id":attempt.request.id,"parent":attempt.parent,"state":attempt.state,
-            "candidate":attempt.candidate,"rejection":attempt.rejection})
-            })
-            .collect::<Vec<_>>();
-        let prompts = job
-            .policy
-            .prompts
-            .as_ref()
-            .context("repair-enabled job has no frozen prompt")?;
-        let components = BTreeMap::from([
-            (
-                prompts.instructions.id.clone(),
-                prompts.instructions.version,
-            ),
-            (prompts.template.id.clone(), prompts.template.version),
-        ]);
-        let context = json!({"domain_job":job.id,"accepted_base":job.base,"candidate_commit":parent,
-            "candidate_directory":self.worktree(job),"diagnostic_path":diagnostics,"prior_attempts":history,
-            "prompt_selection":{"id":prompts.selection.id,"version":prompts.selection.version,
-                "components":components}});
-        let primary = used < job.policy.primary_attempts;
-        let request = providers::request(
-            &identity,
-            &job.id.0,
-            &self.worktree(job),
-            &context,
-            job.policy
-                .prompts
-                .as_ref()
-                .context("repair-enabled job has no frozen prompt")?,
-            if primary {
-                &job.policy.primary_model
-            } else {
-                &job.policy.escalation_model
-            },
-            if primary {
-                job.policy.primary_reasoning
-            } else {
-                job.policy.escalation_reasoning
-            },
-            job.policy.model_timeout_seconds,
-        )?;
-        let directory = self.directory(job)?;
-        store::atomic_json(
-            &directory.join(format!("repair-{number}.request.json")),
-            &request,
-        )?;
-        job.attempts.push(RepairAttempt {
-            number,
-            request,
-            parent,
-            stamp: store::now(),
-            state: "prepared".into(),
-            patch: None,
-            patch_content: None,
-            candidate: None,
-            rejection: None,
-            transport_failures: 0,
-            terminal: None,
-        });
-        job.model_unresolved = true;
-        job.waiting_reason = None;
-        self.save(job, Phase::RepairWait)
-    }
-
-    // Keep one frozen request's observations and admission effects in one workflow.
-    #[allow(clippy::too_many_lines)]
-    async fn repair_wait(&self, job: &mut Job) -> Result<()> {
-        let attempt = job
-            .attempts
-            .last()
-            .context("repair wait has no saved attempt")?
-            .clone();
-        let saved: nucleus_core::JobRequestV1 = serde_json::from_slice(&fs::read(
-            self.directory(job)?
-                .join(format!("repair-{}.request.json", attempt.number)),
-        )?)?;
-        ensure!(saved == attempt.request, "saved Nucleus request changed");
-        let client = providers::client(&job.policy.providers)?;
-        let observed = providers::get_job(&client, &attempt.request.id).await;
-        match observed {
-            Ok(view) => {
-                let observation = providers::correlate(&view, &attempt.request)?;
-                job.attempts
-                    .last_mut()
-                    .context("attempt missing")?
-                    .transport_failures = 0;
-                job.model_unresolved = true;
-                job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
-                if job.cancel_requested && !view.summary.state.is_terminal() {
-                    let cancelled = match providers::cancel(&client, &attempt.request.id).await {
-                        Ok(cancelled) => cancelled,
-                        Err(error) => return self.transport_failure(job, &error),
-                    };
-                    ensure!(
-                        cancelled.version == 1 && cancelled.job_id == attempt.request.id,
-                        "Nucleus cancellation names another job"
-                    );
-                    job.waiting_reason = Some("cancelling_nucleus".into());
-                    return self.store.save(job);
-                }
-                match observation {
-                    Observation::Pending => {
-                        job.waiting_reason = Some(
-                            if view
-                                .quota
-                                .as_ref()
-                                .is_some_and(nucleus_core::QuotaStatusV1::is_blocked)
-                            {
-                                "quota_deferred"
-                            } else {
-                                "nucleus"
-                            }
-                            .into(),
-                        );
-                        self.store.save(job)
-                    }
-                    Observation::Failed { lost, message } => {
-                        store::atomic_json(
-                            &self
-                                .directory(job)?
-                                .join(format!("repair-{}.result.json", attempt.number)),
-                            &view,
-                        )?;
-                        let current = job.attempts.last_mut().context("attempt missing")?;
-                        current.state = if lost { "lost" } else { "failed" }.into();
-                        current.terminal = Some(serde_json::to_value(view)?);
-                        job.model_unresolved = lost;
-                        self.finish(
-                            job,
-                            if job.cancel_requested && !lost {
-                                Phase::Cancelled
-                            } else {
-                                Phase::Failed
-                            },
-                            message,
-                            lost,
-                        )
-                    }
-                    Observation::Completed(patch) => {
-                        store::atomic_json(
-                            &self
-                                .directory(job)?
-                                .join(format!("repair-{}.result.json", attempt.number)),
-                            &view,
-                        )?;
-                        job.model_unresolved = false;
-                        let current = job.attempts.last_mut().context("attempt missing")?;
-                        current.state = "completed".into();
-                        current.terminal = Some(serde_json::to_value(view)?);
-                        if job.cancel_requested {
-                            return self.finish(
-                                job,
-                                Phase::Cancelled,
-                                "Cancelled after model execution settled".into(),
-                                false,
-                            );
-                        }
-                        if let Some(raw) = patch {
-                            let patch_file = self
-                                .directory(job)?
-                                .join(format!("repair-{}.patch", attempt.number));
-                            store::atomic_bytes(&patch_file, raw.as_bytes())?;
-                            let current = job.attempts.last_mut().context("attempt missing")?;
-                            current.patch = Some(patch_file);
-                            current.patch_content = Some(raw);
-                            self.save(job, Phase::Applying)
-                        } else {
-                            job.attempts
-                                .last_mut()
-                                .context("attempt missing")?
-                                .rejection = Some("No correlated final patch was returned".into());
-                            self.save(job, Phase::RepairPrepare)
-                        }
-                    }
-                }
-            }
-            Err(error) if providers::absent(&error) => {
-                let _admission = store::lock(&self.paths.root.join("admission.lock"), true)?;
-                job.model_unresolved = false;
-                job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
-                if job.cancel_requested {
-                    return self.finish(
-                        job,
-                        Phase::Cancelled,
-                        "Cancelled before model admission".into(),
-                        false,
-                    );
-                }
-                if !self.store.holds()?.is_empty() {
-                    job.waiting_reason = Some("requester_maintenance".into());
-                    return self.store.save(job);
-                }
-                match providers::health(&client).await {
-                    Ok(health) => ensure!(
-                        health.version == 1
-                            && health.status == "ok"
-                            && health.accepting_jobs
-                            && health.supported_protocol_versions.contains(&1)
-                            && health.authentication.authenticated,
-                        "Nucleus strict readiness was not proved"
-                    ),
-                    Err(error) if error.deferred() => {
-                        job.waiting_reason = Some("quota_deferred".into());
-                        return self.store.save(job);
-                    }
-                    Err(error) => return self.transport_failure(job, &error),
-                }
-                job.model_unresolved = true;
-                self.store.save(job)?;
-                match providers::submit(&client, &attempt.request).await {
-                    Ok(accepted) => {
-                        ensure!(
-                            accepted.version == 1 && accepted.job_id == attempt.request.id,
-                            "Nucleus admission names another request"
-                        );
-                        ensure!(
-                            accepted.request_digest == attempt.request.request_digest()?,
-                            "Nucleus admission has another request digest"
-                        );
-                        job.attempts.last_mut().context("attempt missing")?.state =
-                            "submitted".into();
-                        job.attempts
-                            .last_mut()
-                            .context("attempt missing")?
-                            .transport_failures = 0;
-                        job.waiting_reason = Some("nucleus".into());
-                        self.store.save(job)
-                    }
-                    Err(error) if error.deferred() => {
-                        job.model_unresolved = false;
-                        job.waiting_reason = Some("quota_deferred".into());
-                        self.store.save(job)
-                    }
-                    Err(error) => self.transport_failure(job, &error),
-                }
-            }
-            Err(error) => self.transport_failure(job, &error),
-        }
-    }
-
-    fn transport_failure(&self, job: &mut Job, error: &providers::CallError) -> Result<()> {
-        job.waiting_reason = Some("nucleus_transport".into());
-        job.last_error = Some(error.to_string());
-        let attempt = job
-            .attempts
-            .last_mut()
-            .context("transport failure has no saved attempt")?;
-        attempt.transport_failures += 1;
-        if attempt.transport_failures >= 5 {
-            self.finish(
-                job,
-                Phase::Failed,
-                "Nucleus observation remains unavailable; the exact request identity is retained"
-                    .into(),
-                true,
-            )
-        } else {
-            self.store.save(job)
-        }
-    }
-
-    fn applying(&self, job: &mut Job) -> Result<()> {
-        self.assert_policy(job)?;
-        let attempt = job
-            .attempts
-            .last()
-            .context("patch application has no attempt")?
-            .clone();
-        ensure!(
-            Self::candidate(job)? == &attempt.parent,
-            "patch parent differs from current candidate"
-        );
-        let raw = attempt
-            .patch_content
-            .as_ref()
-            .context("patch content was not retained")?;
-        ensure!(
-            fs::read_to_string(attempt.patch.as_ref().context("patch path absent")?)? == *raw,
-            "saved model patch changed"
-        );
-        let tree = match git::patch_tree(
-            self.paths,
-            &self.config.repository,
-            &attempt.parent,
-            raw,
-            &self.directory(job)?.join("repair.index"),
-        ) {
-            Ok(tree) => tree,
-            Err(error) => {
-                job.attempts.last_mut().context("attempt absent")?.rejection =
-                    Some(error.to_string());
-                return self.save(job, Phase::RepairPrepare);
-            }
-        };
-        let candidate = git::commit_tree(
-            self.paths,
-            &self.config.repository,
-            &tree,
-            std::slice::from_ref(&attempt.parent),
-            &job.id.0,
-            attempt.stamp,
-            &format!("Apply Telete repair {}", attempt.number),
-        )?;
-        if let Some(previous) = attempt.candidate {
-            ensure!(previous == candidate, "recorded repair candidate changed");
-        }
-        job.attempts.last_mut().context("attempt absent")?.candidate = Some(candidate.clone());
-        self.store.save(job)?;
-        git::advance(
-            self.paths,
-            &self.config.repository,
-            &git::private_ref(&job.id.0, "candidate")?,
-            Some(&attempt.parent),
             &candidate,
         )?;
         job.candidate = Some(candidate.clone());
@@ -2170,7 +1640,6 @@ impl Worker<'_> {
         if let Some(diagnostic) = outcome.compilation_failure {
             let path = directory.join(format!("production-{generation}.log"));
             store::atomic_bytes(&path, diagnostic.as_bytes())?;
-            job.production_diagnostics = Some(path);
             job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
             if job.cancel_requested {
                 return self.finish(
@@ -2180,7 +1649,12 @@ impl Worker<'_> {
                     false,
                 );
             }
-            return self.save(job, Phase::RepairPrepare);
+            return self.finish(
+                job,
+                Phase::Failed,
+                "Release compilation failed".into(),
+                false,
+            );
         }
         let prepared = outcome
             .prepared
@@ -2321,60 +1795,7 @@ impl Worker<'_> {
         }
     }
 
-    async fn notifying(&self, job: &mut Job) -> Result<()> {
-        let notice = job
-            .notification
-            .as_ref()
-            .context("notification phase has no frozen message")?;
-        if notice.accepted {
-            return self.save(
-                job,
-                if job.unresolved {
-                    Phase::Blocked
-                } else {
-                    job.outcome.context("notification has no CI outcome")?
-                },
-            );
-        }
-        let now = store::now();
-        if notice
-            .attempts
-            .last()
-            .is_some_and(|attempt| now.saturating_sub(attempt.started) < 300)
-        {
-            return Ok(());
-        }
-        if notice.attempts.len() >= 2 || now.saturating_sub(notice.created) >= 23 * 3600 {
-            job.notification
-                .as_mut()
-                .context("notice absent")?
-                .uncertain = true;
-            self.store.set("paused", &true)?;
-            return self.save(job, Phase::Blocked);
-        }
-        let message = notice.message.clone();
-        job.notification
-            .as_mut()
-            .context("notice absent")?
-            .attempts
-            .push(SendAttempt {
-                started: now,
-                receipt: None,
-                error: None,
-            });
-        self.store.save(job)?;
-        let result = providers::email(&job.policy.providers, &message).await;
-        let notice = job.notification.as_mut().context("notice absent")?;
-        let attempt = notice.attempts.last_mut().context("send attempt absent")?;
-        match result {
-            Ok(receipt) => {
-                attempt.receipt = Some(receipt);
-                notice.accepted = true;
-            }
-            Err(error) => attempt.error = Some(error.to_string()),
-        }
-        self.store.save(job)
-    }
+
 }
 
 fn correlate_preparation(
@@ -2446,129 +1867,10 @@ fn correlate_deployment(result: &DeploymentResult, request: &DeploymentRequest) 
     Ok(())
 }
 
-fn render_notification(job: &Job) -> (String, String) {
-    let products = job
-        .deployment_result
-        .as_ref()
-        .map(|result| result.products.clone())
-        .or_else(|| {
-            job.validations
-                .last()
-                .map(|validation| validation.report.products.clone())
-        })
-        .unwrap_or_default();
-    let scope = products
-        .iter()
-        .map(|name| name.replace('-', " "))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let suffix = if scope.is_empty() {
-        String::new()
-    } else {
-        format!(" — {scope}")
-    };
-    let (title, mut body) = match job.outcome {
-        Some(Phase::Succeeded) if job.options.workflow.is_some() => {
-            let deployed = job.workflow_runs.iter().any(|run| {
-                run.stage == "deploy"
-                    && Some(&run.candidate) == job.candidate.as_ref()
-                    && run.result.success()
-            });
-            (
-                if deployed { "deployed" } else { "passed" },
-                if deployed {
-                    "Project checks and selected deployment command completed."
-                } else {
-                    "Requested project workflow stages completed."
-                }
-                .to_owned(),
-            )
-        }
-        Some(Phase::Succeeded)
-            if job
-                .deployment_result
-                .as_ref()
-                .is_some_and(|result| result.state == DeploymentState::Succeeded) =>
-        {
-            (
-                "deployed",
-                "Required checks passed and deployment instructions completed.".to_owned(),
-            )
-        }
-        Some(Phase::Succeeded) => (
-            "passed",
-            "Required checks passed. No deployment was selected.".to_owned(),
-        ),
-        Some(Phase::AlreadyIncluded) => (
-            "already included",
-            "These changes are already in accepted history. No new checks or deployment ran."
-                .to_owned(),
-        ),
-        Some(Phase::Cancelled) => (
-            "cancelled",
-            "CI was cancelled. Recorded source acceptance and completed effects are retained."
-                .to_owned(),
-        ),
-        _ => {
-            let phase = job
-                .stopped_phase
-                .map_or("processing", Phase::name)
-                .replace('_', " ");
-            let detail = notification_detail(
-                job,
-                job.outcome_message
-                    .as_deref()
-                    .unwrap_or("No specific cause was reported."),
-            );
-            (
-                "failed",
-                format!("What failed: {phase}.\n{detail}\nThe Telete queue is paused."),
-            )
-        }
-    };
-    if job.options.workflow.is_none() && !job.options.run_tests {
-        body.push_str("\n\nTests were skipped.");
-    }
-    if job.unresolved {
-        body.push_str("\nThe recorded operation requires recovery.");
-    }
-    (format!("Telete: {title}{suffix}"), body)
-}
-
-fn notification_detail(job: &Job, value: &str) -> String {
-    let first = value.lines().next().unwrap_or("");
-    let mut words = Vec::new();
-    for word in first.split_whitespace() {
-        let reference = word.contains('/')
-            || word.contains('\\')
-            || word.contains(&job.id.0)
-            || [
-                &job.input,
-                job.base.as_ref().unwrap_or(&job.input),
-                job.candidate.as_ref().unwrap_or(&job.input),
-            ]
-            .iter()
-            .any(|id| word.contains(&id.0))
-            || word.starts_with("gpt-");
-        if reference {
-            if words
-                .last()
-                .is_none_or(|last| last != "[local details omitted]")
-            {
-                words.push("[local details omitted]".to_owned());
-            }
-        } else {
-            words.push(word.to_owned());
-        }
-    }
-    words.join(" ").chars().take(350).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::signing::MacSigning;
-    use bazaar::api::Record;
     use std::os::unix::fs::PermissionsExt;
 
     fn policy(paths: &Paths) -> Result<Policy> {
@@ -2582,31 +1884,9 @@ mod tests {
             },
         };
         store::atomic_json(&paths.root.join("signing.json"), &signing_policy)?;
-        let record = |id: &str, content: &str| Record {
-            id: id.into(),
-            version: 1,
-            content: content.into(),
-        };
         Ok(Policy {
             commands: None,
-            primary_attempts: 3,
-            escalation_attempts: 1,
-            primary_model: "gpt-5.6-terra".into(),
-            primary_reasoning: nucleus_core::ReasoningEffort::Medium,
-            escalation_model: "gpt-5.6-sol".into(),
-            escalation_reasoning: nucleus_core::ReasoningEffort::High,
-            model_timeout_seconds: 600,
             signing_policy: Some(signing_policy),
-            providers: Selection {
-                nucleus_socket: Some(paths.root.join("not-a-live-socket")),
-                email_executable: None,
-                bazaar_database: Some(paths.root.join("not-a-live-bazaar")),
-            },
-            prompts: Some(Prompts {
-                selection: record(providers::PROMPT_SELECTION, "{}"),
-                instructions: record(providers::PROMPT_INSTRUCTIONS, "Return a patch."),
-                template: record(providers::PROMPT_TEMPLATE, "{context}"),
-            }),
         })
     }
 
@@ -2655,16 +1935,11 @@ mod tests {
     }
 
     fn job(paths: &Paths, base: &CommitId, id: &str) -> Result<Job> {
-        let options = SubmitOptions {
-            notify: false,
-            repair: false,
-            ..SubmitOptions::default()
-        };
         Ok(new_job(
             JobId::new(id)?,
             format!("request-{id}"),
             base.clone(),
-            options,
+            SubmitOptions::default(),
             policy(paths)?,
         ))
     }
@@ -2808,12 +2083,12 @@ mod tests {
         store::atomic_bytes(&record, &saved)?;
 
         let second = candidate(&first, 9)?;
-        let mut repaired = job.clone();
-        repaired.candidate = Some(second.clone());
-        assert!(validation::require_job_dispatcher(&paths, &worktree, &repaired).is_err());
+        let mut next = job.clone();
+        next.candidate = Some(second.clone());
+        assert!(validation::require_job_dispatcher(&paths, &worktree, &next).is_err());
         git::ensure_worktree(&paths, &repo, &worktree, &second)?;
-        let second_key = validation::job_dispatcher_key(&repaired)?;
-        let second_command = validation::job_dispatcher_spec(&paths, &worktree, &repaired)?;
+        let second_key = validation::job_dispatcher_key(&next)?;
+        let second_command = validation::job_dispatcher_spec(&paths, &worktree, &next)?;
         assert_ne!(first_key, second_key);
         let result = crate::broker::run(
             &paths,
@@ -2822,7 +2097,7 @@ mod tests {
             &second_command,
         )?;
         assert_eq!(result.exit_code, Some(9));
-        assert!(validation::require_job_dispatcher(&paths, &worktree, &repaired).is_err());
+        assert!(validation::require_job_dispatcher(&paths, &worktree, &next).is_err());
         validation::require_job_dispatcher(&paths, &worktree, &job)?;
         let mut first_environment = first_command.env;
         let mut second_environment = second_command.env;
@@ -3083,18 +2358,6 @@ mod tests {
         blocked.unresolved = true;
         blocked.cancel_requested = true;
         blocked.options.run_tests = true;
-        blocked.options.notify = true;
-        blocked.notification = Some(Notification {
-            message: email::api::Message {
-                subject: "retained failure".into(),
-                body: "retained body".into(),
-                idempotency_key: Some("retained-failure-key".into()),
-            },
-            accepted: true,
-            uncertain: false,
-            attempts: Vec::new(),
-            created: 1_700_000_003,
-        });
         let directory = paths.job(&blocked.id.0);
         let worktree = directory.join("worktree");
         git::ensure_worktree(&paths, &repo, &worktree, &base)?;
@@ -3193,10 +2456,6 @@ mod tests {
         assert!(require_service_stoppable(&paths).is_err());
         report.products = vec!["alpha".into()];
         store::atomic_json(&output, &report)?;
-        blocked.notification.as_mut().context("notice")?.uncertain = true;
-        store.save(&mut blocked)?;
-        assert!(require_service_stoppable(&paths).is_err());
-        blocked.notification.as_mut().context("notice")?.uncertain = false;
         blocked.preparation_generation = 1;
         store.save(&mut blocked)?;
         assert!(require_service_stoppable(&paths).is_err());
@@ -3223,34 +2482,6 @@ mod tests {
         assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
         assert!(require_quiescent(&paths).is_err());
         Ok(())
-    }
-
-    fn repair(job: &Job, paths: &Paths, number: u64, raw: &str) -> Result<RepairAttempt> {
-        let request = providers::request(
-            &format!("telete-{}-repair-{number}", job.id),
-            &job.id.0,
-            &paths.job(&job.id.0).join("worktree"),
-            &json!({}),
-            job.policy.prompts.as_ref().context("fixture prompts")?,
-            &job.policy.primary_model,
-            job.policy.primary_reasoning,
-            600,
-        )?;
-        let patch = paths.job(&job.id.0).join(format!("repair-{number}.patch"));
-        store::atomic_bytes(&patch, raw.as_bytes())?;
-        Ok(RepairAttempt {
-            number,
-            request,
-            parent: job.candidate.clone().context("fixture candidate")?,
-            stamp: 1_700_000_001,
-            state: "completed".into(),
-            patch: Some(patch),
-            patch_content: Some(raw.into()),
-            candidate: None,
-            rejection: None,
-            transport_failures: 0,
-            terminal: None,
-        })
     }
 
     #[test]
@@ -3455,18 +2686,6 @@ mod tests {
             result: paths.job(&blocked.id.0).join("production-0.json"),
             started: 1_700_000_002,
         });
-        blocked.options.notify = true;
-        blocked.notification = Some(Notification {
-            message: email::api::Message {
-                subject: "retained failure".into(),
-                body: "retained body".into(),
-                idempotency_key: Some("retained-key".into()),
-            },
-            accepted: true,
-            uncertain: false,
-            attempts: Vec::new(),
-            created: 1_700_000_003,
-        });
         let blocked = store.insert(&blocked)?;
         let directory = paths.job(&blocked.id.0);
         git::ensure_worktree(&paths, &repo, &directory.join("worktree"), &base)?;
@@ -3484,11 +2703,6 @@ mod tests {
         assert!(settled.operation.is_none());
         assert_eq!(settled.last_error, blocked.last_error);
         assert_eq!(settled.outcome_message, blocked.outcome_message);
-        assert_eq!(settled.outcome_generation, blocked.outcome_generation);
-        assert_eq!(
-            serde_json::to_value(settled.notification)?,
-            serde_json::to_value(blocked.notification)?
-        );
         assert_eq!(settled.cleanup.state, "removed");
         assert!(directory.join("production-0.acknowledged.json").is_file());
         assert!(!directory.join("production-0.json").exists());
@@ -3510,18 +2724,6 @@ mod tests {
             blocked.stopped_phase = Some(Phase::Checking);
             blocked.outcome = Some(Phase::Failed);
             blocked.unresolved = true;
-            blocked.options.notify = true;
-            blocked.notification = Some(Notification {
-                message: email::api::Message {
-                    subject: "retained failure".into(),
-                    body: "retained body".into(),
-                    idempotency_key: Some(format!("retained-{id}")),
-                },
-                accepted: true,
-                uncertain: false,
-                attempts: Vec::new(),
-                created: 1,
-            });
             if receipt {
                 let result = paths.job(id).join("validation-0.json");
                 store::atomic_json(&result, &report(&base, &base, &[]))?;
@@ -3563,18 +2765,6 @@ mod tests {
         blocked.last_error = blocked.outcome_message.clone();
         blocked.unresolved = true;
         blocked.options.run_tests = true;
-        blocked.options.notify = true;
-        blocked.notification = Some(Notification {
-            message: email::api::Message {
-                subject: "retained failure".into(),
-                body: "retained body".into(),
-                idempotency_key: Some("retained-failure-key".into()),
-            },
-            accepted: true,
-            uncertain: false,
-            attempts: Vec::new(),
-            created: 1_700_000_003,
-        });
         let directory = paths.job(&blocked.id.0);
         let worktree = directory.join("worktree");
         git::ensure_worktree(&paths, &repo, &worktree, &base)?;
@@ -3715,12 +2905,7 @@ mod tests {
         assert!(settled.operation.is_none());
         assert_eq!(settled.outcome, blocked.outcome);
         assert_eq!(settled.outcome_message, blocked.outcome_message);
-        assert_eq!(settled.outcome_generation, blocked.outcome_generation);
         assert_eq!(settled.last_error, blocked.last_error);
-        assert_eq!(
-            serde_json::to_value(&settled.notification)?,
-            serde_json::to_value(&blocked.notification)?
-        );
         let record: ValidationAbandonment =
             serde_json::from_slice(&fs::read(directory.join("validation-0.abandoned.json"))?)?;
         assert_eq!(
@@ -3777,56 +2962,6 @@ mod tests {
             .products = vec!["decisions".into()];
         assert_eq!(worker.production_products(&job)?, vec!["krisis"]);
         assert_eq!(worker.deployment_products(&job)?, vec!["krisis"]);
-        Ok(())
-    }
-
-    #[test]
-    fn accepted_git_patch_refunds_only_recorded_private_candidate() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "refund-fixture")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        job.phase = Phase::Applying;
-        store::private_directory(&paths.job(&job.id.0))?;
-        git::ensure_worktree(&paths, &repo, &worker.worktree(&job), &base)?;
-        git::advance(
-            &paths,
-            &repo,
-            &git::private_ref(&job.id.0, "candidate")?,
-            None,
-            &base,
-        )?;
-        let raw = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1,99 +1,99 @@\n-base\n+patched";
-        job.attempts.push(repair(&job, &paths, 1, raw)?);
-        let mut job = worker.store.insert(&job)?;
-        assert_eq!(job.charged_attempts(), 1);
-        worker.applying(&mut job)?;
-        assert_eq!(job.charged_attempts(), 0);
-        assert_eq!(job.phase, Phase::Checking);
-        assert_eq!(job.budget()["invocations"], 1);
-        assert_eq!(job.budget()["refunded"], 1);
-        assert_eq!(
-            fs::read_to_string(worker.worktree(&job).join("file.txt"))?,
-            "patched\n"
-        );
-        assert_eq!(
-            git::ref_value(&paths, &repo, git::ACCEPTED)?,
-            Some(base.clone())
-        );
-        assert_eq!(git::commit(&paths, &repo, "HEAD")?, base);
-        job.attempts
-            .push(repair(&job, &paths, 2, "this is not a Git patch")?);
-        job.phase = Phase::Applying;
-        worker.store.save(&mut job)?;
-        worker.applying(&mut job)?;
-        assert_eq!(job.charged_attempts(), 1);
-        assert_eq!(job.phase, Phase::RepairPrepare);
-        assert!(job.attempts[1].rejection.is_some());
-        assert_eq!(
-            job.attempts[1].request.id.as_str(),
-            "telete-refund-fixture-repair-2"
-        );
         Ok(())
     }
 
@@ -3903,14 +3038,13 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_drain_keeps_non_model_operations_visible() -> Result<()> {
+    fn maintenance_drain_keeps_active_operations_visible() -> Result<()> {
         let (_temporary, paths, _repo, base) = fixture()?;
         let store = Store::open(&paths.root, false)?;
         let mut active = job(&paths, &base, "drain-fixture")?;
         active.phase = Phase::Preparing;
         active.base = Some(base.clone());
         active.candidate = Some(base);
-        active.model_unresolved = false;
         store.insert(&active)?;
         drop(store);
         let held = maintenance_hold(&paths, "fixture-owner")?;

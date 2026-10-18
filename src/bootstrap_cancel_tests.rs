@@ -13,18 +13,6 @@ fn bootstrap_cancel_fixture(frozen: bool) -> Result<(tempfile::TempDir, Paths, P
     blocked.last_error = blocked.outcome_message.clone();
     blocked.unresolved = true;
     blocked.options.run_tests = true;
-    blocked.options.notify = true;
-    blocked.notification = Some(Notification {
-        message: email::api::Message {
-            subject: "retained bootstrap failure".into(),
-            body: "retained bootstrap diagnostics".into(),
-            idempotency_key: Some("retained-bootstrap-failure".into()),
-        },
-        accepted: true,
-        uncertain: false,
-        attempts: Vec::new(),
-        created: 1_700_000_003,
-    });
     if frozen {
         let mut commands = CommandPolicy::capture(&paths)?;
         commands.environment.insert(
@@ -163,12 +151,7 @@ fn assert_failed_bootstrap_cancel_preserves_failure(frozen: bool) -> Result<()> 
     assert_eq!(cancelled.outcome, Some(Phase::Failed));
     assert_eq!(cancelled.outcome, blocked.outcome);
     assert_eq!(cancelled.outcome_message, blocked.outcome_message);
-    assert_eq!(cancelled.outcome_generation, blocked.outcome_generation);
     assert_eq!(cancelled.last_error, blocked.last_error);
-    assert_eq!(
-        serde_json::to_value(&cancelled.notification)?,
-        serde_json::to_value(&blocked.notification)?
-    );
     assert_eq!(
         serde_json::to_value(&cancelled.policy)?,
         serde_json::to_value(&blocked.policy)?
@@ -328,41 +311,5 @@ fn failed_bootstrap_cancellation_keeps_resource_source_and_queue_guards() -> Res
             .join("validation-0.abandoned.json")
             .exists()
     );
-    Ok(())
-}
-
-#[test]
-fn failed_bootstrap_cancellation_without_settled_notice_keeps_validation_blocked() -> Result<()> {
-    for uncertain in [false, true] {
-        let (_temporary, paths, _repo, blocked) = bootstrap_cancel_fixture(false)?;
-        let store = Store::open(&paths.root, false)?;
-        bootstrap_cancel_retain(
-            &paths,
-            &validation::job_bootstrap_key(&blocked)?,
-            crate::broker::ResourceClass::Heavy,
-            &bootstrap_cancel_command(&paths, &blocked)?,
-            Some(&bootstrap_cancel_result(101)),
-        )?;
-        let mut blocked = store.job(&blocked.id.0)?;
-        let notice = blocked.notification.as_mut().context("failure notice")?;
-        notice.accepted = uncertain;
-        notice.uncertain = uncertain;
-        store.save(&mut blocked)?;
-        cancel(&paths, &blocked.id.0)?;
-        let retained = store.job(&blocked.id.0)?;
-        assert_eq!(retained.phase, Phase::Blocked);
-        assert!(retained.unresolved && retained.operation.is_some());
-        assert_eq!(retained.outcome, Some(Phase::Failed));
-        assert_eq!(
-            serde_json::to_value(&retained.notification)?,
-            serde_json::to_value(&blocked.notification)?
-        );
-        assert!(
-            !paths
-                .job(&blocked.id.0)
-                .join("validation-0.abandoned.json")
-                .exists()
-        );
-    }
     Ok(())
 }

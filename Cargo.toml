@@ -10,13 +10,9 @@ description = "Rust CI orchestration for repository workflows and Cell"
 members = [
     ".",
     "support/cell/deployment/crates/cell-install",
-    "support/cell/infrastructure/bazaar",
     "support/cell/infrastructure/chancery/crates/chancery",
     "support/cell/infrastructure/chancery/crates/chancery-usage",
-    "support/cell/infrastructure/email/crates/email",
     "support/cell/infrastructure/iatreion/crates/iatreion-api",
-    "support/cell/infrastructure/nucleus/crates/nucleus-client",
-    "support/cell/infrastructure/nucleus/crates/nucleus-core",
     "support/cell/infrastructure/usher/crates/usher",
 ]
 default-members = ["."]
@@ -35,17 +31,12 @@ rust-version = "1.89"
 license = "MIT"
 
 [workspace.dependencies]
-bazaar = { path = "support/cell/infrastructure/bazaar" }
 cell-install = { path = "support/cell/deployment/crates/cell-install" }
 chancery-usage = { path = "support/cell/infrastructure/chancery/crates/chancery-usage" }
 iatreion-api = { path = "support/cell/infrastructure/iatreion/crates/iatreion-api" }
-nucleus-client = { path = "support/cell/infrastructure/nucleus/crates/nucleus-client" }
-nucleus-core = { path = "support/cell/infrastructure/nucleus/crates/nucleus-core" }
-base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 fs2 = "0.4"
 libc = "0.2"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
@@ -78,10 +69,6 @@ tokio.workspace = true
 toml.workspace = true
 libc.workspace = true
 rustix = { version = "1.1", features = ["fs", "process"] }
-nucleus-core.workspace = true
-nucleus-client.workspace = true
-bazaar.workspace = true
-email = { path = "support/cell/infrastructure/email/crates/email" }
 chancery = { path = "support/cell/infrastructure/chancery/crates/chancery" }
 usher = { path = "support/cell/infrastructure/usher/crates/usher" }
 

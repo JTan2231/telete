@@ -70,8 +70,6 @@ fn workflow_selection(paths: &Paths) -> Workflow {
         prepare: None,
         deploy: None,
         parameters: json!({"purpose":"ordinary-project-check"}),
-        repair: false,
-        notify: false,
     }
 }
 
@@ -114,7 +112,7 @@ fn workflow_stage_status(job: &Job, stage: &str) -> Result<String> {
 }
 
 #[tokio::test]
-async fn workflow_checks_exact_source_without_baseline_signer_or_providers() -> Result<()> {
+async fn workflow_checks_exact_source_without_baseline_or_signer() -> Result<()> {
     let (_temporary, paths, repo, source) = workflow_fixture(false)?;
     assert!(!repo.join("Cargo.toml").exists());
     assert!(!repo.join("pipeline").exists());
@@ -136,11 +134,6 @@ async fn workflow_checks_exact_source_without_baseline_signer_or_providers() -> 
         workflow_selection(&paths),
     )?;
     assert!(queued.policy.signing_policy.is_none());
-    assert!(queued.policy.providers.nucleus_socket.is_none());
-    assert!(queued.policy.providers.bazaar_database.is_none());
-    assert!(queued.policy.providers.email_executable.is_none());
-    assert!(queued.policy.prompts.is_none());
-    assert!(!queued.options.repair && !queued.options.notify);
     resume(&paths)?;
     let checking = workflow_tick(&paths, &queued.id.0).await?;
     assert_eq!(checking.phase, Phase::Checking);
@@ -420,10 +413,6 @@ printf 'deployed retained preparation\n'"#,
         fs::read_to_string(prepared_output.join("artifact.txt"))?,
         "prepared"
     );
-    let (subject, body) = render_notification(&completed);
-    assert_eq!(subject, "Telete: deployed");
-    assert!(!body.to_lowercase().contains("tests were skipped"));
-    assert!(!body.to_lowercase().contains("no deployment"));
     assert!(git::ref_value(&paths, &repo, git::ACCEPTED)?.is_none());
     Ok(())
 }

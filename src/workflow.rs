@@ -114,7 +114,6 @@ fn empty_parameters() -> serde_json::Value {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Workflow {
     #[serde(default)]
     pub integrate: bool,
@@ -127,10 +126,6 @@ pub(crate) struct Workflow {
     pub deploy: Option<WorkflowCommand>,
     #[serde(default = "empty_parameters")]
     pub parameters: serde_json::Value,
-    #[serde(default)]
-    pub repair: bool,
-    #[serde(default)]
-    pub notify: bool,
 }
 
 impl Workflow {
@@ -199,7 +194,7 @@ mod tests {
             json!({"check":{"program":"scripts/check","args":["one two", "$(touch /tmp/no)", "", "--x=y"]}}),
         );
         workflow.validate()?;
-        assert!(!workflow.integrate && !workflow.accept && !workflow.repair && !workflow.notify);
+        assert!(!workflow.integrate && !workflow.accept);
         assert_eq!(workflow.parameters, json!({}));
         assert_eq!(
             workflow.check.args,

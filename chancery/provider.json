@@ -12,11 +12,11 @@
       "The retained local workspace binding of a newly initialized project queue and its controlled runtime paths."
     ],
     "not_authoritative_for": [
-      "Provider runtime outcomes, product domain state, and final inbox delivery."
+      "Provider runtime outcomes and product domain state."
     ],
     "inventory": {
       "covers": [
-        "Telete project workflow submission, exact candidate checking, selected integration and acceptance, preparation, deployment, repair, notification, and installation commands, including Cell native CI.",
+        "Telete project workflow submission, exact candidate checking, selected integration and acceptance, preparation, deployment, and installation commands, including Cell native CI.",
         "Initial shared host storage selection, storage inspection, initial signing-certificate creation, and explicit shared signing selection."
       ],
       "completeness": "complete",
@@ -29,7 +29,7 @@
       "Host setup selects the current account home independently of HOME and --state; Keychain retains private-key authority."
     ],
     "shared_privacy_and_retention": [
-      "Retained source, prompts, diagnostics, requests, and receipts are private operational records."
+      "Retained source, diagnostics, requests, and receipts are private operational records."
     ],
     "compatibility_and_retirement": [
       "Telete journal and receipt schemas are checked explicitly; the shared host workspace and signing formats remain schema one."

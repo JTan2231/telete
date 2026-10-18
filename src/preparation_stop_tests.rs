@@ -13,18 +13,6 @@ fn preparation_stop_fixture() -> Result<(tempfile::TempDir, Paths, PathBuf, Job)
     blocked.last_error = blocked.outcome_message.clone();
     blocked.unresolved = true;
     blocked.preparation_generation = 2;
-    blocked.options.notify = true;
-    blocked.notification = Some(Notification {
-        message: email::api::Message {
-            subject: "retained preparation failure".into(),
-            body: "retained staging diagnostics".into(),
-            idempotency_key: Some("retained-preparation-failure".into()),
-        },
-        accepted: true,
-        uncertain: false,
-        attempts: Vec::new(),
-        created: 1_700_000_003,
-    });
     let directory = paths.job(&blocked.id.0);
     let worktree = directory.join("worktree");
     git::ensure_worktree(&paths, &repo, &worktree, &base)?;
@@ -85,22 +73,14 @@ fn blocked_preparation_service_stop_preserves_journal_and_maintenance_fence() ->
     // Match the ownership already held by installation::stop.
     let _resources = crate::broker::settled_guards(&paths)?;
     let _deployment = store::lock(&paths.root.join("deployments/deployment.lock"), false)?;
-    for notify in [true, false] {
-        let mut current = store.job(&blocked.id.0)?;
-        if !notify {
-            current.options.notify = false;
-            current.notification = None;
-            store.save(&mut current)?;
-        }
-        let before = serde_json::to_value(&store.job(&blocked.id.0)?)?;
-        assert!(require_quiescent(&paths).is_err());
-        require_service_stoppable(&paths)?;
-        require_service_stoppable(&paths)?;
-        assert_eq!(serde_json::to_value(&store.job(&blocked.id.0)?)?, before);
-        assert_eq!(store.config()?, config);
-        assert!(store.paused()?);
-        assert!(require_quiescent(&paths).is_err());
-    }
+    let before = serde_json::to_value(&store.job(&blocked.id.0)?)?;
+    assert!(require_quiescent(&paths).is_err());
+    require_service_stoppable(&paths)?;
+    require_service_stoppable(&paths)?;
+    assert_eq!(serde_json::to_value(&store.job(&blocked.id.0)?)?, before);
+    assert_eq!(store.config()?, config);
+    assert!(store.paused()?);
+    assert!(require_quiescent(&paths).is_err());
     assert_eq!(
         fs::read(directory.join("production-2/partial.log"))?,
         b"retained partial staging\n"
@@ -132,13 +112,11 @@ fn blocked_preparation_stop_rejects_changed_job_or_operation_authority() -> Resu
         ("stopped_phase", json!("checking")),
         ("outcome", json!("succeeded")),
         ("unresolved", json!(false)),
-        ("model_unresolved", json!(true)),
         ("accepted", json!(true)),
         ("base", Value::Null),
         ("candidate", Value::Null),
         ("operation", Value::Null),
         ("preparation_generation", json!(3)),
-        ("notification", Value::Null),
     ] {
         let mut changed = original.clone();
         changed[field] = value;
@@ -152,11 +130,6 @@ fn blocked_preparation_stop_rejects_changed_job_or_operation_authority() -> Resu
     ] {
         let mut changed = original.clone();
         changed["operation"][field] = value;
-        preparation_stop_rejects_job(&paths, &blocked, serde_json::from_value(changed)?, field)?;
-    }
-    for (field, value) in [("accepted", json!(false)), ("uncertain", json!(true))] {
-        let mut changed = original.clone();
-        changed["notification"][field] = value;
         preparation_stop_rejects_job(&paths, &blocked, serde_json::from_value(changed)?, field)?;
     }
     let mut changed = original.clone();
@@ -243,10 +216,6 @@ fn blocked_preparation_stop_rejects_unsettled_queue_source_or_deployment() -> Re
     store.save(&mut queued)?;
     assert!(require_service_stoppable(&paths).is_err());
     queued.unresolved = false;
-    queued.model_unresolved = true;
-    store.save(&mut queued)?;
-    assert!(require_service_stoppable(&paths).is_err());
-    queued.model_unresolved = false;
     store.save(&mut queued)?;
     require_service_stoppable(&paths)?;
     assert_eq!(serde_json::to_value(&store.job(&blocked.id.0)?)?, before);

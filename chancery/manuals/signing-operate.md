@@ -78,7 +78,7 @@ volume formatting, mounting, ownership change, or journal migration is supplied.
 
 ## Use the signing policy
 
-Telete owns the shared Cell signing policy. Builds, repairs, cache resets,
+Telete owns the shared Cell signing policy. Builds, cache resets,
 reinstallations, and upgrades do not select or generate another certificate.
 The supported `local` profile supplies no Developer ID distribution,
 notarization, installer-package signing, Hardened Runtime, additional
@@ -162,9 +162,7 @@ Telete retains no additional artifact cache.
 
 Missing keys, expired certificates, locked Keychains, and failed signing commands
 stop the operation. There is no unsigned, ad hoc, alternate-name, renewal, or
-automatically generated identity fallback. Signing failures do not request
-model repair. Repair agents receive no private-key material or configuration
-writer.
+automatically generated identity fallback.
 
 For initial adoption or rotation, select the intended product inventory with
 repeated `--deploy PRODUCT` options and inspect the retained deployment result.

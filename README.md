@@ -1,8 +1,10 @@
 # Telete
 
 Telete runs a serial queue for committed source. Repository configuration selects
-the check command and optional integration, preparation, acceptance, deployment,
-repair, and notification stages. A foreground worker needs no service installation.
+the check command and optional integration, preparation, acceptance, and deployment
+stages. A foreground worker needs no service installation. Failed checks and
+compilation remain failures after any deterministic Cell autofix; fix the source
+and submit again.
 
 Build the CLI, then use this repository's workflow:
 
@@ -22,3 +24,6 @@ one lifecycle tick, not a complete CI job.
 Read the [queue contract](chancery/manuals/queue-operate.md) for project setup,
 command configuration, retained outcomes, and Cell compatibility. The
 [source layout](docs/source-layout.md) identifies the copied dependencies.
+
+The two plain repair prompt files under `prompts/` are retained text assets.
+No workflow loads or executes them.
