@@ -3,9 +3,11 @@
 Do not overcomplicate or overarchitect things.
 
 Telete runs a serial queue for committed repository workflows on macOS. Every
-public command selects a project config. The config owns repository and runtime
-paths, commands, and parameters. Create private runtime state on demand; no init
-command or pre-existing state is required.
+public command selects a project config. The config owns the source repository,
+commands, parameters, and initial runtime path. Worktree creation binds the Git
+common directory to one runtime path; all linked worktrees and configs then use
+that shared queue. Create private runtime state on demand; no init command or
+pre-existing state is required.
 
 Run the selected committed revision directly, defaulting to HEAD resolved at
 submission. Do not add integration, accepted baselines, source acceptance, or

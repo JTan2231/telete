@@ -1,9 +1,9 @@
 # Telete
 
 Telete runs a serial queue for committed source on macOS. A project JSON config
-selects the repository, private runtime directory, check command, and optional
-preparation and deployment commands. Each job runs one exact commit in a private
-checkout.
+selects the repository, initial private runtime directory, check command, and
+optional preparation and deployment commands. Each job runs one exact commit in
+a private checkout.
 
 Build the CLI, then run this repository's workflow:
 
@@ -15,6 +15,19 @@ cargo build --locked --bin telete
 
 `submit` defaults to the project's current `HEAD`. Supply a revision to run
 another commit. No initialization or prior runtime directory is required.
+
+Create a development worktree and a branch named after its destination:
+
+```sh
+telete worktree ../feature-a --config ci/workflow.json
+```
+
+The branch starts at the configured repository's `HEAD` when invoked. Worktree
+creation binds the repository's queue to the selected runtime directory. The
+original checkout and all linked worktrees then share that queue, including
+worktrees created with Git. Submit from each checkout using its corresponding
+config to select its own commit and workflow. Separate clones keep separate
+queues. Operation results report the effective runtime directory as `state_root`.
 
 The wrapper selects `ci/workflow.json`, which points to this repository and
 `.telete/`. Set `TELETE_BIN` to an absolute built executable when using another

@@ -16,9 +16,9 @@ telete \- run a serial queue of committed repository workflows
 .SH DESCRIPTION
 .B telete
 runs committed source from a local Git repository on macOS.
-A project JSON configuration selects the repository, private runtime directory,
-required check command, optional preparation and deployment commands, and
-parameters.
+A project JSON configuration selects the repository, initial private runtime
+directory, required check command, optional preparation and deployment commands,
+and parameters.
 Each submitted job runs one exact commit in a private checkout.
 Jobs run serially, in queue order.
 .PP
@@ -36,6 +36,11 @@ Mutating commands create private runtime state on demand.
 Every operation must select a project configuration, including when inspecting
 an existing queue.
 Help and version requests do not require a configuration.
+.PP
+Creating a development worktree binds the Git common directory to one queue.
+The original checkout, every linked worktree, and alternate configurations then
+share that queue, including worktrees created directly with Git.
+Separate clones retain independent queues.
 .SH OPTIONS
 The following global options may appear before or after a subcommand.
 .TP
@@ -62,6 +67,25 @@ Display the program version and exit.
 Available at the top level.
 .SH COMMANDS
 .TP
+.BI "worktree " path
+Resolve HEAD once in the configured repository and create a new branch and
+Git worktree at that commit.
+A relative destination resolves against the invocation's current directory.
+The branch name is the normalized destination's last path component, which
+must be a valid literal Git branch name.
+An existing destination or branch is an error; no existing worktree is adopted.
+Uncommitted changes remain in the source checkout.
+This command neither submits work nor starts a worker.
+The result includes the absolute
+.BR path ,
+new
+.BR branch ,
+full
+.BR commit ,
+and shared runtime
+.BR state .
+See SHARED QUEUE for queue binding and failure behavior.
+.TP
 .B submit \fR[\fIrevision\fR]
 Queue a new job for a Git revision that resolves to a local commit.
 The default is HEAD.
@@ -70,6 +94,10 @@ The result includes the job's
 and full
 .BR commit .
 Each submission creates a separate job, even for a previously submitted commit.
+Before reporting success, Telete retains the commit and creates its private
+execution checkout.
+Removing the submitting linked worktree does not change this retained source;
+the shared Git repository and runtime must remain available.
 It does not start a worker or wait for completion.
 .TP
 .B status \fR[\fIjob\fR]
@@ -174,11 +202,15 @@ Every operation reads and validates the selected configuration.
 .SS Project fields
 .TP
 .B repo
-Required path to the Git repository checkout.
+Required path to the Git repository checkout selecting source.
+HEAD is resolved there regardless of the invocation's current directory.
 .TP
 .B state
-Required path to the private runtime directory identifying this queue.
-Use the same state directory for all operations on the queue.
+Required initial path to the private runtime directory identifying this queue.
+Until a shared queue is bound, use the same state directory for queue
+operations.
+After binding, the recorded shared runtime path takes precedence; changing this
+field cannot redirect the queue.
 A populated directory is bound to its repository and runtime path and cannot
 be reassigned to another repository or moved by changing the configuration.
 .TP
@@ -249,6 +281,52 @@ Omitted or null means no time limit.
 On timeout, Telete terminates the command's process group and records failure.
 .PP
 Programs, arguments, and environment values cannot contain NUL.
+.SH SHARED QUEUE
+The first
+.B worktree
+invocation binds Git's common directory to the selected configuration's absolute
+.B state
+path, recording the private binding at
+.IR G/telete/queue.json .
+Here
+.I G
+is the common Git directory shared by the original checkout and linked
+worktrees.
+Every Telete command selecting one of those checkouts then uses this runtime
+directory, including commands using another config or a manually created
+worktree.
+Separate clones have different Git common directories and independent queues.
+.PP
+Initial binding requires exclusive repository selection.
+If a worker or operation is using an unbound repository, stop existing workers
+and retry after the operation finishes.
+Once bound, the repository permits worktree creation while its shared worker
+runs.
+.PP
+The selected configuration still chooses the source repository, commands, and
+parameters.
+Submission freezes each job's own commit, workflow, and parameters before
+joining the common queue.
+Select the corresponding config in each checkout when its repository path is
+relative.
+Passing the original checkout's config from inside a child continues to select
+the original repository's HEAD.
+A copied config's relative state path cannot create a second queue after
+binding.
+.PP
+All linked worktrees share queue order, worker ownership, pause, maintenance
+holds, cancellation, recovery, diagnostics, and retention limits.
+An unresolved command blocks subsequent work from every checkout.
+Telete rejects conflicting existing runtime state instead of combining queues.
+.PP
+The queue binding can remain if Git worktree creation fails.
+Inspect the reported branch and destination before retrying; Telete does not
+remove pre-existing branches or worktrees to recover a failed creation.
+Preserve the shared Git repository, binding, and runtime directory while work
+is queued, active, or unresolved.
+If the binding survives but the runtime directory or queue database is missing,
+all operations fail and require restoration of that operational state.
+Telete does not create an empty replacement queue behind an existing binding.
 .SH EXECUTION
 Stages run in this order: check, optional preparation, optional deployment.
 A stage succeeds only when its command exits with status 0 without a timeout,
@@ -310,6 +388,10 @@ cleanup.
 Operation results are JSON on standard output.
 Operation errors are written to standard error.
 Help and version requests print text instead.
+Operation results include the effective absolute runtime directory as the
+top-level
+.B state_root
+field.
 The foreground worker normally runs without printing progress; inspect it
 from another terminal using
 .B status
@@ -379,9 +461,18 @@ The project JSON configuration selected by
 .BR \-\-config .
 It is separate from runtime state.
 .TP
+.I G/telete/queue.json
+Private binding from Git's common directory to the shared runtime directory,
+created by the first worktree command.
+.TP
+.I G/telete/queue.lock
+Repository selection lock coordinating ordinary queue operations with initial
+shared binding.
+This lock can exist before the queue binding is established.
+.TP
 .I state/queue.sqlite3
 The operational queue, repository binding, pause state, maintenance holds,
-and bounded completion markers in the configured runtime directory.
+and bounded completion markers in the effective runtime directory.
 .TP
 .I state/jobs/job/
 Private checkout, command requests and contexts, stage results, logs, and
@@ -397,8 +488,12 @@ The
 .I state
 and
 .I job
-components above stand for the configured runtime path and a job ID.
+components above stand for the effective runtime path and a job ID.
 Runtime directories must be owned by the invoking user with mode 0700.
+The
+.I G/telete
+directory is also private with mode 0700; its binding and lock files use mode
+0600.
 Symbolic links anywhere in the runtime path are rejected; select a physical
 path rather than a macOS path alias.
 .PP
@@ -408,7 +503,10 @@ path rather than a macOS path alias.
 and
 .B maintenance status
 do not initialize missing state.
-A fresh queue has no work and permits new claims.
+Without a shared binding, a missing runtime directory has no work and permits
+new claims.
+An existing binding with a missing runtime directory or queue database is an
+error requiring restoration of operational state.
 .PP
 Runtime state is for current operation, not a permanent history.
 Worker cleanup releases successful and cancelled jobs' scratch files and full
@@ -425,6 +523,7 @@ After pruning,
 and
 .B wait job
 report that the job is unavailable.
+These limits apply to the shared queue as a whole, not separately per worktree.
 .SH RECOVERY
 An interrupted command without matching terminal evidence remains unresolved
 and blocks later work.
@@ -501,6 +600,19 @@ Submit a particular revision:
 .RS
 .nf
 telete \-\-config telete.json submit v1.2.3
+.fi
+.RE
+.PP
+Create two branches and linked worktrees, then submit their respective HEADs to
+one queue:
+.PP
+.RS
+.nf
+telete worktree ../feature-a \-\-config telete.json
+telete worktree ../feature-b \-\-config telete.json
+telete \-\-config ../feature-a/telete.json submit
+telete \-\-config ../feature-b/telete.json submit
+telete \-\-config telete.json status
 .fi
 .RE
 .PP

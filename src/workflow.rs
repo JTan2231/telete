@@ -134,7 +134,7 @@ struct ProjectFile {
     parameters: serde_json::Value,
 }
 
-fn normalized_absolute(path: &Path, directory: &Path) -> PathBuf {
+pub(crate) fn normalized_absolute(path: &Path, directory: &Path) -> PathBuf {
     let joined = directory.join(path);
     let mut normalized = PathBuf::new();
     for component in joined.components() {

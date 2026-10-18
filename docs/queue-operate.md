@@ -35,8 +35,9 @@ telete --config telete.json worker
 
 No initialization command or pre-existing runtime directory is needed. Mutating
 operations create runtime state on demand, and a fresh queue permits admission.
-Use the same configured state directory to operate that queue. Telete rejects
-reusing a populated runtime directory with a different repository.
+Until a shared queue is bound, use the same configured state directory to
+operate that queue. Telete rejects reusing a populated runtime directory with a
+different repository.
 
 The private state directory holds the operational queue, private checkouts,
 command records, output files, and Telete's temporary files. Ignore it in Git
@@ -44,7 +45,66 @@ when it is inside the project. State must be user-owned and private. It is
 operational data, not project configuration or a permanent job archive.
 
 `status`, `wait`, `gates`, and `maintenance status` do not initialize missing
-runtime state. A missing runtime directory has no queued work.
+runtime state. Without a shared queue binding, a missing runtime directory has
+no queued work. If a binding exists but its runtime directory or queue database
+is missing, operations fail and require restoration of the operational state.
+
+## Create worktrees and share a queue
+
+```sh
+telete worktree ../feature-a --config telete.json
+```
+
+`worktree PATH` resolves `HEAD` once in the configured repository, then creates a
+new branch and Git worktree at that commit. A relative destination resolves
+against the invocation's current directory. The branch name is the destination's
+last normalized path component and must be a valid literal Git branch name:
+`../feature-a` creates `feature-a`. An existing destination or branch is an
+error; Telete does not adopt an existing worktree. Uncommitted
+changes stay in the source checkout. This command neither submits a job nor
+starts a worker.
+
+The first `worktree` invocation binds the Git common directory to the selected
+config's absolute `state` path. Telete keeps the private binding at
+`G/telete/queue.json`, where `G` is Git's common directory. From then on, the
+original checkout, all linked worktrees, and all configs selecting those
+checkouts use this one runtime directory. This includes manually created Git
+worktrees. Separate clones have separate Git common directories and keep
+independent queues.
+
+Initial binding requires exclusive repository selection. If an existing worker
+or operation is using an unbound repository, stop its workers and retry after
+the operation finishes. Once the repository is bound, creating another worktree
+can proceed while the shared worker runs.
+
+After binding, `state` remains a required config field but cannot redirect the
+queue. A copied config's relative `.telete` path therefore does not create a
+second queue in its checkout. Telete rejects conflicting existing runtime state
+rather than combining queues. The binding can remain if Git worktree creation
+fails; inspect the reported branch and destination before retrying. Telete does
+not remove pre-existing branches or worktrees to recover a failed creation.
+
+The selected config still determines the source repository, commands, and
+parameters. Use the config inside each checkout when its `repo` is relative:
+
+```sh
+telete --config ../feature-a/telete.json submit
+telete --config ../feature-b/telete.json submit
+telete --config telete.json status
+```
+
+These submissions join the same queue and retain their own selected commits,
+workflows, and parameters. Passing the original checkout's config while standing
+in a child still selects the original repository's `HEAD`. Queue order is the
+order submissions are admitted to the shared queue.
+
+Operation results include the effective absolute runtime directory in the
+top-level `state_root` field. `worktree` also returns `path`, `branch`, `commit`,
+and `state`. Preserve the shared Git repository, queue binding, and runtime
+directory while work is queued, active, or unresolved.
+If the binding survives but its runtime directory or queue database is missing,
+restore that operational state before continuing. Telete refuses to create an
+empty replacement queue behind an existing binding.
 
 ## Select source and commands
 
@@ -52,6 +112,11 @@ runtime state. A missing runtime directory has no queued work.
 resolves the revision once to a full commit ID and freezes the configured
 workflow and parameters. Uncommitted checkout changes are not submitted. Later
 config or HEAD changes do not change the submitted job.
+
+Before reporting successful submission, Telete retains the commit and creates
+its private execution checkout. Removing the submitting linked worktree does
+not change this retained source; the shared Git repository and runtime must
+remain available.
 
 Each job runs that exact commit in a clean private checkout. Telete does not
 merge source, maintain an accepted baseline, accept commits, or advance project
@@ -126,6 +191,11 @@ to inspect work, and `wait JOB --timeout 60` to observe a job without submitting
 it again. Add `--json` for compact JSON output and structured operation errors.
 Ordinary operation failures use exit 1; CLI syntax errors use exit 2.
 
+For a bound repository, these operations act on the shared queue from every
+linked checkout. Only one worker can own it. Pause, maintenance holds,
+cancellation, recovery, and retained diagnostics are shared too. An unresolved
+command blocks later jobs from every checkout.
+
 `pause` prevents new claims. `resume` permits claims when no maintenance hold or
 unresolved work blocks admission. `cancel JOB` requests an intended stop at a
 safe boundary. It cannot establish completion or discard uncertain effects of
@@ -156,6 +226,8 @@ phase, queue sequence, and update time. Markers contain no commit, command,
 parameters, environment, or output. Old markers are pruned, and `wait JOB` then
 reports that the job is unavailable. Archive any project outputs through the
 configured commands when they need a longer lifetime.
+These retention limits apply to the shared queue as a whole, not separately to
+each worktree.
 
 ## Coordinate maintenance
 

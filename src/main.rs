@@ -5,6 +5,7 @@ mod manager;
 mod model;
 mod paths;
 mod process;
+mod repository_queue;
 mod store;
 mod workflow;
 
@@ -30,6 +31,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a branch and worktree sharing this repository's queue.
+    Worktree {
+        path: PathBuf,
+    },
     /// Run an exact committed revision using the selected project configuration.
     Submit {
         #[arg(default_value = "HEAD")]
@@ -118,6 +123,9 @@ async fn execute(cli: Cli) -> Result<serde_json::Value> {
         return Ok(serde_json::json!({"state":"completed"}));
     }
     let project = workflow::read(cli.config.as_deref().context("--config is required")?)?;
+    if let Command::Worktree { path } = &cli.command {
+        return repository_queue::create_worktree(&project, path);
+    }
     let create = !matches!(
         cli.command,
         Command::Status { .. }
@@ -128,7 +136,7 @@ async fn execute(cli: Cli) -> Result<serde_json::Value> {
             }
     );
     let paths = manager::select(&project, create)?;
-    match cli.command {
+    let mut result = match cli.command {
         Command::Submit { revision } => {
             manager::submit(&paths, &project.repo, &revision, project.workflow)
         }
@@ -153,7 +161,10 @@ async fn execute(cli: Cli) -> Result<serde_json::Value> {
         },
         Command::Gates => broker::status(&paths),
         Command::InternalExecute { .. } => unreachable!("handled before config selection"),
-    }
+        Command::Worktree { .. } => unreachable!("handled before queue selection"),
+    }?;
+    result["state_root"] = serde_json::to_value(&paths.root)?;
+    Ok(result)
 }
 
 #[cfg(test)]

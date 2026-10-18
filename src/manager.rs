@@ -18,25 +18,7 @@ mod workflow_manager;
 
 /// Validate the project before creating any operational state.
 pub(crate) fn select(project: &ProjectConfig, create: bool) -> Result<Paths> {
-    project.workflow.validate()?;
-    let mut paths = Paths::selected(project.state.clone(), false)?;
-    let repository = git::repository(&paths, &project.repo)?;
-    let binding = Config {
-        state_root: paths.root.clone(),
-        common_git_dir: git::common(&paths, &repository)?,
-        repository,
-    };
-    if let Some(previous) = store::probe_config(&paths.root)? {
-        ensure!(
-            previous == binding,
-            "configured repository or state identity changed"
-        );
-    } else if create {
-        paths = Paths::selected(project.state.clone(), true)?;
-        let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
-        Store::create(&paths.root, &binding)?;
-    }
-    Ok(paths)
+    crate::repository_queue::select(project, create)
 }
 
 fn configured(paths: &Paths) -> Result<(Store, Config)> {
@@ -44,7 +26,7 @@ fn configured(paths: &Paths) -> Result<(Store, Config)> {
     let config = store.config()?;
     paths.verify_config(&config)?;
     ensure!(
-        git::common(paths, &config.repository)? == config.common_git_dir,
+        git::common(paths, &config.common_git_dir)? == config.common_git_dir,
         "configured Git repository identity changed"
     );
     Ok((store, config))
@@ -59,8 +41,8 @@ pub(crate) fn submit(
     workflow.validate()?;
     let (store, config) = configured(paths)?;
     ensure!(
-        git::repository(paths, repo)? == config.repository,
-        "submit must select the configured repository checkout"
+        git::common(paths, repo)? == config.common_git_dir,
+        "submit must select a checkout of the configured Git repository"
     );
     let commit = git::commit(paths, repo, revision)?;
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
@@ -70,15 +52,25 @@ pub(crate) fn submit(
         workflow,
     );
     let mut admitted = store.transaction(|| store.insert(&job))?;
-    // A queued record makes an interrupted submission visible. Starting the
-    // job also ensures its private ref, without an unrecorded resubmission.
-    if let Err(error) = git::advance(
-        paths,
-        repo,
-        &git::private_ref(&job.id.0)?,
-        None,
-        &job.commit,
-    ) {
+    // A queued record makes interrupted admission visible. Retain its commit
+    // and private checkout before acknowledging admission, so removing the
+    // submitting development worktree does not affect accepted work.
+    let retained = (|| {
+        git::advance(
+            paths,
+            &config.common_git_dir,
+            &git::private_ref(&job.id.0)?,
+            None,
+            &job.commit,
+        )?;
+        git::ensure_worktree(
+            paths,
+            &config.common_git_dir,
+            &paths.job(&job.id.0).join("worktree"),
+            &job.commit,
+        )
+    })();
+    if let Err(error) = retained {
         let message = format!("could not retain submitted source: {error:#}");
         admitted.phase = Phase::Failed;
         admitted.outcome = Some(Phase::Failed);
@@ -372,14 +364,14 @@ impl Worker<'_> {
             Phase::Starting => {
                 git::advance(
                     self.paths,
-                    &self.config.repository,
+                    &self.config.common_git_dir,
                     &git::private_ref(&job.id.0)?,
                     None,
                     &job.commit,
                 )?;
                 git::ensure_worktree(
                     self.paths,
-                    &self.config.repository,
+                    &self.config.common_git_dir,
                     &self.worktree(job),
                     &job.commit,
                 )?;
@@ -446,18 +438,23 @@ impl Worker<'_> {
             let worktree = self.worktree(job);
             if !job.cleanup.recorded {
                 job.cleanup.registration =
-                    git::registration(self.paths, &self.config.repository, &worktree)?;
+                    git::registration(self.paths, &self.config.common_git_dir, &worktree)?;
                 job.cleanup.recorded = true;
                 self.store.save(job)?;
             }
             crate::broker::forget_job(self.paths, &job.id.0)?;
             git::remove_worktree(
                 self.paths,
-                &self.config.repository,
+                &self.config.common_git_dir,
                 &worktree,
                 job.cleanup.registration.as_deref(),
             )?;
-            git::forget(self.paths, &self.config.repository, &job.id.0, &job.commit)?;
+            git::forget(
+                self.paths,
+                &self.config.common_git_dir,
+                &job.id.0,
+                &job.commit,
+            )?;
             let directory = self.paths.job(&job.id.0);
             if crate::paths::private_directory_exists(&directory)? {
                 fs::remove_dir_all(directory)?;

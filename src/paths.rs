@@ -3,6 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -12,6 +13,8 @@ use serde::Serialize;
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
     pub(crate) root: PathBuf,
+    // Prevent establishing a shared binding while an unbound operation is live.
+    repository_selection: Option<Arc<FileLock>>,
 }
 
 impl Paths {
@@ -19,7 +22,10 @@ impl Paths {
         if let Some(config) = crate::store::probe_config(&root)? {
             ensure!(config.state_root == root, "queue state directory changed");
         }
-        let paths = Self { root };
+        let paths = Self {
+            root,
+            repository_selection: None,
+        };
         if create {
             paths.create_directories()?;
         }
@@ -34,6 +40,10 @@ impl Paths {
         Ok(())
     }
 
+    pub(crate) fn retain_repository_selection(&mut self, lock: FileLock) {
+        self.repository_selection = Some(Arc::new(lock));
+    }
+
     fn create_directories(&self) -> Result<()> {
         ensure_private(&self.root)?;
         for name in ["jobs", "tmp", "broker", "deployments"] {
@@ -44,9 +54,7 @@ impl Paths {
 
     #[cfg(test)]
     pub(crate) fn for_test(root: PathBuf) -> Result<Self> {
-        let paths = Self { root };
-        paths.create_directories()?;
-        Ok(paths)
+        Self::selected(root, true)
     }
 
     pub(crate) fn job(&self, id: &str) -> PathBuf {
@@ -131,11 +139,20 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 pub(crate) struct FileLock {
     _file: File,
 }
 
 pub(crate) fn lock(path: &Path, blocking: bool) -> Result<FileLock> {
+    file_lock(path, blocking, false)
+}
+
+pub(crate) fn shared_lock(path: &Path) -> Result<FileLock> {
+    file_lock(path, true, true)
+}
+
+fn file_lock(path: &Path, blocking: bool, shared: bool) -> Result<FileLock> {
     ensure_private(path.parent().context("lock has no parent")?)?;
     let file = OpenOptions::new()
         .read(true)
@@ -151,7 +168,9 @@ pub(crate) fn lock(path: &Path, blocking: bool) -> Result<FileLock> {
             && file.metadata()?.mode() & 0o777 == 0o600,
         "lock must be a private user-owned regular file"
     );
-    if blocking {
+    if shared {
+        FileExt::lock_shared(&file)?;
+    } else if blocking {
         file.lock_exclusive()?;
     } else if let Err(error) = file.try_lock_exclusive() {
         bail!("operation already owned: {}: {error}", path.display());

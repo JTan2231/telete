@@ -18,7 +18,7 @@ fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
     let directory = temporary.path().canonicalize()?;
     let repo = directory.join("project");
     fs::create_dir(&repo)?;
-    let paths = Paths { root:directory.join("state") };
+    let paths = Paths::selected(directory.join("state"), false)?;
     git::value(&paths, &repo, &["init", "--initial-branch=main"])?;
     fs::write(repo.join("payload.txt"), "selected source\n")?;
     script(&repo.join("check.sh"), "cat payload.txt >> \"$MARKER\"")?;
@@ -89,6 +89,57 @@ fn source_is_resolved_at_submission_and_success_discards_details() -> Result<()>
     assert_eq!(git::commit(&paths, &project.repo, "HEAD")?, later);
     assert_eq!(fs::read_to_string(project.repo.join("payload.txt"))?, "dirty caller\n");
     assert_eq!(fs::read_to_string(paths.root.join("observed"))?, "selected source\n");
+    Ok(())
+}
+
+#[test]
+fn linked_checkouts_submit_in_one_order_with_their_selected_workflows() -> Result<()> {
+    let (temporary, project, original) = fixture()?;
+    let (paths, first) = enqueue(&project, "HEAD")?;
+    let linked = temporary.path().canonicalize()?.join("feature");
+    git::value(&paths, &project.repo, &["worktree", "add", "-b", "feature",
+        linked.to_str().context("linked path")?, &original.0])?;
+    fs::write(linked.join("payload.txt"), "feature source\n")?;
+    let selected = record_commit(&paths, &linked)?;
+    let mut workflow = project.workflow.clone();
+    workflow.check.program = "/bin/sh".into();
+    workflow.check.args = vec!["-c".into(), "printf '%s: ' \"$MODE\" >> \"$MARKER\"; cat payload.txt >> \"$MARKER\"".into()];
+    workflow.check.env.insert("MODE".into(), "feature workflow".into());
+    let value = submit(&paths, &linked, "HEAD", workflow)?;
+    let second = value["id"].as_str().context("second id")?;
+    assert_eq!(value["commit"], selected.0);
+    assert!(paths.job(second).join("worktree").is_dir());
+    let queued = status(&paths, None)?;
+    assert_eq!(queued["queue"][0]["id"], first);
+    assert_eq!(queued["queue"][1]["id"], second);
+    assert_eq!(queued["queue"][0]["commit"], original.0);
+    assert_eq!(finish_run(&paths, &first)?["phase"], "succeeded");
+    assert_eq!(status(&paths, Some(second))?["phase"], "queued");
+    assert_eq!(finish_run(&paths, second)?["phase"], "succeeded");
+    assert_eq!(fs::read_to_string(paths.root.join("observed"))?,
+        "selected source\nfeature workflow: feature source\n");
+    Ok(())
+}
+
+#[test]
+fn accepted_source_survives_removal_of_the_queue_origin_checkout() -> Result<()> {
+    let (temporary, mut project, original) = fixture()?;
+    let paths = Paths::selected(project.state.clone(), false)?;
+    let primary = project.repo.clone();
+    let linked = temporary.path().canonicalize()?.join("feature");
+    git::value(&paths, &primary, &["worktree", "add", "-b", "feature",
+        linked.to_str().context("linked path")?, &original.0])?;
+    project.repo = linked.clone();
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    assert_eq!(Store::open(&paths.root)?.config()?.repository, linked);
+    assert!(paths.job(&id).join("worktree").is_dir());
+    git::value(&paths, &primary, &["worktree", "remove",
+        linked.to_str().context("linked path")?])?;
+    assert!(!linked.exists());
+    assert_eq!(finish_run(&paths, &id)?["phase"], "succeeded");
+    assert_eq!(fs::read_to_string(paths.root.join("observed"))?, "selected source\n");
+    assert!(!paths.job(&id).exists());
+    assert!(git::ref_value(&paths, &primary, &git::private_ref(&id)?)?.is_none());
     Ok(())
 }
 
