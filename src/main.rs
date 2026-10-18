@@ -23,7 +23,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "telete", version, about = "Committed-source CI for repository workflows")]
+#[command(
+    name = "telete",
+    version,
+    about = "Committed-source CI for repository workflows"
+)]
 struct Cli {
     /// Absolute queue directory; new explicit project queues also work here.
     #[arg(long, global = true)]
