@@ -25,3 +25,18 @@ For another project, run `telete --config path/to/telete.json submit` and
 `telete --config path/to/telete.json worker`. Read the
 [queue contract](docs/queue-operate.md) for configuration, execution, and recovery.
 The [source layout](docs/source-layout.md) describes the standalone Rust package.
+
+The [telete(1) manual](docs/telete.1) covers commands, configuration, execution
+context, exit statuses, files, recovery, and examples. View it from this checkout:
+
+```sh
+man ./docs/telete.1
+```
+
+To install the manual for your user account:
+
+```sh
+install -d "$HOME/.local/share/man/man1"
+install -m 0644 docs/telete.1 "$HOME/.local/share/man/man1/telete.1"
+man -M "$HOME/.local/share/man" telete
+```

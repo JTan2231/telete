@@ -1,0 +1,534 @@
+.TH TELETE 1 "October 18, 2026" "Telete 0.1.0" "General Commands Manual"
+.SH NAME
+telete \- run a serial queue of committed repository workflows
+.SH SYNOPSIS
+.B telete \-\-config
+.I file
+.RB [ \-\-json ]
+.I command
+.RI [ arguments ]
+.br
+.B telete
+.RB { \-h | \-\-help | \-V | \-\-version }
+.br
+.B telete help
+.RI [ command " ...]"
+.SH DESCRIPTION
+.B telete
+runs committed source from a local Git repository on macOS.
+A project JSON configuration selects the repository, private runtime directory,
+required check command, optional preparation and deployment commands, and
+parameters.
+Each submitted job runs one exact commit in a private checkout.
+Jobs run serially, in queue order.
+.PP
+Submission resolves the requested revision once and freezes the workflow and
+parameters with the job.
+The default revision is HEAD in the configured repository at submission time.
+Uncommitted changes are not included.
+Later changes to HEAD or the configuration do not alter a submitted job.
+Telete runs the selected commit directly; it does not merge source or update
+project branches.
+.PP
+Submission queues work; a separately started foreground worker executes it.
+No initialization command or pre-existing runtime directory is required.
+Mutating commands create private runtime state on demand.
+Every operation must select a project configuration, including when inspecting
+an existing queue.
+Help and version requests do not require a configuration.
+.SH OPTIONS
+The following global options may appear before or after a subcommand.
+.TP
+.BI \-\-config " file"
+Read the required project JSON configuration.
+A relative configuration path resolves against the current directory.
+There is no default configuration path or environment variable selector.
+The configuration and configured repository must remain available for queue
+operations.
+.TP
+.B \-\-json
+Write compact JSON results to standard output and structured operation errors
+to standard error.
+Without this option, results are pretty-printed JSON and operation errors begin
+with
+.BR "telete:" .
+Command-line parsing errors and help remain ordinary text in either mode.
+.TP
+.BR \-h ", " \-\-help
+Display help for the selected command and exit.
+.TP
+.BR \-V ", " \-\-version
+Display the program version and exit.
+Available at the top level.
+.SH COMMANDS
+.TP
+.B submit \fR[\fIrevision\fR]
+Queue a new job for a Git revision that resolves to a local commit.
+The default is HEAD.
+The result includes the job's
+.B id
+and full
+.BR commit .
+Each submission creates a separate job, even for a previously submitted commit.
+It does not start a worker or wait for completion.
+.TP
+.B status \fR[\fIjob\fR]
+Display the queue, active job, retained failure, settled-job markers, operator
+pause, and maintenance owners.
+With a job ID, display only that job's retained result.
+An unavailable or pruned job is an operation error.
+.TP
+.BI "wait " "job " "\fR[\fB\-\-timeout \fIseconds\fR]"
+Observe a job until it succeeds, fails, is cancelled, becomes blocked, or the
+observation times out.
+The timeout is a positive integer number of seconds; the default is 60.
+This timeout limits observation, not execution.
+The command does not advance work or cancel the job.
+The result has
+.B observation
+set to
+.B terminal
+or
+.B timeout
+and a
+.B job
+object containing the observed state.
+A blocked job is reported as a terminal observation but remains unresolved.
+Inspect the result to determine workflow success; see EXIT STATUS.
+.TP
+.B pause
+Prevent the worker from claiming new jobs.
+Submissions are still accepted, and an already active job can continue.
+Pausing does not stop the worker or drain the queue.
+.TP
+.B resume
+Clear the operator pause.
+Claims remain prevented while any maintenance hold exists.
+An unresolved active job must be recovered before resuming.
+.TP
+.BI "cancel " job
+Request cancellation at a safe boundary.
+A queued job is cancelled before execution.
+For active work, the request is considered before the next command or after
+the current command settles.
+Cancellation does not interrupt an admitted command, roll back effects, or
+resolve uncertain work.
+.TP
+.BI "recover " job
+Reconcile a blocked job using its retained command, context, and terminal
+process evidence.
+Only blocked jobs can be recovered.
+Stop the foreground worker before invoking this command; recovery requires
+exclusive worker ownership.
+Stopping the worker may leave an admitted command running; wait for its
+execution ownership to clear before recovery.
+Recovery fails if matching terminal evidence is unavailable.
+It does not repeat an uncertain command.
+Run the worker afterward to continue remaining work.
+.TP
+.B worker \fR[\fB\-\-once\fR]
+Run the foreground queue worker until stopped or an operation error occurs.
+Only one worker can own a queue at a time.
+With
+.BR \-\-once ,
+advance one lifecycle tick and print the resulting job or idle state.
+A tick may run a selected stage to completion; it does not necessarily finish
+the entire job.
+.TP
+.BI "maintenance hold \-\-owner " owner
+Add a maintenance hold preventing new claims.
+Owner names must contain 1 to 256 bytes and no control characters.
+Holding an already held owner is harmless.
+Multiple owners may hold the queue independently; all holds must be released
+before new claims are allowed.
+Submissions and active work can continue while a hold exists.
+.TP
+.B maintenance status
+Display maintenance owners and the active job.
+The
+.B held
+field indicates whether any hold exists;
+.B drained
+means no job is active, even if jobs are queued.
+Acquiring a hold does not wait for active work to drain.
+.TP
+.BI "maintenance release \-\-owner " owner
+Release the named hold.
+Releasing an absent owner is harmless.
+Release only the owner acquired by the maintenance operation.
+This command does not clear operator pause or resolve interrupted work.
+.TP
+.B gates
+Inspect retained command execution gate records for current diagnostics.
+The broker serializes commands and permits an execution identity to join an
+existing result only when its saved command and context match exactly.
+Missing terminal evidence blocks its resource slot.
+.TP
+.B help \fR[\fIcommand\fR ...]
+Display general help or help for a subcommand, such as
+.BR "telete help maintenance hold" .
+.SH CONFIGURATION
+The configuration is a JSON object.
+Unknown project and command fields are rejected.
+Every operation reads and validates the selected configuration.
+.SS Project fields
+.TP
+.B repo
+Required path to the Git repository checkout.
+.TP
+.B state
+Required path to the private runtime directory identifying this queue.
+Use the same state directory for all operations on the queue.
+A populated directory is bound to its repository and runtime path and cannot
+be reassigned to another repository or moved by changing the configuration.
+.TP
+.B check
+Required command object for checking the selected commit.
+.TP
+.B prepare
+Optional command object, run after a successful check.
+Omitted or null means no preparation stage.
+.TP
+.B deploy
+Optional command object, run after all selected preceding stages succeed.
+Deployment may be selected without preparation.
+Omitted or null means no deployment stage.
+.TP
+.B parameters
+JSON object passed unchanged through the execution context.
+The default is an empty object.
+.PP
+Relative
+.B repo
+and
+.B state
+paths resolve against the configuration file's directory.
+They are normalized to absolute paths.
+Ignore the runtime directory in Git if it is inside the repository.
+.SS Command fields
+The same command object format applies to all three stages.
+.TP
+.B program
+Required executable path, either absolute or normalized relative to the private
+checkout.
+Relative paths must stay inside that checkout.
+A bare name such as
+.B check
+means a file in the checkout, not a PATH search.
+Paths containing dot or dot-dot components, repeated slashes, or a trailing
+slash are rejected; use
+.BR ci/check.sh ,
+not
+.BR ./ci/check.sh .
+.TP
+.B args
+Array of literal string arguments; the default is an empty array.
+Telete performs no shell interpretation or variable expansion.
+Select a shell explicitly when needed, for example
+.B program
+set to
+.B /bin/sh
+with
+.B args
+set to
+.BR "[\(dq\-c\(dq, \(dqexec ci/check.sh\(dq]" .
+.TP
+.B env
+Object of string environment overrides; the default is an empty object.
+Names must start with an ASCII letter or underscore and contain only ASCII
+letters, digits, and underscores.
+Names beginning with
+.B TELETE_
+are reserved and cannot be overridden.
+Values are literal: Telete neither expands them nor resolves paths in them
+against the configuration directory.
+.TP
+.B timeout_seconds
+Positive integer execution timeout in seconds.
+Omitted or null means no time limit.
+On timeout, Telete terminates the command's process group and records failure.
+.PP
+Programs, arguments, and environment values cannot contain NUL.
+.SH EXECUTION
+Stages run in this order: check, optional preparation, optional deployment.
+A stage succeeds only when its command exits with status 0 without a timeout,
+signal, start error, or output collection error.
+A failed stage stops the job.
+An unselected stage is reported as
+.BR not_requested ,
+not as a successful execution.
+The configured commands own their checks, output formats, credentials,
+deployment effects, and any stronger claim of domain success.
+.PP
+All stages use the same private checkout as their working directory.
+They inherit the environment at launch, with configured overrides and Telete's
+execution context.
+The inherited environment is not frozen with the submission or retained.
+Commands run with ordinary user permissions.
+Configure any required toolchain, caches, credentials, or environment in the
+project's commands; Telete imposes no filesystem sandbox or reproducibility
+guarantee.
+.PP
+Standard input is closed.
+Standard output and standard error are captured separately, up to 16 MiB each,
+and decoded as UTF-8 with replacement for invalid bytes.
+Excess output is drained but not retained, and an output collection error makes
+the stage fail even if its exit status is zero.
+A known terminal exit remains recorded separately from collection errors.
+Failure to start a program is recorded as a start error.
+Commands must not leave background work: Telete kills surviving processes in
+the command's process group after the direct child exits.
+.SS Execution context
+.B TELETE_CONTEXT
+contains the absolute path to a private JSON context file supplied to each
+stage.
+The context includes:
+.TP
+.BR id ", " job_id ", " stage
+The execution identity, job identity, and stage name.
+.TP
+.B checkout
+The absolute private checkout path.
+.TP
+.B source.commit
+The full commit ID selected at submission.
+.TP
+.B parameters
+The submitted parameters object.
+.TP
+.B outputs.directory
+The private output directory for this command.
+.TP
+.B inputs.preparation
+The absolute output directory of the successful preparation stage, when
+available; otherwise null.
+.PP
+Telete defines no package or installation format for these outputs.
+Commands that need durable outputs must copy or publish them before runtime
+cleanup.
+.SH OUTPUT
+Operation results are JSON on standard output.
+Operation errors are written to standard error.
+Help and version requests print text instead.
+The foreground worker normally runs without printing progress; inspect it
+from another terminal using
+.B status
+or
+.BR wait .
+.PP
+Job phases are
+.BR queued ,
+.BR starting ,
+.BR checking ,
+.BR preparing ,
+.BR deploying ,
+.BR blocked ,
+.BR succeeded ,
+.BR failed ,
+and
+.BR cancelled .
+Detailed records include stage results and current execution diagnostics.
+Settled jobs may instead have only a small completion marker; see FILES.
+.SH EXIT STATUS
+.TP
+.B 0
+The requested operation completed successfully, or help or version was printed.
+This does not establish that a workflow succeeded.
+In particular,
+.B wait
+returns zero for failed, cancelled, and blocked jobs and for observation
+timeout; inspect
+.B observation
+and
+.BR job.phase .
+.B worker \-\-once
+can also return zero while reporting a failed or blocked job.
+.TP
+.B 1
+An operation failed, including a missing configuration selection, invalid
+configuration, unavailable job, conflicting ownership, or recovery without
+matching terminal evidence.
+With
+.BR \-\-json ,
+the error object has
+.B ok
+set to false and an
+.B error
+string.
+.TP
+.B 2
+Invalid command-line syntax, such as an unknown option or missing required
+command argument.
+.SH ENVIRONMENT
+.TP
+.B TELETE_CONTEXT
+Set by Telete for configured commands; see EXECUTION.
+.TP
+.B TELETE_*
+Reserved for Telete's context; unavailable as configured environment overrides.
+.PP
+Other environment variables are inherited by configured commands and may be
+overridden through their
+.B env
+objects.
+Environment values are not retained unless explicitly configured.
+.SH FILES
+.TP
+.I file
+The project JSON configuration selected by
+.BR \-\-config .
+It is separate from runtime state.
+.TP
+.I state/queue.sqlite3
+The operational queue, repository binding, pause state, maintenance holds,
+and bounded completion markers in the configured runtime directory.
+.TP
+.I state/jobs/job/
+Private checkout, command requests and contexts, stage results, logs, and
+command output directories for a retained job.
+.TP
+.I state/broker/
+Current execution gate records and terminal process evidence.
+.TP
+.IR state/tmp/ ", " state/deployments/ ", " state/*.lock
+Temporary files and execution coordination locks managed by Telete.
+.PP
+The
+.I state
+and
+.I job
+components above stand for the configured runtime path and a job ID.
+Runtime directories must be owned by the invoking user with mode 0700.
+Symbolic links anywhere in the runtime path are rejected; select a physical
+path rather than a macOS path alias.
+.PP
+.BR status ,
+.BR wait ,
+.BR gates ,
+and
+.B maintenance status
+do not initialize missing state.
+A fresh queue has no work and permits new claims.
+.PP
+Runtime state is for current operation, not a permanent history.
+Worker cleanup releases successful and cancelled jobs' scratch files and full
+execution records.
+The latest failed workflow retains its diagnostics and checkout until a newer
+workflow succeeds or fails; cancellation does not supersede that failure.
+Superseded failure details are also removed.
+.PP
+At most 128 small settled-job markers are retained.
+They contain the job ID, phase, queue sequence, and update time, without source,
+commands, parameters, environment, or output.
+After pruning,
+.B status job
+and
+.B wait job
+report that the job is unavailable.
+.SH RECOVERY
+An interrupted command without matching terminal evidence remains unresolved
+and blocks later work.
+Process disappearance does not establish completion.
+Telete does not automatically repeat or roll back uncertain effects.
+.PP
+Preserve the runtime directory while work is active or unresolved.
+Deleting or editing evidence can prevent safe reconciliation.
+Inspect
+.BR "status job" ,
+.BR gates ,
+and retained diagnostics before stopping the worker and running
+.BR "recover job" .
+Recovery uses the saved invocation, including its context, explicit environment
+overrides, and timeout, rather than current command settings.
+It does not authorize another launch under the same execution identity.
+.PP
+Use the Telete version that owns existing runtime state.
+Incompatible runtime schemas are rejected; Telete does not automatically migrate
+active queues.
+.SH EXAMPLES
+Configure a repository with an executable, committed
+.B ci/check.sh
+and optional preparation and deployment scripts.
+Save this file as
+.B telete.json
+in the repository root, and ignore
+.B .telete/
+in Git:
+.PP
+.RS
+.nf
+{
+  "repo": ".",
+  "state": ".telete",
+  "check": {
+    "program": "ci/check.sh",
+    "args": [],
+    "env": {},
+    "timeout_seconds": 600
+  },
+  "prepare": {"program": "ci/prepare.sh"},
+  "deploy": {"program": "ci/deploy.sh"},
+  "parameters": {"suite": "all"}
+}
+.fi
+.RE
+.PP
+Submit HEAD and start the worker in the foreground.
+Omit the
+.B prepare
+and
+.B deploy
+fields for a check-only workflow:
+.PP
+.RS
+.nf
+telete \-\-config telete.json submit
+telete \-\-config telete.json worker
+.fi
+.RE
+.PP
+In another terminal, use the ID returned by submission in place of JOB:
+.PP
+.RS
+.nf
+telete \-\-config telete.json status
+telete \-\-config telete.json \-\-json wait JOB \-\-timeout 300
+.fi
+.RE
+.PP
+Submit a particular revision:
+.PP
+.RS
+.nf
+telete \-\-config telete.json submit v1.2.3
+.fi
+.RE
+.PP
+Hold admission for maintenance, inspect
+.BR drained ,
+and release the same owner when maintenance is complete:
+.PP
+.RS
+.nf
+telete \-\-config telete.json maintenance hold \-\-owner upgrade
+telete \-\-config telete.json maintenance status
+telete \-\-config telete.json maintenance release \-\-owner upgrade
+.fi
+.RE
+.PP
+After stopping the worker, inspect and reconcile a blocked job, then continue
+execution:
+.PP
+.RS
+.nf
+telete \-\-config telete.json status JOB
+telete \-\-config telete.json gates
+telete \-\-config telete.json recover JOB
+telete \-\-config telete.json worker
+.fi
+.RE
+.SH SEE ALSO
+.BR git (1),
+.BR git-worktree (1),
+.BR sh (1),
+.BR gitrevisions (7)
