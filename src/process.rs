@@ -15,36 +15,38 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CommandSpec {
     pub(crate) program: PathBuf,
     pub(crate) args: Vec<String>,
     pub(crate) cwd: PathBuf,
-    #[serde(default)]
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) timeout_seconds: Option<u64>,
     pub(crate) stdin: Option<String>,
     pub(crate) confined: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) context: Option<CommandContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CommandContext {
     pub(crate) path: PathBuf,
     pub(crate) value: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProcessResult {
     pub(crate) exit_code: Option<i32>,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
     pub(crate) timed_out: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) signal: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) start_error: Option<String>,
 }
 impl ProcessResult {
@@ -150,7 +152,7 @@ fn prepare_context(paths: &Paths, spec: &CommandSpec) -> Result<()> {
     let metadata = file.metadata()?;
     ensure!(
         metadata.is_file()
-            && metadata.uid() == crate::host_setup::uid()
+            && metadata.uid() == rustix::process::getuid().as_raw()
             && metadata.mode() & 0o777 == 0o600,
         "context must be a private user-owned regular file"
     );
@@ -169,9 +171,9 @@ pub(crate) fn run(paths: &Paths, spec: &CommandSpec) -> Result<ProcessResult> {
     let mut command = if spec.confined {
         ensure!(
             PathBuf::from("/usr/bin/sandbox-exec").is_file(),
-            "confined compiler execution requires macOS sandbox-exec"
+            "confined execution requires macOS sandbox-exec"
         );
-        let base = serde_json::to_string(&paths.workspace.display().to_string())?;
+        let base = serde_json::to_string(&paths.root.display().to_string())?;
         let profile = format!(
             "(version 1) (allow default) (deny file-write*) (allow file-write* (subpath {base}) (literal \"/dev/null\") (literal \"/dev/tty\"))"
         );
@@ -184,11 +186,6 @@ pub(crate) fn run(paths: &Paths, spec: &CommandSpec) -> Result<ProcessResult> {
     if spec.context.is_some() {
         command.env_clear();
     } else {
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("NEXTEST_") {
-                command.env_remove(name);
-            }
-        }
         command.envs(paths.environment());
     }
     command
@@ -284,6 +281,7 @@ pub(crate) fn run(paths: &Paths, spec: &CommandSpec) -> Result<ProcessResult> {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Completion {
     schema: u32,
     request: CommandSpec,
@@ -474,13 +472,13 @@ mod tests {
     }
 
     #[test]
-    fn optional_deadline_preserves_legacy_requests_and_bounded_commands() {
+    fn optional_deadline_runs_bounded_and_unbounded_commands() {
         let (_temporary, paths, mut request) = fixture();
-        let legacy = serde_json::to_value(&request).unwrap();
-        assert_eq!(legacy["timeout_seconds"], 5);
-        assert!(legacy.get("context").is_none());
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["timeout_seconds"], 5);
+        assert!(encoded.get("context").is_none());
         assert_eq!(
-            serde_json::from_value::<CommandSpec>(legacy)
+            serde_json::from_value::<CommandSpec>(encoded)
                 .unwrap()
                 .timeout_seconds,
             Some(5)
@@ -674,11 +672,5 @@ mod tests {
         assert_eq!(result.exit_code, None);
         assert_eq!(result.signal, Some(libc::SIGTERM));
         assert!(!result.success());
-        let legacy = serde_json::json!({
-            "exit_code":0, "stdout":"", "stderr":"", "timed_out":false
-        });
-        let result: ProcessResult = serde_json::from_value(legacy.clone()).unwrap();
-        assert!(result.success());
-        assert_eq!(serde_json::to_value(result).unwrap(), legacy);
     }
 }

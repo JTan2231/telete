@@ -81,7 +81,6 @@ impl WorkflowCommand {
                             | "XDG_CACHE_HOME"
                             | "CLANG_MODULE_CACHE_PATH"
                             | "SWIFT_MODULECACHE_PATH"
-                            | "CHANCERY_USAGE_INTERNAL"
                     ),
                 "{stage} cannot override reserved environment: {name}"
             );
@@ -153,8 +152,7 @@ impl Workflow {
     }
 }
 
-pub(crate) fn read(path: Option<&Path>) -> Result<Option<Workflow>> {
-    let Some(path) = path else { return Ok(None) };
+pub(crate) fn read(path: &Path) -> Result<Workflow> {
     ensure!(path.is_absolute(), "workflow file must be an absolute path");
     ensure!(
         std::fs::symlink_metadata(path)?.is_file(),
@@ -165,10 +163,11 @@ pub(crate) fn read(path: Option<&Path>) -> Result<Option<Workflow>> {
     )
     .with_context(|| format!("decode workflow {}", path.display()))?;
     workflow.validate()?;
-    Ok(Some(workflow))
+    Ok(workflow)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StageRun {
     pub stage: String,
     pub candidate: CommitId,
@@ -259,17 +258,16 @@ mod tests {
 
     #[test]
     fn workflow_file_is_validated_and_unknown_selections_are_rejected() -> Result<()> {
-        assert!(read(Some(Path::new("workflow.json"))).is_err());
-        assert!(read(None)?.is_none());
+        assert!(read(Path::new("workflow.json")).is_err());
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("workflow.json");
         std::fs::write(&path, r#"{"check":{"program":"check"},"unknown":true}"#)?;
-        assert!(read(Some(&path)).is_err());
+        assert!(read(&path).is_err());
         std::fs::write(
             &path,
             r#"{"check":{"program":"check","env":{"PROJECT_MODE":"ci"}}}"#,
         )?;
-        assert_eq!(read(Some(&path))?.unwrap().check.env["PROJECT_MODE"], "ci");
+        assert_eq!(read(&path)?.check.env["PROJECT_MODE"], "ci");
         Ok(())
     }
 }

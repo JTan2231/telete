@@ -13,98 +13,44 @@ use serde::Serialize;
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
     pub(crate) root: PathBuf,
-    pub(crate) workspace: PathBuf,
-    local: bool,
-}
-
-pub(crate) fn default_root() -> Result<PathBuf> {
-    Ok(crate::workspace::root()?.join("telete"))
 }
 
 impl Paths {
-    pub(crate) fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        let workspace = crate::workspace::root()?;
-        ensure!(
-            root.is_absolute() && root.starts_with(&workspace) && root != workspace,
-            "Telete state must be inside the selected external workspace"
-        );
-        ensure!(normalized_absolute(&root), "state path is not normalized");
-        let relative = root.strip_prefix(&workspace)?;
-        let first = relative
-            .components()
-            .next()
-            .context("empty state path")?
-            .as_os_str();
-        ensure!(
-            first
-                .to_str()
-                .is_some_and(|v| v == "telete" || v.starts_with("telete-")),
-            "state must use a separate telete directory"
-        );
-        let paths = Self {
-            root,
-            workspace,
-            local: false,
-        };
-        paths.initialize()?;
-        Ok(paths)
-    }
-
-    /// Select an explicit state path without using an incomplete journal to
-    /// infer a new layout. Default and native bootstrap paths use `new` directly.
-    pub(crate) fn selected(root: PathBuf, initialize_project: bool) -> Result<Self> {
-        if Self::select_local(&root, initialize_project)? {
-            Self::local(root)
+    pub(crate) fn selected(root: PathBuf, initialize: bool) -> Result<Self> {
+        if let Some(config) = crate::store::probe_config(&root)? {
+            ensure!(config.state_root == root, "queue state directory changed");
         } else {
-            Self::new(root)
-        }
-    }
-
-    fn select_local(root: &Path, initialize_project: bool) -> Result<bool> {
-        if let Some(config) = crate::store::probe_config(root)? {
-            config.local_workspace(root)
-        } else {
+            ensure!(initialize, "Telete is not initialized; run telete init");
             ensure!(
-                initialize_project,
-                "Telete is not initialized; run telete init"
-            );
-            ensure!(
-                !private_directory_exists(root)? || fs::read_dir(root)?.next().is_none(),
+                !private_directory_exists(&root)? || fs::read_dir(&root)?.next().is_none(),
                 "refusing to initialize nonempty state without a Telete journal"
             );
-            Ok(true)
         }
-    }
-
-    fn local(root: PathBuf) -> Result<Self> {
-        let paths = Self {
-            workspace: root.clone(),
-            root,
-            local: true,
-        };
+        let paths = Self { root };
         paths.initialize()?;
-        // Generic queues do not share Cell's Cargo download directory.
-        ensure_private(&paths.workspace.join("cargo"))?;
-        ensure_private(&paths.root.join("cache"))?;
         Ok(paths)
-    }
-
-    pub(crate) fn local_workspace(&self) -> Option<PathBuf> {
-        self.local.then(|| self.root.clone())
     }
 
     pub(crate) fn verify_config(&self, config: &crate::store::Config) -> Result<()> {
         ensure!(
-            config.local_workspace(&self.root)? == self.local,
-            "queue workspace selection changed"
+            config.state_root == self.root,
+            "queue state directory changed"
         );
         Ok(())
     }
 
     fn initialize(&self) -> Result<()> {
         ensure_private(&self.root)?;
-        for name in ["jobs", "tmp", "targets", "broker", "deployments", "logs"] {
+        for name in [
+            "jobs",
+            "tmp",
+            "targets",
+            "broker",
+            "deployments",
+            "logs",
+            "cargo",
+            "cache",
+        ] {
             ensure_private(&self.root.join(name))?;
         }
         Ok(())
@@ -112,11 +58,7 @@ impl Paths {
 
     #[cfg(test)]
     pub(crate) fn for_test(root: PathBuf) -> Result<Self> {
-        let paths = Self {
-            workspace: root.clone(),
-            root,
-            local: false,
-        };
+        let paths = Self { root };
         paths.initialize()?;
         Ok(paths)
     }
@@ -124,23 +66,19 @@ impl Paths {
     pub(crate) fn job(&self, id: &str) -> PathBuf {
         self.root.join("jobs").join(id)
     }
+
     pub(crate) fn targets(&self) -> PathBuf {
         self.root.join("targets")
     }
+
     pub(crate) fn require_capacity(&self) -> Result<()> {
-        #[cfg(not(test))]
-        if !self.local {
-            ensure!(
-                crate::workspace::root()? == self.workspace,
-                "external workspace selection changed"
-            );
-        }
         ensure!(
-            fs2::available_space(&self.workspace)? >= 2 * 1024 * 1024 * 1024,
-            "selected workspace has less than 2 GiB free"
+            fs2::available_space(&self.root)? >= 2 * 1024 * 1024 * 1024,
+            "selected state directory has less than 2 GiB free"
         );
         Ok(())
     }
+
     pub(crate) fn environment(&self) -> BTreeMap<String, String> {
         let temporary = self.root.join("tmp").display().to_string();
         let cache = self.root.join("cache").display().to_string();
@@ -156,7 +94,7 @@ impl Paths {
             ("TEMP".into(), temporary),
             (
                 "CARGO_HOME".into(),
-                self.workspace.join("cargo").display().to_string(),
+                self.root.join("cargo").display().to_string(),
             ),
             (
                 "CARGO_TARGET_DIR".into(),
@@ -165,7 +103,6 @@ impl Paths {
             ("XDG_CACHE_HOME".into(), cache.clone()),
             ("CLANG_MODULE_CACHE_PATH".into(), format!("{cache}/clang")),
             ("SWIFT_MODULECACHE_PATH".into(), format!("{cache}/swift")),
-            ("CHANCERY_USAGE_INTERNAL".into(), "1".into()),
         ])
     }
 }
@@ -205,7 +142,7 @@ pub(crate) fn private_directory_exists(path: &Path) -> Result<bool> {
     };
     ensure!(
         metadata.is_dir()
-            && metadata.uid() == crate::host_setup::uid()
+            && metadata.uid() == rustix::process::getuid().as_raw()
             && metadata.mode() & 0o777 == 0o700,
         "private directory must be user-owned mode 0700: {}",
         path.display()
@@ -261,7 +198,7 @@ pub(crate) fn lock(path: &Path, blocking: bool) -> Result<FileLock> {
         .open(path)?;
     ensure!(
         file.metadata()?.is_file()
-            && file.metadata()?.uid() == crate::host_setup::uid()
+            && file.metadata()?.uid() == rustix::process::getuid().as_raw()
             && file.metadata()?.mode() & 0o777 == 0o600,
         "lock must be a private user-owned regular file"
     );

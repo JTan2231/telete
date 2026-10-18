@@ -11,7 +11,6 @@ use crate::paths::Paths;
 use crate::process::{self, CommandSpec, ProcessResult};
 
 pub(crate) const ACCEPTED: &str = "refs/telete/accepted";
-pub(crate) const PROJECT_ACCEPTED: &str = "refs/telete/project-accepted";
 
 pub(crate) fn run(
     paths: &Paths,
@@ -112,9 +111,7 @@ pub(crate) fn private_ref(job: &str, name: &str) -> Result<String> {
 
 pub(crate) fn ref_value(paths: &Paths, repo: &Path, reference: &str) -> Result<Option<CommitId>> {
     ensure!(
-        reference == ACCEPTED
-            || reference == PROJECT_ACCEPTED
-            || reference.starts_with("refs/telete/jobs/"),
+        reference == ACCEPTED || reference.starts_with("refs/telete/jobs/"),
         "Telete cannot read another manager's refs"
     );
     let result = run(
@@ -140,9 +137,7 @@ pub(crate) fn advance(
     new: &CommitId,
 ) -> Result<()> {
     ensure!(
-        reference == ACCEPTED
-            || reference == PROJECT_ACCEPTED
-            || reference.starts_with("refs/telete/jobs/"),
+        reference == ACCEPTED || reference.starts_with("refs/telete/jobs/"),
         "Telete cannot mutate another manager's refs"
     );
     let observed = ref_value(paths, repo, reference)?;
@@ -167,6 +162,7 @@ pub(crate) fn advance(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn ancestor(
     paths: &Paths,
     repo: &Path,
@@ -282,7 +278,7 @@ pub(crate) fn commit_tree(
         env.insert(key.into(), "Telete".into());
     }
     for key in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
-        env.insert(key.into(), "telete@cell.local".into());
+        env.insert(key.into(), "telete@localhost".into());
     }
     for key in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
         env.insert(key.into(), format!("{stamp} +0000"));
@@ -300,61 +296,6 @@ pub(crate) fn commit_tree(
         result.stderr.trim()
     );
     CommitId::new(result.stdout.trim())
-}
-
-pub(crate) fn patch_tree(
-    paths: &Paths,
-    repo: &Path,
-    parent: &CommitId,
-    raw: &str,
-    index: &Path,
-) -> Result<String> {
-    ensure!(
-        index.is_absolute() && index.starts_with(&paths.root),
-        "private index is outside Telete state"
-    );
-    if let Ok(metadata) = fs::symlink_metadata(index) {
-        ensure!(!metadata.file_type().is_symlink(), "symbolic private index");
-        fs::remove_file(index)?;
-    }
-    let mut env = BTreeMap::new();
-    env.insert("GIT_INDEX_FILE".into(), index.display().to_string());
-    let result = (|| {
-        let initialized = run(
-            paths,
-            repo,
-            &strings(&["read-tree", &parent.0]),
-            None,
-            env.clone(),
-        )?;
-        ensure!(
-            initialized.success(),
-            "Git could not initialize private patch index"
-        );
-        let applied = run(
-            paths,
-            repo,
-            &strings(&["apply", "--cached", "--recount", "--whitespace=nowarn", "-"]),
-            Some(if raw.ends_with('\n') {
-                raw.to_owned()
-            } else {
-                format!("{raw}\n")
-            }),
-            env.clone(),
-        )?;
-        ensure!(
-            applied.success(),
-            "Git rejected patch: {}",
-            applied.stderr.trim()
-        );
-        let tree = run(paths, repo, &strings(&["write-tree"]), None, env)?;
-        ensure!(tree.success(), "Git could not write patched tree");
-        Ok(tree.stdout.trim().to_owned())
-    })();
-    if index.exists() {
-        fs::remove_file(index)?;
-    }
-    result
 }
 
 fn validate_registration(

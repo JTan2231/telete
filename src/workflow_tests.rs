@@ -44,7 +44,7 @@ printf x >> "$WORKFLOW_MARKER""#,
     )?;
     let source = workflow_record_commit(&paths, &repo, &[], "Ordinary project source")?;
     if accepted {
-        init_project(&paths, &repo, Some(&source.0))?;
+        init(&paths, &repo, Some(&source.0))?;
     } else {
         init(&paths, &repo, None)?;
     }
@@ -86,15 +86,14 @@ fn workflow_submit(
         &input.0,
         SubmitOptions {
             request_id: Some(request.into()),
-            workflow: Some(workflow),
-            ..SubmitOptions::default()
+            workflow,
         },
     )?;
     Store::open(&paths.root, false)?.job(output["id"].as_str().context("submitted job identity")?)
 }
 
-async fn workflow_tick(paths: &Paths, id: &str) -> Result<Job> {
-    worker_once(paths).await?;
+fn workflow_tick(paths: &Paths, id: &str) -> Result<Job> {
+    worker_once(paths)?;
     Store::open(&paths.root, false)?.job(id)
 }
 
@@ -111,16 +110,13 @@ fn workflow_stage_status(job: &Job, stage: &str) -> Result<String> {
         .to_owned())
 }
 
-#[tokio::test]
-async fn workflow_checks_exact_source_without_baseline_or_signer() -> Result<()> {
+#[test]
+fn workflow_checks_exact_source_without_baseline() -> Result<()> {
     let (_temporary, paths, repo, source) = workflow_fixture(false)?;
     assert!(!repo.join("Cargo.toml").exists());
     assert!(!repo.join("pipeline").exists());
-    assert!(!paths.root.join("signing.json").exists());
     assert!(configured(&paths)?.1.accepted_baseline.is_none());
-    assert!(configured(&paths)?.1.project);
     assert!(git::ref_value(&paths, &repo, git::ACCEPTED)?.is_none());
-    assert!(git::ref_value(&paths, &repo, git::PROJECT_ACCEPTED)?.is_none());
 
     // The caller's uncommitted files must not become the checked source.
     fs::write(repo.join("payload.txt"), "dirty caller payload\n")?;
@@ -133,9 +129,8 @@ async fn workflow_checks_exact_source_without_baseline_or_signer() -> Result<()>
         "exact-source",
         workflow_selection(&paths),
     )?;
-    assert!(queued.policy.signing_policy.is_none());
     resume(&paths)?;
-    let checking = workflow_tick(&paths, &queued.id.0).await?;
+    let checking = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(checking.phase, Phase::Checking);
     assert_eq!(checking.candidate.as_ref(), Some(&source));
     assert!(checking.base.is_none());
@@ -145,22 +140,20 @@ async fn workflow_checks_exact_source_without_baseline_or_signer() -> Result<()>
             .join("worktree/untracked.txt")
             .exists()
     );
-    let completed = workflow_tick(&paths, &queued.id.0).await?;
+    let completed = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(completed.phase, Phase::Succeeded);
-    assert_eq!(completed.workflow_runs.len(), 1);
-    let run = &completed.workflow_runs[0];
+    assert_eq!(completed.runs.len(), 1);
+    let run = &completed.runs[0];
     assert_eq!(run.candidate, source);
     assert_eq!(run.result.stdout, "committed\nliteral argument\n");
     assert!(run.result.success());
     assert_eq!(fs::read_to_string(paths.root.join("check-marker"))?, "x");
-    assert!(completed.validations.is_empty() && completed.preparation.is_none());
     assert!(!completed.accepted && !completed.unresolved);
     for stage in ["integrate", "prepare", "accept", "deploy"] {
         assert_eq!(workflow_stage_status(&completed, stage)?, "not_requested");
     }
     assert_eq!(workflow_stage_status(&completed, "check")?, "succeeded");
     assert!(git::ref_value(&paths, &repo, git::ACCEPTED)?.is_none());
-    assert!(git::ref_value(&paths, &repo, git::PROJECT_ACCEPTED)?.is_none());
     assert_eq!(
         fs::read_to_string(repo.join("payload.txt"))?,
         "dirty caller payload\n"
@@ -168,8 +161,8 @@ async fn workflow_checks_exact_source_without_baseline_or_signer() -> Result<()>
     Ok(())
 }
 
-#[tokio::test]
-async fn workflow_failed_exact_check_retains_failure_and_request_identity() -> Result<()> {
+#[test]
+fn workflow_failed_exact_check_retains_failure_and_request_identity() -> Result<()> {
     let (_temporary, paths, repo, base) = workflow_fixture(false)?;
     workflow_script(
         &repo.join("check.sh"),
@@ -193,85 +186,53 @@ async fn workflow_failed_exact_check_retains_failure_and_request_identity() -> R
     // A dirty passing replacement cannot turn the submitted failure into success.
     workflow_script(&repo.join("check.sh"), "exit 0")?;
     resume(&paths)?;
-    assert_eq!(
-        workflow_tick(&paths, &queued.id.0).await?.phase,
-        Phase::Checking
-    );
-    let completed = workflow_tick(&paths, &queued.id.0).await?;
+    assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, Phase::Checking);
+    let completed = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(completed.phase, Phase::Failed);
     assert_eq!(completed.outcome, Some(Phase::Failed));
     assert_eq!(completed.candidate.as_ref(), Some(&source));
-    assert_eq!(completed.workflow_runs[0].result.exit_code, Some(7));
-    assert_eq!(
-        completed.workflow_runs[0].result.stdout,
-        "submitted failure\n"
-    );
+    assert_eq!(completed.runs[0].result.exit_code, Some(7));
+    assert_eq!(completed.runs[0].result.stdout, "submitted failure\n");
     assert!(!completed.unresolved && completed.operation.is_none());
     assert_eq!(workflow_stage_status(&completed, "check")?, "failed");
     assert!(Store::open(&paths.root, false)?.paused()?);
     assert_eq!(fs::read_to_string(paths.root.join("check-marker"))?, "x");
     assert!(git::ref_value(&paths, &repo, git::ACCEPTED)?.is_none());
-    assert!(git::ref_value(&paths, &repo, git::PROJECT_ACCEPTED)?.is_none());
     Ok(())
 }
 
 #[test]
-fn workflow_submission_cannot_change_cell_queue_authority() -> Result<()> {
-    let (_temporary, paths, repo, base) = fixture()?;
-    assert!(!configured(&paths)?.1.project);
-    assert!(
-        workflow_submit(
-            &paths,
-            &repo,
-            &base,
-            "cell-workflow-rejected",
-            workflow_selection(&paths)
-        )
-        .is_err()
-    );
-    assert!(Store::open(&paths.root, false)?.jobs()?.is_empty());
-    assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-    assert!(git::ref_value(&paths, &repo, git::PROJECT_ACCEPTED)?.is_none());
-    Ok(())
-}
-
-#[tokio::test]
-async fn workflow_integration_checks_already_accepted_source_then_conditionally_accepts()
--> Result<()> {
+fn workflow_integration_checks_already_accepted_source_then_conditionally_accepts() -> Result<()> {
     let (_temporary, paths, repo, base) = workflow_fixture(true)?;
     let mut selected = workflow_selection(&paths);
     selected.integrate = true;
     selected.accept = true;
     let queued = workflow_submit(&paths, &repo, &base, "integrate-accepted", selected)?;
     resume(&paths)?;
-    let checking = workflow_tick(&paths, &queued.id.0).await?;
+    let checking = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(checking.phase, Phase::Checking);
     assert_eq!(checking.base.as_ref(), Some(&base));
     let candidate = checking.candidate.clone().context("integrated candidate")?;
     assert_ne!(candidate, base);
     assert!(git::ancestor(&paths, &repo, &base, &candidate)?);
-    let accepting = workflow_tick(&paths, &queued.id.0).await?;
+    let accepting = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(accepting.phase, Phase::Accepting);
-    assert_eq!(accepting.workflow_runs[0].candidate, candidate);
-    assert_eq!(
-        git::ref_value(&paths, &repo, git::PROJECT_ACCEPTED)?,
-        Some(base)
-    );
-    let completed = workflow_tick(&paths, &queued.id.0).await?;
+    assert_eq!(accepting.runs[0].candidate, candidate);
+    assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
+    let completed = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(completed.phase, Phase::Succeeded);
     assert!(completed.accepted);
     assert_eq!(
-        git::ref_value(&paths, &repo, git::PROJECT_ACCEPTED)?,
+        git::ref_value(&paths, &repo, git::ACCEPTED)?,
         Some(candidate)
     );
     assert_eq!(workflow_stage_status(&completed, "integrate")?, "succeeded");
     assert_eq!(workflow_stage_status(&completed, "accept")?, "succeeded");
-    assert!(git::ref_value(&paths, &repo, git::ACCEPTED)?.is_none());
     Ok(())
 }
 
-#[tokio::test]
-async fn workflow_acceptance_conflict_keeps_the_fixed_checked_candidate() -> Result<()> {
+#[test]
+fn workflow_acceptance_conflict_keeps_the_fixed_checked_candidate() -> Result<()> {
     let (_temporary, paths, repo, base) = workflow_fixture(true)?;
     fs::write(repo.join("payload.txt"), "submitted\n")?;
     let source = workflow_record_commit(
@@ -285,47 +246,37 @@ async fn workflow_acceptance_conflict_keeps_the_fixed_checked_candidate() -> Res
     selected.accept = true;
     let queued = workflow_submit(&paths, &repo, &source, "accept-race", selected)?;
     resume(&paths)?;
-    let checking = workflow_tick(&paths, &queued.id.0).await?;
+    let checking = workflow_tick(&paths, &queued.id.0)?;
     let candidate = checking.candidate.clone().context("integrated candidate")?;
     assert_ne!(candidate, source);
-    assert_eq!(
-        workflow_tick(&paths, &queued.id.0).await?.phase,
-        Phase::Accepting
-    );
+    assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, Phase::Accepting);
     let competing = workflow_record_commit(
         &paths,
         &repo,
         std::slice::from_ref(&base),
         "Competing acceptance",
     )?;
-    git::advance(
-        &paths,
-        &repo,
-        git::PROJECT_ACCEPTED,
-        Some(&base),
-        &competing,
-    )?;
-    let completed = workflow_tick(&paths, &queued.id.0).await?;
+    git::advance(&paths, &repo, git::ACCEPTED, Some(&base), &competing)?;
+    let completed = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(completed.phase, Phase::Failed);
     assert!(!completed.accepted && !completed.unresolved);
     assert_eq!(completed.base.as_ref(), Some(&base));
     assert_eq!(completed.candidate.as_ref(), Some(&candidate));
-    assert_eq!(completed.workflow_runs.len(), 1);
-    assert_eq!(completed.workflow_runs[0].candidate, candidate);
-    assert!(completed.workflow_runs[0].result.success());
+    assert_eq!(completed.runs.len(), 1);
+    assert_eq!(completed.runs[0].candidate, candidate);
+    assert!(completed.runs[0].result.success());
     assert_eq!(
-        git::ref_value(&paths, &repo, git::PROJECT_ACCEPTED)?,
+        git::ref_value(&paths, &repo, git::ACCEPTED)?,
         Some(competing)
     );
     assert_eq!(workflow_stage_status(&completed, "check")?, "succeeded");
     assert_eq!(workflow_stage_status(&completed, "accept")?, "failed");
-    assert!(git::ref_value(&paths, &repo, git::ACCEPTED)?.is_none());
     Ok(())
 }
 
-#[tokio::test]
+#[test]
 #[allow(clippy::too_many_lines)]
-async fn workflow_deploy_consumes_retained_preparation_outputs_outside_checkout() -> Result<()> {
+fn workflow_deploy_consumes_retained_preparation_outputs_outside_checkout() -> Result<()> {
     let (_temporary, paths, repo, source) = workflow_fixture(false)?;
     let prepare = paths.root.join("host-prepare.sh");
     let deploy = paths.root.join("host-deploy.sh");
@@ -361,17 +312,11 @@ printf 'deployed retained preparation\n'"#,
     });
     let queued = workflow_submit(&paths, &repo, &source, "prepare-and-deploy", selected)?;
     resume(&paths)?;
-    assert_eq!(
-        workflow_tick(&paths, &queued.id.0).await?.phase,
-        Phase::Checking
-    );
-    assert_eq!(
-        workflow_tick(&paths, &queued.id.0).await?.phase,
-        Phase::Preparing
-    );
-    let prepared = workflow_tick(&paths, &queued.id.0).await?;
+    assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, Phase::Checking);
+    assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, Phase::Preparing);
+    let prepared = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(prepared.phase, Phase::Deploying);
-    let prepare_run = &prepared.workflow_runs[1];
+    let prepare_run = &prepared.runs[1];
     assert_eq!(prepare_run.command.program, prepare);
     let prepared_output = PathBuf::from(
         prepare_run
@@ -389,10 +334,10 @@ printf 'deployed retained preparation\n'"#,
         fs::read_to_string(prepared_output.join("artifact.txt"))?,
         "prepared"
     );
-    let completed = workflow_tick(&paths, &queued.id.0).await?;
+    let completed = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(completed.phase, Phase::Succeeded);
-    assert_eq!(completed.workflow_runs.len(), 3);
-    let deploy_run = &completed.workflow_runs[2];
+    assert_eq!(completed.runs.len(), 3);
+    let deploy_run = &completed.runs[2];
     assert_eq!(deploy_run.command.program, deploy);
     assert_eq!(deploy_run.result.stdout, "deployed retained preparation\n");
     assert_eq!(
@@ -417,8 +362,8 @@ printf 'deployed retained preparation\n'"#,
     Ok(())
 }
 
-#[tokio::test]
-async fn workflow_cancel_after_preparation_never_admits_deployment() -> Result<()> {
+#[test]
+fn workflow_cancel_after_preparation_never_admits_deployment() -> Result<()> {
     let (_temporary, paths, repo, source) = workflow_fixture(false)?;
     let deploy = paths.root.join("cancelled-deploy.sh");
     let marker = paths.root.join("cancelled-deploy-marker");
@@ -438,25 +383,19 @@ async fn workflow_cancel_after_preparation_never_admits_deployment() -> Result<(
     });
     let queued = workflow_submit(&paths, &repo, &source, "cancel-before-deploy", selected)?;
     resume(&paths)?;
-    assert_eq!(
-        workflow_tick(&paths, &queued.id.0).await?.phase,
-        Phase::Checking
-    );
-    assert_eq!(
-        workflow_tick(&paths, &queued.id.0).await?.phase,
-        Phase::Preparing
-    );
-    let prepared = workflow_tick(&paths, &queued.id.0).await?;
+    assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, Phase::Checking);
+    assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, Phase::Preparing);
+    let prepared = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(prepared.phase, Phase::Deploying);
-    assert_eq!(prepared.workflow_runs.len(), 2);
-    assert!(prepared.workflow_runs[1].result.success());
+    assert_eq!(prepared.runs.len(), 2);
+    assert!(prepared.runs[1].result.success());
     assert!(prepared.operation.is_none());
     cancel(&paths, &queued.id.0)?;
-    let cancelled = workflow_tick(&paths, &queued.id.0).await?;
+    let cancelled = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(cancelled.phase, Phase::Cancelled);
     assert_eq!(cancelled.outcome, Some(Phase::Cancelled));
     assert!(cancelled.operation.is_none() && !cancelled.unresolved);
-    assert_eq!(cancelled.workflow_runs.len(), 2);
+    assert_eq!(cancelled.runs.len(), 2);
     assert!(!marker.exists());
     assert!(!crate::broker::recorded(
         &paths,
@@ -465,9 +404,9 @@ async fn workflow_cancel_after_preparation_never_admits_deployment() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[test]
 #[allow(clippy::too_many_lines)]
-async fn workflow_recovery_requires_exact_completion_and_never_repeats_check() -> Result<()> {
+fn workflow_recovery_requires_exact_completion_and_never_repeats_check() -> Result<()> {
     let (_temporary, paths, repo, source) = workflow_fixture(false)?;
     let mut selected = workflow_selection(&paths);
     // Leave another stage pending so the completed check's checkout remains.
@@ -479,14 +418,11 @@ async fn workflow_recovery_requires_exact_completion_and_never_repeats_check() -
     });
     let queued = workflow_submit(&paths, &repo, &source, "recover-exact-check", selected)?;
     resume(&paths)?;
-    assert_eq!(
-        workflow_tick(&paths, &queued.id.0).await?.phase,
-        Phase::Checking
-    );
-    let prepared = workflow_tick(&paths, &queued.id.0).await?;
+    assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, Phase::Checking);
+    let prepared = workflow_tick(&paths, &queued.id.0)?;
     assert_eq!(prepared.phase, Phase::Preparing);
     assert_eq!(fs::read_to_string(paths.root.join("check-marker"))?, "x");
-    let run = &prepared.workflow_runs[0];
+    let run = &prepared.runs[0];
     let receipt = paths
         .job(&queued.id.0)
         .join(format!("{}.json", run.operation));
@@ -515,11 +451,11 @@ async fn workflow_recovery_requires_exact_completion_and_never_repeats_check() -
         result: receipt.clone(),
         started: run.stamp,
     });
-    blocked.workflow_runs.clear();
+    blocked.runs.clear();
     store.save(&mut blocked)?;
     assert_eq!(workflow_stage_status(&blocked, "check")?, "unresolved");
     let before = fs::read(&broker_record)?;
-    assert!(recover(&paths, &queued.id.0).await.is_err());
+    assert!(recover(&paths, &queued.id.0).is_err());
     assert_eq!(fs::read(&broker_record)?, before);
     assert_eq!(store.job(&queued.id.0)?.phase, Phase::Blocked);
     assert!(!receipt.exists());
@@ -535,7 +471,7 @@ async fn workflow_recovery_requires_exact_completion_and_never_repeats_check() -
         .context("retained check intent")?
         .result = foreign_result.clone();
     store.save(&mut changed)?;
-    assert!(recover(&paths, &queued.id.0).await.is_err());
+    assert!(recover(&paths, &queued.id.0).is_err());
     assert!(!foreign_result.exists());
     assert!(!receipt.exists());
     let mut changed = store.job(&queued.id.0)?;
@@ -546,7 +482,7 @@ async fn workflow_recovery_requires_exact_completion_and_never_repeats_check() -
     operation.result = receipt.clone();
     operation.name = "workflow-check-999".into();
     store.save(&mut changed)?;
-    assert!(recover(&paths, &queued.id.0).await.is_err());
+    assert!(recover(&paths, &queued.id.0).is_err());
     assert!(!receipt.exists());
     let mut changed = store.job(&queued.id.0)?;
     changed
@@ -555,15 +491,186 @@ async fn workflow_recovery_requires_exact_completion_and_never_repeats_check() -
         .context("retained check intent")?
         .name = run.operation.clone();
     store.save(&mut changed)?;
-    let recovered = recover(&paths, &queued.id.0).await?;
+    let recovered = recover(&paths, &queued.id.0)?;
     assert_eq!(recovered["phase"], "preparing");
     let recovered = store.job(&queued.id.0)?;
     assert!(!recovered.unresolved && recovered.operation.is_none());
-    assert_eq!(recovered.workflow_runs.len(), 1);
-    assert!(recovered.workflow_runs[0].result.success());
-    assert_eq!(recovered.workflow_runs[0].candidate, source);
+    assert_eq!(recovered.runs.len(), 1);
+    assert!(recovered.runs[0].result.success());
+    assert_eq!(recovered.runs[0].candidate, source);
     assert!(receipt.exists());
     assert_eq!(fs::read_to_string(paths.root.join("check-marker"))?, "x");
     assert_eq!(workflow_stage_status(&recovered, "check")?, "succeeded");
+    Ok(())
+}
+
+#[test]
+fn workflow_acceptance_reconciles_existing_promotion_before_cancellation() -> Result<()> {
+    for (promoted, cancelled) in [(true, false), (true, true), (false, true)] {
+        let (_temporary, paths, repo, base) = workflow_fixture(true)?;
+        let mut selected = workflow_selection(&paths);
+        selected.integrate = true;
+        selected.accept = true;
+        let queued = workflow_submit(&paths, &repo, &base, "accept-interruption", selected)?;
+        resume(&paths)?;
+        workflow_tick(&paths, &queued.id.0)?;
+        let accepting = workflow_tick(&paths, &queued.id.0)?;
+        assert_eq!(accepting.phase, Phase::Accepting);
+        let candidate = accepting.candidate.context("checked candidate")?;
+        if promoted {
+            // Termination after Git promotion but before the journal update.
+            git::advance(&paths, &repo, git::ACCEPTED, Some(&base), &candidate)?;
+        }
+        if cancelled {
+            cancel(&paths, &queued.id.0)?;
+        }
+        let completed = workflow_tick(&paths, &queued.id.0)?;
+        assert_eq!(
+            completed.phase,
+            if cancelled {
+                Phase::Cancelled
+            } else {
+                Phase::Succeeded
+            }
+        );
+        assert_eq!(completed.accepted, promoted);
+        assert!(!completed.unresolved);
+        assert_eq!(completed.runs.len(), 1);
+        assert_eq!(completed.runs[0].candidate, candidate);
+        assert_eq!(
+            git::ref_value(&paths, &repo, git::ACCEPTED)?,
+            Some(if promoted { candidate } else { base })
+        );
+        assert_eq!(fs::read_to_string(paths.root.join("check-marker"))?, "x");
+    }
+    Ok(())
+}
+
+#[test]
+fn workflow_cancel_cannot_clear_an_unresolved_command_or_repeat_it() -> Result<()> {
+    let (_temporary, paths, repo, source) = workflow_fixture(false)?;
+    let queued = workflow_submit(
+        &paths,
+        &repo,
+        &source,
+        "unknown-completion",
+        workflow_selection(&paths),
+    )?;
+    resume(&paths)?;
+    let mut checking = workflow_tick(&paths, &queued.id.0)?;
+    let store = Store::open(&paths.root, false)?;
+    checking.operation = Some(Operation {
+        phase: Phase::Checking,
+        name: "workflow-check-0".into(),
+        candidate: source,
+        result: paths.job(&queued.id.0).join("workflow-check-0.json"),
+        started: store::now(),
+    });
+    store.save(&mut checking)?;
+    let blocked = workflow_tick(&paths, &queued.id.0)?;
+    assert_eq!(blocked.phase, Phase::Blocked);
+    assert!(blocked.unresolved && blocked.operation.is_some());
+    cancel(&paths, &queued.id.0)?;
+    assert!(recover(&paths, &queued.id.0).is_err());
+    assert!(resume(&paths).is_err());
+    let retained = workflow_tick(&paths, &queued.id.0)?;
+    assert_eq!(retained.phase, Phase::Blocked);
+    assert!(retained.cancel_requested && retained.unresolved);
+    assert!(retained.operation.is_some() && retained.runs.is_empty());
+    assert!(!paths.root.join("check-marker").exists());
+    Ok(())
+}
+
+#[test]
+fn workflow_failed_deployment_keeps_accepted_source() -> Result<()> {
+    let (_temporary, paths, repo, base) = workflow_fixture(true)?;
+    let mut selected = workflow_selection(&paths);
+    selected.integrate = true;
+    selected.accept = true;
+    selected.prepare = Some(crate::workflow::WorkflowCommand {
+        program: "/usr/bin/true".into(),
+        args: Vec::new(),
+        timeout_seconds: Some(10),
+        env: BTreeMap::new(),
+    });
+    selected.deploy = Some(crate::workflow::WorkflowCommand {
+        program: "/usr/bin/false".into(),
+        args: Vec::new(),
+        timeout_seconds: Some(10),
+        env: BTreeMap::new(),
+    });
+    let queued = workflow_submit(&paths, &repo, &base, "failed-deployment", selected)?;
+    resume(&paths)?;
+    for expected in [
+        Phase::Checking,
+        Phase::Preparing,
+        Phase::Accepting,
+        Phase::Deploying,
+    ] {
+        assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, expected);
+    }
+    let completed = workflow_tick(&paths, &queued.id.0)?;
+    assert_eq!(completed.phase, Phase::Failed);
+    assert!(completed.accepted && !completed.unresolved && completed.operation.is_none());
+    assert_eq!(completed.runs.len(), 3);
+    assert_eq!(completed.runs[2].result.exit_code, Some(1));
+    assert_eq!(
+        git::ref_value(&paths, &repo, git::ACCEPTED)?,
+        completed.candidate
+    );
+    assert_eq!(workflow_stage_status(&completed, "accept")?, "succeeded");
+    assert_eq!(workflow_stage_status(&completed, "deploy")?, "failed");
+    Ok(())
+}
+
+#[test]
+fn workflow_changed_acceptance_fails_before_deployment_admission() -> Result<()> {
+    let (_temporary, paths, repo, base) = workflow_fixture(true)?;
+    let marker = paths.root.join("unexpected-deployment");
+    let program = paths.root.join("deployment.sh");
+    workflow_script(&program, "printf x >> \"$1\"")?;
+    let mut selected = workflow_selection(&paths);
+    selected.integrate = true;
+    selected.accept = true;
+    selected.prepare = Some(crate::workflow::WorkflowCommand {
+        program: "/usr/bin/true".into(),
+        args: Vec::new(),
+        timeout_seconds: Some(10),
+        env: BTreeMap::new(),
+    });
+    selected.deploy = Some(crate::workflow::WorkflowCommand {
+        program,
+        args: vec![marker.display().to_string()],
+        timeout_seconds: Some(10),
+        env: BTreeMap::new(),
+    });
+    let queued = workflow_submit(&paths, &repo, &base, "deploy-ref-race", selected)?;
+    resume(&paths)?;
+    for expected in [
+        Phase::Checking,
+        Phase::Preparing,
+        Phase::Accepting,
+        Phase::Deploying,
+    ] {
+        assert_eq!(workflow_tick(&paths, &queued.id.0)?.phase, expected);
+    }
+    let candidate = Store::open(&paths.root, false)?
+        .job(&queued.id.0)?
+        .candidate;
+    let competing = workflow_record_commit(&paths, &repo, &[base], "Competing accepted source")?;
+    git::advance(&paths, &repo, git::ACCEPTED, candidate.as_ref(), &competing)?;
+    let completed = workflow_tick(&paths, &queued.id.0)?;
+    assert_eq!(completed.phase, Phase::Failed);
+    assert!(completed.accepted && !completed.unresolved && completed.operation.is_none());
+    assert_eq!(completed.runs.len(), 2);
+    assert_eq!(
+        git::ref_value(&paths, &repo, git::ACCEPTED)?,
+        Some(competing)
+    );
+    assert!(!marker.exists());
+    assert!(!crate::broker::recorded(
+        &paths,
+        &format!("{}-workflow-deploy-2", queued.id)
+    )?);
     Ok(())
 }

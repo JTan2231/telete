@@ -1,3 +1,0 @@
-Propose a patch for this exact Telete repair context:
-
-{context}

@@ -1,22 +1,17 @@
 # Source layout
 
-The root package is copied from Cell's `infrastructure/telete` at source commit
-`79b406279df18e56210026c2e1f3fa1121c916d9`. It retains the native Cell workflow
-and adds local project queue storage.
+Telete is one standalone Rust package. `Cargo.toml` declares its dependencies and
+`Cargo.lock` pins their versions. Build the command with
+`cargo build --locked --bin telete`.
 
-`support/cell` contains the five local Rust dependencies needed to build the
-copied package: Cell Install, Chancery, Chancery Usage, Iatreion API, and Usher.
-Their existing package versions and provider interfaces are retained. Build
-paths do not refer to a sibling Cell checkout. Embedded scripts and fixtures
-retain the relative layout required by those packages.
+`src/main.rs` defines the CLI. The manager and workflow runner coordinate the
+queue lifecycle; the store retains its journal; Git helpers own private candidate
+operations. Invocation, process, and broker modules freeze commands, supervise
+execution, and retain correlated results. Path helpers enforce private local
+storage. The workflow module validates the caller's JSON configuration.
 
-`prompts/repair-instructions.txt` and `prompts/repair-prompt.txt` retain Telete's
-authored repair text as ordinary inactive files. No runtime reader, prompt store,
-selection manifest, import procedure, or model execution uses these files.
+`ci.sh` selects this repository's `.telete/` state and `ci/workflow.json` workflow.
+`ci/check.sh` runs formatting, Clippy, tests, and a CLI build. The tests under
+`src/` check queue and execution behavior.
 
-`product.sh` describes Telete's native Cell inventory entry. It does not register
-this standalone repository with Cell. The repository's own check is
-`ci/workflow.json`, selected by `ci.sh`.
-
-The Cell program installer and its service remain explicit native Cell
-operations. Build and invoke the CLI directly for an ordinary project queue.
+Read [Operate Telete](queue-operate.md) for the command and execution contract.

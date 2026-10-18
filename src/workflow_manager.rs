@@ -1,15 +1,15 @@
-//! Project workflow stages reuse retained commands and the existing gate broker.
+//! Frozen workflow stages and correlated command completion.
 
 use super::{
     BTreeMap, Context, Job, Phase, Result, StageRun, Worker, bail, ensure, fs, git, json, store,
 };
-use crate::broker::{self, ResourceClass};
+use crate::broker;
 use crate::invocation;
 use crate::process::CommandSpec;
 
 impl Worker<'_> {
     fn workflow_command(&self, job: &Job, stage: &str, operation: &str) -> Result<CommandSpec> {
-        let workflow = job.options.workflow.as_ref().context("workflow absent")?;
+        let workflow = &job.workflow;
         let selected = match stage {
             "check" => &workflow.check,
             "prepare" => workflow
@@ -23,7 +23,7 @@ impl Worker<'_> {
             _ => bail!("unknown workflow stage"),
         };
         let preparation = job
-            .workflow_runs
+            .runs
             .iter()
             .rev()
             .find(|run| {
@@ -65,7 +65,7 @@ impl Worker<'_> {
 
     fn require_workflow_success(job: &Job, stage: &str) -> Result<()> {
         ensure!(
-            job.workflow_runs
+            job.runs
                 .iter()
                 .rev()
                 .find(|run| {
@@ -89,7 +89,7 @@ impl Worker<'_> {
             Phase::Deploying => "deploy",
             _ => bail!("workflow operation has another phase"),
         };
-        let expected = format!("workflow-{stage}-{}", job.workflow_runs.len());
+        let expected = format!("workflow-{stage}-{}", job.runs.len());
         ensure!(
             operation.name == expected
                 && operation.result == self.paths.job(&job.id.0).join(format!("{expected}.json"))
@@ -107,12 +107,11 @@ impl Worker<'_> {
         )?)?;
         ensure!(
             serde_json::to_value(&saved)? == serde_json::to_value(&command)?,
-            "workflow invocation differs from frozen policy"
+            "workflow invocation differs from frozen workflow"
         );
         let result = broker::completed(
             self.paths,
             &Self::workflow_key(job, &operation.name),
-            ResourceClass::Heavy,
             &saved,
         )?;
         let run = StageRun {
@@ -141,20 +140,11 @@ impl Worker<'_> {
         }
         if stage == "deploy" {
             Self::require_workflow_success(job, "prepare")?;
-            if job
-                .options
-                .workflow
-                .as_ref()
-                .is_some_and(|workflow| workflow.accept)
-            {
+            if job.workflow.accept {
                 ensure!(
                     job.accepted
-                        && git::ref_value(
-                            self.paths,
-                            &self.config.repository,
-                            self.config.accepted_ref()
-                        )?
-                        .as_ref()
+                        && git::ref_value(self.paths, &self.config.repository, git::ACCEPTED)?
+                            .as_ref()
                             == job.candidate.as_ref(),
                     "accepted source changed before deployment"
                 );
@@ -174,7 +164,7 @@ impl Worker<'_> {
                 false,
             );
         }
-        let operation = format!("workflow-{stage}-{}", job.workflow_runs.len());
+        let operation = format!("workflow-{stage}-{}", job.runs.len());
         let receipt = self.directory(job)?.join(format!("{operation}.json"));
         let command = self.workflow_command(job, stage, &operation)?;
         let directory = invocation::directory(self.paths, job, &operation)?;
@@ -191,16 +181,7 @@ impl Worker<'_> {
                 "admitted workflow invocation is missing"
             );
             git::clean_candidate(self.paths, &self.worktree(job), &candidate)?;
-            if stage == "check"
-                && !job
-                    .options
-                    .workflow
-                    .as_ref()
-                    .context("workflow absent")?
-                    .check
-                    .program
-                    .is_absolute()
-            {
+            if stage == "check" && !job.workflow.check.program.is_absolute() {
                 let program = command
                     .program
                     .canonicalize()
@@ -222,19 +203,14 @@ impl Worker<'_> {
             None
         };
         if self.begin_operation(job, operation.clone(), receipt.clone())? {
-            broker::run(
-                self.paths,
-                &Self::workflow_key(job, &operation),
-                ResourceClass::Heavy,
-                &command,
-            )?;
+            broker::run(self.paths, &Self::workflow_key(job, &operation), &command)?;
         }
         self.reconcile_workflow(job)?;
         let run: StageRun = serde_json::from_slice(&fs::read(receipt)?)?;
         let success = run.result.success();
         let diagnostic = self.directory(job)?.join(format!("{operation}.log"));
         store::atomic_bytes(&diagnostic, run.result.diagnostics().as_bytes())?;
-        job.workflow_runs.push(run);
+        job.runs.push(run);
         job.operation = None;
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
         if job.cancel_requested {
@@ -260,7 +236,7 @@ impl Worker<'_> {
     }
 
     fn workflow_next(&self, job: &mut Job, completed: &str) -> Result<()> {
-        let workflow = job.options.workflow.as_ref().context("workflow absent")?;
+        let workflow = &job.workflow;
         if completed == "check" && workflow.prepare.is_some() {
             return self.save(job, Phase::Preparing);
         }
@@ -282,7 +258,7 @@ impl Worker<'_> {
     }
 
     pub(super) fn workflow_accept(&self, job: &mut Job) -> Result<()> {
-        let workflow = job.options.workflow.as_ref().context("workflow absent")?;
+        let workflow = &job.workflow;
         ensure!(
             workflow.accept && workflow.integrate,
             "workflow did not select conditional acceptance"
@@ -296,7 +272,7 @@ impl Worker<'_> {
         git::advance(
             self.paths,
             &self.config.repository,
-            self.config.accepted_ref(),
+            git::ACCEPTED,
             Some(Self::base(job)?),
             &candidate,
         )?;

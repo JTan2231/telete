@@ -45,32 +45,7 @@ macro_rules! identity {
 identity!(CommitId, |v: &str| matches!(v.len(), 40 | 64)
     && v.bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-identity!(ProductId, |v: &str| slug(v)
-    && v.len() <= 64
-    && v.as_bytes()[0].is_ascii_lowercase()
-    && v.bytes().all(|b| b.is_ascii_lowercase()
-        || b.is_ascii_digit()
-        || b == b'-'));
-identity!(ProviderId, |v: &str| slug(v)
-    && v.len() <= 64
-    && v.as_bytes()[0].is_ascii_lowercase()
-    && v.bytes().all(|b| b.is_ascii_lowercase()
-        || b.is_ascii_digit()
-        || b == b'-'));
-identity!(PackageId, slug);
 identity!(JobId, slug);
-identity!(RequestId, |v: &str| !v.is_empty()
-    && v.len() <= 256
-    && v.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b)));
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ResourceClass {
-    Heavy,
-    Light,
-    Supervisor,
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -81,9 +56,8 @@ mod tests {
     fn retained_identities_reject_path_traversal() {
         assert!(serde_json::from_str::<JobId>("\"../foreign\"").is_err());
         assert!(CommitId::new("main").is_err());
-        assert!(ProductId::new("").is_err());
+        assert!(JobId::new("").is_err());
         assert!(CommitId::new("a".repeat(40)).is_ok());
         assert!(CommitId::new("A".repeat(40)).is_err());
-        assert!(ProviderId::new("wrongCase").is_err());
     }
 }

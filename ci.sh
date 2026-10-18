@@ -14,7 +14,7 @@ command=$1
 shift
 case "$command" in
     init)
-        exec "$binary" --state "$repo/.telete" init --project --repo "$repo" "$@"
+        exec "$binary" --state "$repo/.telete" init --repo "$repo" "$@"
         ;;
     submit)
         exec "$binary" --state "$repo/.telete" submit "$@" --repo "$repo" \

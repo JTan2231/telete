@@ -1,72 +1,27 @@
-//! Serial CI orchestration, with intent retained before effects.
+//! Serial workflow orchestration, with intent retained before effects.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::cell_pipeline::{self, PreparationOutcome};
-use crate::deployment::{self, DeploymentResult, DeploymentState, InstructionState, Preparation};
 use crate::git;
-use crate::inventory::Inventory;
-use crate::invocation::CommandPolicy;
+use crate::invocation;
 use crate::model::{CommitId, JobId};
 use crate::paths::Paths;
-use crate::signing::{self, SigningPolicy};
-use crate::store::{self, Cleanup, Config, DeploymentRequest, Job, Operation, Phase, Store, Validation};
-use crate::validation::{self, ValidationReport, ValidationState};
+use crate::store::{self, Cleanup, Config, Job, Operation, Phase, Store};
 use crate::workflow::{StageRun, Workflow};
 
 #[path = "workflow_manager.rs"]
 mod workflow_manager;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-// These independent caller choices are frozen together at admission.
+#[derive(Clone, Debug)]
 pub(crate) struct SubmitOptions {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<Workflow>,
     pub request_id: Option<String>,
-    pub run_tests: bool,
-    pub deploy: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub settings: BTreeMap<String, Value>,
-    pub no_deploy: bool,
-}
-
-impl Default for SubmitOptions {
-    fn default() -> Self {
-        Self {
-            workflow: None,
-            request_id: None,
-            run_tests: false,
-            deploy: Vec::new(),
-            settings: BTreeMap::new(),
-            no_deploy: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Policy {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commands: Option<CommandPolicy>,
-    #[allow(clippy::struct_field_names)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signing_policy: Option<SigningPolicy>,
-}
-
-impl Policy {
-    pub(crate) fn signing(&self) -> Result<&SigningPolicy> {
-        self.signing_policy
-            .as_ref()
-            .context("Cell job has no frozen signing policy")
-    }
+    pub workflow: Workflow,
 }
 
 fn check_identity(value: &str, label: &str) -> Result<()> {
@@ -88,42 +43,7 @@ fn configured(paths: &Paths) -> Result<(Store, Config)> {
     Ok((store, config))
 }
 
-fn freeze_policy(paths: &Paths, options: &SubmitOptions) -> Result<Policy> {
-    let signing_policy = if options.workflow.is_none() {
-        let selected = signing::selected(paths)?;
-        signing::preflight(&selected)?;
-        Some(selected)
-    } else {
-        None
-    };
-    Ok(Policy {
-        commands: Some(CommandPolicy::capture(paths)?),
-        signing_policy,
-    })
-}
-
 pub(crate) fn init(paths: &Paths, repo: &Path, accepted_baseline: Option<&str>) -> Result<Value> {
-    initialize(paths, repo, accepted_baseline, accepted_baseline.is_none())
-}
-
-pub(crate) fn init_project(
-    paths: &Paths,
-    repo: &Path,
-    accepted_baseline: Option<&str>,
-) -> Result<Value> {
-    initialize(paths, repo, accepted_baseline, true)
-}
-
-fn initialize(
-    paths: &Paths,
-    repo: &Path,
-    accepted_baseline: Option<&str>,
-    project: bool,
-) -> Result<Value> {
-    ensure!(
-        project || paths.local_workspace().is_none(),
-        "Cell queues cannot select a local workspace"
-    );
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
     let store = Store::open(&paths.root, true)?;
     let repository = git::repository(paths, repo)?;
@@ -131,8 +51,7 @@ fn initialize(
         .map(|value| git::commit(paths, &repository, value))
         .transpose()?;
     let config = Config {
-        project,
-        workspace: paths.local_workspace(),
+        state_root: paths.root.clone(),
         common_git_dir: git::common(paths, &repository)?,
         repository,
         accepted_baseline: baseline.clone(),
@@ -140,11 +59,11 @@ fn initialize(
     if let Some(previous) = store.get::<Config>("config")? {
         ensure!(
             previous == config,
-            "initialization cannot replace Telete's repository, baseline, or workspace"
+            "initialization cannot replace Telete's repository, baseline, or state directory"
         );
         if let Some(baseline) = &baseline {
             ensure!(
-                git::ref_value(paths, &config.repository, config.accepted_ref())?.as_ref()
+                git::ref_value(paths, &config.repository, git::ACCEPTED)?.as_ref()
                     == Some(baseline),
                 "accepted history already advanced; initialization cannot rewind it"
             );
@@ -154,13 +73,7 @@ fn initialize(
         );
     }
     if let Some(baseline) = &baseline {
-        git::advance(
-            paths,
-            &config.repository,
-            config.accepted_ref(),
-            None,
-            baseline,
-        )?;
+        git::advance(paths, &config.repository, git::ACCEPTED, None, baseline)?;
     }
     store.transaction(|| {
         store.set("config", &config)?;
@@ -173,7 +86,7 @@ pub(crate) fn submit(
     paths: &Paths,
     repo: &Path,
     revision: &str,
-    mut options: SubmitOptions,
+    options: SubmitOptions,
 ) -> Result<Value> {
     let (store, config) = configured(paths)?;
     ensure!(
@@ -181,80 +94,27 @@ pub(crate) fn submit(
         "submit from a worktree of Telete's configured repository"
     );
     let input = git::commit(paths, repo, revision)?;
-    if let Some(workflow) = &options.workflow {
-        ensure!(
-            config.project,
-            "project workflows require a separate project queue; Cell queues retain Cell validation and signing"
-        );
-        workflow.validate()?;
-        ensure!(
-            !options.run_tests
-                && options.deploy.is_empty()
-                && options.settings.is_empty()
-                && !options.no_deploy,
-            "workflow jobs select their stages instead of Cell options"
-        );
-        if workflow.integrate {
-            ensure!(
-                config.accepted_baseline.is_some(),
-                "integration requires an initialized accepted baseline"
-            );
-        }
-    } else {
-        ensure!(!config.project, "project queues require --workflow");
-        ensure!(
-            config.accepted_baseline.is_some(),
-            "Cell delivery requires an initialized accepted baseline"
-        );
-    }
-    options.deploy.sort();
-    options.deploy.dedup();
-    for product in &options.deploy {
-        crate::model::ProductId::new(product)?;
-    }
-    for (product, settings) in &options.settings {
-        crate::model::ProductId::new(product)?;
-        ensure!(
-            product != "decisions",
-            "use canonical krisis settings for decisions"
-        );
-        ensure!(
-            settings.is_object(),
-            "product settings must be JSON objects"
-        );
-        ensure!(
-            options.deploy.iter().any(|selected| {
-                selected == product || (selected == "decisions" && product == "krisis")
-            }),
-            "settings require an explicit --deploy selection for {product}"
-        );
-    }
+    options.workflow.validate()?;
     ensure!(
-        !options.deploy.iter().any(|product| product == "telete"),
-        "Telete installation is separate; use telete install explicitly"
-    );
-    ensure!(
-        !options.no_deploy || options.deploy.is_empty(),
-        "--no-deploy conflicts with explicit deployment products"
+        !options.workflow.integrate || config.accepted_baseline.is_some(),
+        "integration requires an initialized accepted baseline"
     );
     let request_id = options
         .request_id
-        .clone()
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     check_identity(&request_id, "submission request identity")?;
-    options.request_id = Some(request_id.clone());
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
     if let Some(previous) = store.by_request(&request_id)? {
         ensure!(
-            previous.input == input && previous.options == options,
+            previous.input == input && previous.workflow == options.workflow,
             "submission request identity belongs to different inputs"
         );
         return previous.output();
     }
     paths.require_capacity()?;
-    let policy = freeze_policy(paths, &options)?;
+    let environment = invocation::capture_environment(paths)?;
     let id = JobId::new(uuid::Uuid::now_v7().to_string())?;
-    let job = new_job(id, request_id, input, options, policy);
+    let job = new_job(id, request_id, input, options.workflow, environment);
     git::advance(
         paths,
         repo,
@@ -266,25 +126,12 @@ pub(crate) fn submit(
     admitted.output()
 }
 
-pub(crate) fn read_settings(path: Option<&Path>) -> Result<BTreeMap<String, Value>> {
-    let Some(path) = path else {
-        return Ok(BTreeMap::new());
-    };
-    ensure!(path.is_absolute(), "settings path must be absolute");
-    ensure!(
-        fs::symlink_metadata(path)?.is_file(),
-        "settings must be a regular JSON file"
-    );
-    serde_json::from_slice(&fs::read(path)?)
-        .context("settings must map product IDs to JSON objects")
-}
-
 fn new_job(
     id: JobId,
     request_id: String,
     input: CommitId,
-    options: SubmitOptions,
-    policy: Policy,
+    workflow: Workflow,
+    environment: BTreeMap<String, String>,
 ) -> Job {
     Job {
         id,
@@ -296,23 +143,17 @@ fn new_job(
         created: store::now(),
         updated: store::now(),
         input,
-        options,
-        policy,
+        workflow,
+        environment,
         base: None,
         candidate: None,
         accepted: false,
-        workflow_runs: Vec::new(),
-        validations: Vec::new(),
-        preparation: None,
-        preparation_generation: 0,
-        deployment_request: None,
-        deployment_result: None,
+        runs: Vec::new(),
         operation: None,
         outcome: None,
         outcome_message: None,
         stopped_phase: None,
         unresolved: false,
-        waiting_reason: None,
         last_error: None,
         cleanup: Cleanup::default(),
     }
@@ -331,8 +172,8 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
         .map(|job| job.output())
         .collect::<Result<Vec<_>>>()?;
     Ok(
-        json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"paused":store.paused()?,
-        "config":config,"accepted":git::ref_value(paths,&config.repository,config.accepted_ref())?,"active":active,"queue":queue,"maintenance_owners":store.holds()?}),
+        json!({"schema_version":2,"version":env!("CARGO_PKG_VERSION"),"paused":store.paused()?,
+        "config":config,"accepted":git::ref_value(paths,&config.repository,git::ACCEPTED)?,"active":active,"queue":queue,"maintenance_owners":store.holds()?}),
     )
 }
 
@@ -374,20 +215,7 @@ pub(crate) fn resume(paths: &Paths) -> Result<Value> {
 
 pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
-    let (store, config) = configured(paths)?;
-    let mut job = store.job(id)?;
-    if job.phase == Phase::Blocked
-        && job.stopped_phase == Some(Phase::Checking)
-        && job.options.workflow.is_none()
-        && let (Some(operation), Some(base), Some(candidate)) =
-            (&job.operation, &job.base, &job.candidate)
-        && !operation.result.try_exists()?
-        && !validation::receipt_path(paths, base, candidate, job.options.run_tests, true)
-            .try_exists()?
-    {
-        abandon_settled_validation(paths, &store, &config, &mut job)?;
-        return store.job(id)?.output();
-    }
+    let (store, _) = configured(paths)?;
     store.transaction(|| {
         let mut job = store.job(id)?;
         store.cancel(id)?;
@@ -401,125 +229,6 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
         Ok(())
     })?;
     store.job(id)?.output()
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ValidationAbandonment {
-    schema: u32,
-    job: JobId,
-    base: CommitId,
-    operation: Operation,
-    abandoned: u64,
-}
-
-// Cancellation observes terminal children and retains intent; it never runs validation.
-#[allow(clippy::too_many_lines)]
-fn abandon_settled_validation(
-    paths: &Paths,
-    store: &Store,
-    config: &Config,
-    job: &mut Job,
-) -> Result<()> {
-    ensure!(
-        store.paused()?
-            && !config.project
-            && job.options.workflow.is_none()
-            && job.phase == Phase::Blocked
-            && job.stopped_phase == Some(Phase::Checking)
-            && job.outcome == Some(Phase::Failed)
-            && job.unresolved
-            && !job.accepted
-            && job.preparation.is_none()
-            && job.preparation_generation == 0
-            && job.deployment_request.is_none()
-            && job.deployment_result.is_none()
-            && store.jobs()?.iter().all(|other| {
-                other.id == job.id || (other.phase.terminal() && !other.unresolved)
-            }),
-        "validation abandonment requires one paused unaccepted blocked validation with settled execution"
-    );
-    let operation = job
-        .operation
-        .as_ref()
-        .context("blocked validation has no retained operation")?;
-    let base = job.base.as_ref().context("fixed base absent")?;
-    let candidate = job.candidate.as_ref().context("candidate absent")?;
-    let directory = paths.job(&job.id.0);
-    let name = format!("validation-{}", job.validations.len());
-    ensure!(
-        operation.phase == Phase::Checking
-            && operation.name == name
-            && operation.candidate == *candidate
-            && operation.result == directory.join(format!("{name}.json"))
-            && !operation.result.try_exists()?
-            && !validation::receipt_path(paths, base, candidate, job.options.run_tests, true)
-                .try_exists()?,
-        "validation has a different intent or a terminal report; use its recovery path"
-    );
-    let _resources = crate::broker::settled_guards(paths)?;
-    let _deployment = crate::paths::lock(&paths.root.join("deployments/deployment.lock"), false)?;
-    ensure!(
-        !paths.root.join("deployments/active.json").try_exists()?
-            && git::ref_value(paths, &config.repository, git::ACCEPTED)?.as_ref() == Some(base)
-            && git::ref_value(
-                paths,
-                &config.repository,
-                &git::private_ref(&job.id.0, "candidate")?,
-            )?
-            .as_ref()
-                == Some(candidate),
-        "accepted source, private candidate or deployment ownership changed"
-    );
-    let worktree = directory.join("worktree");
-    ensure!(
-        git::common(paths, &worktree)? == config.common_git_dir,
-        "validation worktree belongs to another repository"
-    );
-    git::clean_candidate(paths, &worktree, candidate)?;
-    if validation::require_timed_out_dispatcher(
-        paths,
-        &worktree,
-        base,
-        candidate,
-        job.options.run_tests,
-        true,
-    )
-    .is_err()
-    {
-        validation::require_failed_bootstrap(paths, &worktree, job)
-            .context("validation abandonment requires an exact timed-out dispatcher or failed bootstrap without dispatcher admission")?;
-    }
-    let record = directory.join(format!("{name}.abandoned.json"));
-    if record.try_exists()? {
-        let previous: ValidationAbandonment = serde_json::from_slice(&fs::read(&record)?)?;
-        ensure!(
-            previous.schema == 1
-                && previous.job == job.id
-                && previous.base == *base
-                && serde_json::to_value(previous.operation)? == serde_json::to_value(operation)?,
-            "retained validation abandonment names another operation"
-        );
-    } else {
-        store::atomic_json(
-            &record,
-            &ValidationAbandonment {
-                schema: 1,
-                job: job.id.clone(),
-                base: base.clone(),
-                operation: operation.clone(),
-                abandoned: store::now(),
-            },
-        )?;
-    }
-    store.transaction(|| {
-        store.cancel(&job.id.0)?;
-        job.cancel_requested = true;
-        job.operation = None;
-        job.unresolved = false;
-        job.phase = Phase::Cancelled;
-        store.save(job)
-    })
 }
 
 pub(crate) fn maintenance_hold(paths: &Paths, owner: &str) -> Result<Value> {
@@ -552,252 +261,9 @@ fn maintenance(paths: &Paths, owner: Option<&str>, action: &str) -> Result<Value
         "owner_held":owner.map(|owner| owners.iter().any(|held| held == owner)),"owners":owners,"active_job":active.map(|job|job.id)}))
 }
 
-pub(crate) fn require_quiescent(paths: &Paths) -> Result<()> {
-    let database = paths.root.join("queue.sqlite3");
-    if !database.exists() {
-        return Ok(());
-    }
-    let store = Store::open(&paths.root, false)?;
-    ensure!(
-        store.paused()?,
-        "pause Telete before installation or signing maintenance"
-    );
-    ensure!(
-        store
-            .jobs()?
-            .iter()
-            .all(|job| job.phase.terminal() && !job.unresolved),
-        "Telete has queued, active or unresolved work; settle it before maintenance"
-    );
-    Ok(())
-}
-
-// Service stop holds broker and deployment ownership for these recovery cases.
-// Installation and signing retain the stricter quiescent queue requirement.
-pub(crate) fn require_service_stoppable(paths: &Paths) -> Result<()> {
-    if require_quiescent(paths).is_ok() {
-        return Ok(());
-    }
-    let (store, config) = configured(paths)?;
-    ensure!(store.paused()?, "pause Telete before stopping its service");
-    let job = store
-        .active()?
-        .context("Telete has unsettled queued work")?;
-    if job.stopped_phase == Some(Phase::Checking) {
-        return require_blocked_autofix_stoppable(paths, &store, &config, &job);
-    }
-    if job.stopped_phase == Some(Phase::Preparing) {
-        return require_blocked_preparation_stoppable(paths, &store, &config, &job);
-    }
-    ensure!(
-        job.phase == Phase::Blocked
-            && job.stopped_phase == Some(Phase::Deploying)
-            && job.accepted
-            && job.operation.is_none()
-            && store.jobs()?.iter().all(|other| {
-                other.id == job.id || (other.phase.terminal() && !other.unresolved)
-            }),
-        "service stop requires settled work or one blocked completed deployment"
-    );
-    let request = job
-        .deployment_request
-        .as_ref()
-        .context("blocked deployment has no saved request")?;
-    ensure!(
-        job.candidate.as_ref() == Some(&request.source)
-            && git::ref_value(paths, &config.repository, git::ACCEPTED)?.as_ref()
-                == Some(&request.source)
-            && !paths.root.join("deployments/active.json").try_exists()?,
-        "blocked deployment source or execution ownership is unsettled"
-    );
-    let result = deployment::observe(paths, &request.id)?
-        .context("blocked deployment has no terminal receipt")?;
-    correlate_deployment(&result, request)?;
-    ensure!(
-        result.state == DeploymentState::Succeeded,
-        "service stop requires the blocked deployment to have completed successfully"
-    );
-    Ok(())
-}
-
-// Stop only; acknowledgement still owns abandonment after worker shutdown.
-fn require_blocked_preparation_stoppable(
-    paths: &Paths,
-    store: &Store,
-    config: &Config,
-    job: &Job,
-) -> Result<()> {
-    ensure!(
-        !config.project
-            && job.options.workflow.is_none()
-            && job.phase == Phase::Blocked
-            && job.stopped_phase == Some(Phase::Preparing)
-            && job.outcome == Some(Phase::Failed)
-            && job.unresolved
-            && !job.accepted
-            && job.preparation.is_none()
-            && job.deployment_request.is_none()
-            && job.deployment_result.is_none()
-            && store.jobs()?.iter().all(|other| {
-                other.id == job.id || (other.phase.terminal() && !other.unresolved)
-            }),
-        "service stop requires one unaccepted blocked preparation with settled execution"
-    );
-    let operation = job
-        .operation
-        .as_ref()
-        .context("blocked preparation has no retained operation")?;
-    let base = job.base.as_ref().context("fixed base absent")?;
-    let candidate = job.candidate.as_ref().context("candidate absent")?;
-    let directory = paths.job(&job.id.0);
-    let name = format!("production-{}", job.preparation_generation);
-    ensure!(
-        operation.phase == Phase::Preparing
-            && operation.name == name
-            && operation.candidate == *candidate
-            && operation.result == directory.join(format!("{name}.json"))
-            && fs::symlink_metadata(paths.root.join("deployments/active.json"))
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            && git::ref_value(paths, &config.repository, git::ACCEPTED)?.as_ref() == Some(base)
-            && git::ref_value(
-                paths,
-                &config.repository,
-                &git::private_ref(&job.id.0, "candidate")?,
-            )?
-            .as_ref()
-                == Some(candidate),
-        "blocked preparation intent, source or deployment ownership changed"
-    );
-    for receipt in [
-        operation.result.clone(),
-        directory.join(&name).join("result.json"),
-    ] {
-        ensure!(
-            fs::symlink_metadata(receipt)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-            "preparation has a terminal receipt or inaccessible path; use its recovery path"
-        );
-    }
-    let worktree = directory.join("worktree");
-    ensure!(
-        git::common(paths, &worktree)? == config.common_git_dir,
-        "preparation worktree belongs to another repository"
-    );
-    git::clean_candidate(paths, &worktree, candidate)?;
-    if job.policy.commands.is_some() {
-        // The outer preparation supervisor is independent of broker gates.
-        let command = cell_pipeline::preparation_command(paths, job)?;
-        let invocation = crate::invocation::directory(paths, job, &name)?;
-        let saved: crate::process::CommandSpec =
-            serde_json::from_slice(&fs::read(invocation.join("request.json"))?)?;
-        ensure!(
-            serde_json::to_value(saved)? == serde_json::to_value(command)?,
-            "preparation invocation does not match its job"
-        );
-        let result = crate::process::observe(&invocation)?
-            .context("preparation invocation has no terminal completion")?;
-        let code = result
-            .exit_code
-            .context("preparation invocation has no normal exit status")?;
-        ensure!(
-            code > 0 && result.exited_with(&[code]),
-            "preparation invocation has no ordinary failed completion"
-        );
-    }
-    Ok(())
-}
-
-// A completed autofix can be recovered after stop; this guard changes no journal state.
-#[allow(clippy::too_many_lines)]
-fn require_blocked_autofix_stoppable(
-    paths: &Paths,
-    store: &Store,
-    config: &Config,
-    job: &Job,
-) -> Result<()> {
-    ensure!(
-        job.phase == Phase::Blocked
-            && job.stopped_phase == Some(Phase::Checking)
-            && job.outcome == Some(Phase::Failed)
-            && job.unresolved
-            && !job.accepted
-            && job.preparation.is_none()
-            && job.preparation_generation == 0
-            && job.deployment_request.is_none()
-            && job.deployment_result.is_none()
-            && store.jobs()?.iter().all(|other| {
-                other.id == job.id || (other.phase.terminal() && !other.unresolved)
-            }),
-        "service stop requires one unaccepted blocked autofix with settled execution"
-    );
-    let operation = job
-        .operation
-        .as_ref()
-        .context("blocked autofix has no retained operation")?;
-    let base = job.base.as_ref().context("fixed base absent")?;
-    let candidate = job.candidate.as_ref().context("candidate absent")?;
-    let directory = paths.job(&job.id.0);
-    let name = format!("validation-{}", job.validations.len());
-    ensure!(
-        operation.phase == Phase::Checking
-            && operation.name == name
-            && operation.candidate == *candidate
-            && operation.result == directory.join(format!("{name}.json"))
-            && !paths.root.join("deployments/active.json").try_exists()?
-            && git::ref_value(paths, &config.repository, git::ACCEPTED)?.as_ref() == Some(base)
-            && git::ref_value(
-                paths,
-                &config.repository,
-                &git::private_ref(&job.id.0, "candidate")?,
-            )?
-            .as_ref()
-                == Some(candidate),
-        "blocked autofix intent, source or deployment ownership changed"
-    );
-    let canonical = validation::receipt_path(paths, base, candidate, job.options.run_tests, true);
-    let bytes = fs::read(&operation.result)?;
-    let report: ValidationReport = serde_json::from_slice(&bytes)?;
-    ensure!(
-        report.state == ValidationState::Autofix
-            && serde_json::from_slice::<Value>(&bytes)?
-                == serde_json::from_slice::<Value>(&fs::read(&canonical)?)?,
-        "blocked autofix has no matching terminal aggregate reports"
-    );
-    validation::verify_report(&report, base, candidate, job.options.run_tests, true)?;
-    let patch = report
-        .autofix_patch
-        .as_ref()
-        .context("autofix receipt has no patch")?;
-    ensure!(
-        *patch
-            == canonical
-                .parent()
-                .context("validation receipt directory absent")?
-                .join("autofix.patch")
-            && !fs::read_to_string(patch)?.is_empty(),
-        "blocked autofix has no exact retained patch"
-    );
-    let worktree = directory.join("worktree");
-    ensure!(
-        git::common(paths, &worktree)? == config.common_git_dir,
-        "validation worktree belongs to another repository"
-    );
-    git::clean_candidate(paths, &worktree, candidate)?;
-    let names = Inventory::load(&worktree)?
-        .select(&report.products)?
-        .iter()
-        .map(|product| product.id.to_string())
-        .collect::<BTreeSet<_>>();
-    ensure!(
-        names.len() == report.products.len() && names == report.products.iter().cloned().collect(),
-        "validation selection is not a canonical product scope"
-    );
-    validation::require_job_dispatcher(paths, &worktree, job)
-}
-
-// Keep the authoritative recovery decisions together before the state transition.
-#[allow(clippy::too_many_lines)]
-pub(crate) async fn recover(paths: &Paths, id: &str) -> Result<Value> {
+/// Recover only a command with correlated terminal process evidence. Recovery
+/// consumes the saved result; it never admits the same command again.
+pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
     let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
     let (store, config) = configured(paths)?;
     let mut job = store.job(id)?;
@@ -808,126 +274,27 @@ pub(crate) async fn recover(paths: &Paths, id: &str) -> Result<Value> {
     let phase = job
         .stopped_phase
         .context("blocked job has no retained operation phase")?;
-    let settled_cancel = phase == Phase::Checking
-        && job.cancel_requested
-        && job.operation.is_none()
-        && job
-            .validations
-            .last()
-            .is_some_and(|validation| validation.report.state == ValidationState::Stale);
-    match phase {
-        Phase::Checking if settled_cancel => {}
-        Phase::Checking | Phase::Preparing | Phase::Deploying if job.options.workflow.is_some() => {
-            let inspector = Worker {
-                paths,
-                store: Store::open(&paths.root, false)?,
-                config: config.clone(),
-            };
-            inspector.reconcile_workflow(&job)?;
-        }
-        Phase::Checking | Phase::Preparing => {
-            let operation = job
-                .operation
-                .as_ref()
-                .context("blocked operation has no retained intent")?;
-            if phase == Phase::Checking {
-                validation::require_job_dispatcher(
-                    paths,
-                    &paths.job(&job.id.0).join("worktree"),
-                    &job,
-                )?;
-            }
-            if phase == Phase::Checking && !operation.result.is_file() {
-                let provider_receipt = validation::receipt_path(
-                    paths,
-                    job.base.as_ref().context("fixed base absent")?,
-                    job.candidate.as_ref().context("candidate absent")?,
-                    job.options.run_tests,
-                    true,
-                );
-                if provider_receipt.is_file() {
-                    let report: ValidationReport =
-                        serde_json::from_slice(&fs::read(provider_receipt)?)?;
-                    store::atomic_json(&operation.result, &report)?;
-                }
-            }
-            if phase == Phase::Preparing && !operation.result.is_file() {
-                let output = paths
-                    .job(&job.id.0)
-                    .join(format!("production-{}", job.preparation_generation))
-                    .join("result.json");
-                if output.is_file() {
-                    let prepared: Preparation = serde_json::from_slice(&fs::read(output)?)?;
-                    let inspector = Worker {
-                        paths,
-                        store: Store::open(&paths.root, false)?,
-                        config: config.clone(),
-                    };
-                    let products = inspector.production_products(&job)?;
-                    correlate_preparation(
-                        &prepared,
-                        job.candidate.as_ref().context("candidate absent")?,
-                        &products,
-                        job.policy.signing()?,
-                        paths,
-                    )?;
-                    store::atomic_json(
-                        &operation.result,
-                        &PreparationOutcome {
-                            prepared: Some(prepared),
-                            compilation_failure: None,
-                        },
-                    )?;
-                }
-            }
-            ensure!(
-                operation.result.is_file(),
-                "operation has no authoritative terminal receipt; it cannot be repeated"
-            );
-        }
-        Phase::Deploying => {
-            let request = job
-                .deployment_request
-                .as_ref()
-                .context("blocked deployment has no saved request")?;
-            let observed = deployment::observe(paths, &request.id)?
-                .context("deployment admission remains unknown")?;
-            correlate_deployment(&observed, request)?;
-            ensure!(
-                observed.state != DeploymentState::Running
-                    && (observed.state != DeploymentState::Interrupted || observed.acknowledged),
-                "deployment has interrupted or uncertain instruction effects; inspect its owning operation"
-            );
-        }
-        Phase::Accepting | Phase::Autofixing | Phase::Integrating => {}
-        _ => bail!("recovery has no authoritative continuation for this phase"),
-    }
+    ensure!(
+        matches!(phase, Phase::Checking | Phase::Preparing | Phase::Deploying),
+        "recovery has no authoritative continuation for this phase"
+    );
+    let mut worker = Worker {
+        paths,
+        store,
+        config,
+    };
+    worker.reconcile_workflow(&job)?;
     job.phase = phase;
     job.outcome = None;
     job.outcome_message = None;
     job.unresolved = false;
     job.last_error = None;
-    job.waiting_reason = None;
-    store.save(&mut job)?;
-    let mut worker = Worker {
-        paths,
-        store,
-        config,
-    };
-    if settled_cancel {
-        worker.finish(
-            &mut job,
-            Phase::Cancelled,
-            "Cancelled after stale validation settled".into(),
-            false,
-        )?;
-    } else {
-        worker.tick().await?;
-    }
+    worker.store.save(&mut job)?;
+    worker.tick()?;
     worker.store.job(id)?.output()
 }
 
-pub(crate) async fn worker_once(paths: &Paths) -> Result<Value> {
+pub(crate) fn worker_once(paths: &Paths) -> Result<Value> {
     let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
     let (store, config) = configured(paths)?;
     let mut worker = Worker {
@@ -935,117 +302,7 @@ pub(crate) async fn worker_once(paths: &Paths) -> Result<Value> {
         store,
         config,
     };
-    worker.tick().await
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PreparationAcknowledgement {
-    schema: u32,
-    job: JobId,
-    operation: Operation,
-    acknowledged: u64,
-}
-
-// Keep the identity checks and durable abandonment transition in one place.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn acknowledge_preparation(paths: &Paths, id: &str) -> Result<Value> {
-    let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
-    let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
-    let (store, config) = configured(paths)?;
-    ensure!(
-        store.paused()?,
-        "pause Telete before acknowledging preparation"
-    );
-    let mut job = store.job(id)?;
-    let directory = paths.job(&job.id.0);
-    let name = format!("production-{}", job.preparation_generation);
-    let record = directory.join(format!("{name}.acknowledged.json"));
-    let previous: Option<PreparationAcknowledgement> = if record.try_exists()? {
-        Some(serde_json::from_slice(&fs::read(&record)?)?)
-    } else {
-        None
-    };
-    if let Some(acknowledgement) = &previous {
-        ensure!(
-            acknowledgement.schema == 1
-                && acknowledgement.job == job.id
-                && acknowledgement.operation.phase == Phase::Preparing
-                && acknowledgement.operation.name == name
-                && Some(&acknowledgement.operation.candidate) == job.candidate.as_ref()
-                && acknowledgement.operation.result == directory.join(format!("{name}.json")),
-            "preparation acknowledgement names another operation"
-        );
-        if job.phase == Phase::Failed && !job.unresolved && job.operation.is_none() {
-            let worker = Worker {
-                paths,
-                store,
-                config,
-            };
-            worker.cleanup(&mut job)?;
-            return job.output();
-        }
-    }
-    ensure!(
-        job.phase == Phase::Blocked
-            && job.stopped_phase == Some(Phase::Preparing)
-            && job.outcome == Some(Phase::Failed)
-            && job.unresolved
-            && !job.accepted
-            && job.preparation.is_none()
-            && job.deployment_request.is_none()
-            && job.deployment_result.is_none(),
-        "only an unaccepted blocked preparation can be acknowledged"
-    );
-    let operation = job
-        .operation
-        .as_ref()
-        .context("preparation intent absent")?;
-    ensure!(
-        operation.phase == Phase::Preparing
-            && operation.name == name
-            && Some(&operation.candidate) == job.candidate.as_ref()
-            && operation.result == directory.join(format!("{name}.json")),
-        "preparation intent does not match the job"
-    );
-    ensure!(
-        !operation.result.try_exists()?
-            && !directory.join(&name).join("result.json").try_exists()?,
-        "preparation has a terminal receipt; use recover"
-    );
-    ensure!(
-        git::ref_value(paths, &config.repository, git::ACCEPTED)?.as_ref() == job.base.as_ref(),
-        "accepted source changed after preparation"
-    );
-    crate::broker::require_settled(paths)?;
-    if previous.is_none() {
-        store::atomic_json(
-            &record,
-            &PreparationAcknowledgement {
-                schema: 1,
-                job: job.id.clone(),
-                operation: operation.clone(),
-                acknowledged: store::now(),
-            },
-        )?;
-    } else {
-        ensure!(
-            serde_json::to_value(&previous.context("acknowledgement absent")?.operation)?
-                == serde_json::to_value(operation)?,
-            "retained preparation intent changed"
-        );
-    }
-    job.operation = None;
-    job.unresolved = false;
-    job.phase = Phase::Failed;
-    store.save(&mut job)?;
-    let worker = Worker {
-        paths,
-        store,
-        config,
-    };
-    worker.cleanup(&mut job)?;
-    job.output()
+    worker.tick()
 }
 
 pub(crate) async fn worker(paths: &Paths) -> Result<()> {
@@ -1057,7 +314,7 @@ pub(crate) async fn worker(paths: &Paths) -> Result<()> {
         config,
     };
     loop {
-        worker.tick().await?;
+        worker.tick()?;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -1104,16 +361,11 @@ impl Worker<'_> {
                 return Ok(None);
             };
             self.paths.require_capacity()?;
-            if job
-                .options
-                .workflow
-                .as_ref()
-                .is_none_or(|workflow| workflow.integrate)
-            {
+            if job.workflow.integrate {
                 job.base = Some(git::commit(
                     self.paths,
                     &self.config.repository,
-                    self.config.accepted_ref(),
+                    git::ACCEPTED,
                 )?);
             }
             self.save(&mut job, Phase::Integrating)?;
@@ -1121,7 +373,7 @@ impl Worker<'_> {
         })
     }
 
-    async fn tick(&mut self) -> Result<Value> {
+    fn tick(&mut self) -> Result<Value> {
         self.paths.require_capacity()?;
         for mut job in self.store.jobs()? {
             if (job.phase.terminal() || job.outcome.is_some()) && !job.unresolved {
@@ -1132,22 +384,30 @@ impl Worker<'_> {
             return Ok(json!({"state":"idle","paused":self.store.paused()?}));
         };
         if job.phase != Phase::Blocked
-            && let Err(error) = self.step(&mut job).await
+            && let Err(error) = self.step(&mut job)
         {
             let message = format!("{error:#}");
             job.last_error = Some(message.clone());
-            let unresolved = job.operation.is_some() || matches!(job.phase, Phase::Deploying);
+            let unresolved = job.operation.is_some();
             self.finish(&mut job, Phase::Failed, message, unresolved)?;
         }
         self.store.job(&job.id.0)?.output()
     }
 
-    async fn step(&mut self, job: &mut Job) -> Result<()> {
+    fn step(&mut self, job: &mut Job) -> Result<()> {
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
         if job.cancel_requested
             && job.operation.is_none()
             && !matches!(job.phase, Phase::Deploying | Phase::Blocked)
         {
+            // Git promotion may have completed before the worker saved its
+            // acceptance fact. Cancellation must retain that existing effect.
+            if job.phase == Phase::Accepting
+                && git::ref_value(self.paths, &self.config.repository, git::ACCEPTED)?.as_ref()
+                    == Some(Self::candidate(job)?)
+            {
+                job.accepted = true;
+            }
             return self.finish(
                 job,
                 Phase::Cancelled,
@@ -1157,29 +417,13 @@ impl Worker<'_> {
         }
         match job.phase {
             Phase::Integrating => self.integrating(job),
-            Phase::Checking if job.options.workflow.is_some() => self.workflow_stage(job, "check"),
-            Phase::Checking => self.checking(job),
-            Phase::Autofixing => self.autofixing(job),
-            Phase::Preparing if job.options.workflow.is_some() => self.workflow_stage(job, "prepare"),
-            Phase::Preparing => self.preparing(job),
-            Phase::Accepting if job.options.workflow.is_some() => self.workflow_accept(job),
-            Phase::Accepting => self.accepting(job),
-            Phase::Deploying if job.options.workflow.is_some() => self.workflow_stage(job, "deploy"),
-            Phase::Deploying => self.deploying(job),
+            Phase::Checking => self.workflow_stage(job, "check"),
+            Phase::Preparing => self.workflow_stage(job, "prepare"),
+            Phase::Accepting => self.workflow_accept(job),
+            Phase::Deploying => self.workflow_stage(job, "deploy"),
             Phase::Blocked => Ok(()),
             _ => bail!("unexpected active Telete phase: {:?}", job.phase),
         }
-    }
-
-    fn assert_policy(&self, job: &Job) -> Result<()> {
-        if job.options.workflow.is_some() {
-            return Ok(());
-        }
-        ensure!(
-            signing::selected(self.paths)? == *job.policy.signing()?,
-            "host signing selection changed after admission"
-        );
-        Ok(())
     }
 
     fn finish(
@@ -1189,12 +433,12 @@ impl Worker<'_> {
         message: String,
         unresolved: bool,
     ) -> Result<()> {
-        ensure!(outcome.terminal(), "invalid terminal CI outcome");
+        ensure!(outcome.terminal(), "invalid terminal workflow outcome");
         job.stopped_phase = Some(job.phase);
         job.outcome = Some(outcome);
         job.outcome_message = Some(message);
         job.unresolved = unresolved;
-        if !matches!(outcome, Phase::Succeeded | Phase::AlreadyIncluded) {
+        if outcome != Phase::Succeeded {
             self.store.set("paused", &true)?;
         }
         let phase = if unresolved { Phase::Blocked } else { outcome };
@@ -1242,12 +486,7 @@ impl Worker<'_> {
     }
 
     fn integrating(&self, job: &mut Job) -> Result<()> {
-        if job
-            .options
-            .workflow
-            .as_ref()
-            .is_some_and(|workflow| !workflow.integrate)
-        {
+        if !job.workflow.integrate {
             let candidate = job.input.clone();
             job.candidate = Some(candidate.clone());
             self.store.save(job)?;
@@ -1267,18 +506,6 @@ impl Worker<'_> {
             return self.save(job, Phase::Checking);
         }
         let base = Self::base(job)?.clone();
-        if job.options.workflow.is_none()
-            && job.options.deploy.is_empty()
-            && git::ancestor(self.paths, &self.config.repository, &job.input, &base)?
-        {
-            job.candidate = Some(base);
-            return self.finish(
-                job,
-                Phase::AlreadyIncluded,
-                "The submitted changes are already in accepted history".into(),
-                false,
-            );
-        }
         let worktree = self.worktree(job);
         git::ensure_worktree(self.paths, &self.config.repository, &worktree, &base)?;
         let merge = git::merge(self.paths, &worktree, &job.input)?;
@@ -1352,595 +579,20 @@ impl Worker<'_> {
         self.store.save(job)?;
         Ok(true)
     }
-
-    // Receipt correlation, cancellation, and the next phase form one durable decision.
-    #[allow(clippy::too_many_lines)]
-    fn checking(&self, job: &mut Job) -> Result<()> {
-        self.assert_policy(job)?;
-        let candidate = Self::candidate(job)?.clone();
-        let base = Self::base(job)?.clone();
-        let worktree = self.worktree(job);
-        let ordinal = job.validations.len();
-        let directory = self.directory(job)?;
-        let receipt = directory.join(format!("validation-{ordinal}.json"));
-        let fresh = self.begin_operation(job, format!("validation-{ordinal}"), receipt.clone())?;
-        if fresh {
-            git::ensure_worktree(self.paths, &self.config.repository, &worktree, &candidate)?;
-            let report = validation::run_candidate(
-                self.paths,
-                &worktree,
-                &base,
-                &candidate,
-                job.options.run_tests,
-                true,
-                job,
-            )?;
-            store::atomic_json(&receipt, &report)?;
-        }
-        let report: ValidationReport = serde_json::from_slice(&fs::read(&receipt)?)?;
-        validation::verify_report(&report, &base, &candidate, job.options.run_tests, true)?;
-        validation::require_job_dispatcher(self.paths, &worktree, job)?;
-        ensure!(
-            report.schema == 1 && report.base == base && report.candidate == candidate,
-            "validation receipt names another source"
-        );
-        if report.state == ValidationState::Passed {
-            ensure!(
-                report.tests_run == job.options.run_tests,
-                "validation receipt has another test policy"
-            );
-        }
-        if matches!(
-            report.state,
-            ValidationState::Passed | ValidationState::Autofix
-        ) {
-            ensure!(
-                report.release_builds_deferred,
-                "validation receipt has another release policy"
-            );
-        }
-        job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
-        if job.cancel_requested {
-            let diagnostics = directory.join(format!("validation-{ordinal}.log"));
-            store::atomic_bytes(&diagnostics, report.diagnostics.as_bytes())?;
-            job.validations.push(Validation {
-                report,
-                diagnostics,
-                stamp: store::now(),
-                patch_content: None,
-                fixed_candidate: None,
-            });
-            job.operation = None;
-            return self.finish(
-                job,
-                Phase::Cancelled,
-                "Cancelled after validation settled".into(),
-                false,
-            );
-        }
-        git::clean_candidate(self.paths, &worktree, &candidate)?;
-        let inventory = Inventory::load(&worktree)?;
-        let selected = inventory.select(&report.products)?;
-        let names = selected
-            .iter()
-            .map(|product| product.id.to_string())
-            .collect::<BTreeSet<_>>();
-        ensure!(
-            names.len() == report.products.len()
-                && names == report.products.iter().cloned().collect(),
-            "validation selection is not a canonical product scope"
-        );
-        let diagnostics = directory.join(format!("validation-{ordinal}.log"));
-        store::atomic_bytes(&diagnostics, report.diagnostics.as_bytes())?;
-        let patch_content = if report.state == ValidationState::Autofix {
-            let path = report
-                .autofix_patch
-                .as_ref()
-                .context("autofix receipt has no patch")?;
-            ensure!(
-                path.is_absolute() && path.starts_with(&self.paths.root),
-                "autofix patch is outside Telete state"
-            );
-            let raw = fs::read_to_string(path)?;
-            ensure!(!raw.is_empty(), "autofix patch is empty");
-            Some(raw)
-        } else {
-            None
-        };
-        job.validations.push(Validation {
-            report: report.clone(),
-            diagnostics,
-            stamp: store::now(),
-            patch_content,
-            fixed_candidate: None,
-        });
-        job.operation = None;
-        job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
-        if job.cancel_requested {
-            return self.finish(
-                job,
-                Phase::Cancelled,
-                "Cancelled after validation settled".into(),
-                false,
-            );
-        }
-        match report.state {
-            ValidationState::Passed => self.save(job, Phase::Preparing),
-            ValidationState::Autofix => self.save(job, Phase::Autofixing),
-            ValidationState::Failed => self.finish(
-                job,
-                Phase::Failed,
-                "Required checks failed".into(),
-                false,
-            ),
-            ValidationState::Stale => self.finish(
-                job,
-                Phase::Failed,
-                "Validation became stale; fresh validation requires a new submission".into(),
-                true,
-            ),
-        }
-    }
-
-    fn autofixing(&self, job: &mut Job) -> Result<()> {
-        self.assert_policy(job)?;
-        let validation = job
-            .validations
-            .last()
-            .context("autofix has no validation")?;
-        let parent = validation.report.candidate.clone();
-        ensure!(
-            validation.report.state == ValidationState::Autofix && Self::candidate(job)? == &parent,
-            "autofix names another candidate"
-        );
-        let raw = validation
-            .patch_content
-            .as_ref()
-            .context("autofix patch was not retained")?;
-        let path = validation
-            .report
-            .autofix_patch
-            .as_ref()
-            .context("autofix path absent")?;
-        ensure!(
-            fs::read_to_string(path)? == *raw,
-            "retained autofix patch changed"
-        );
-        let tree = git::patch_tree(
-            self.paths,
-            &self.config.repository,
-            &parent,
-            raw,
-            &self.directory(job)?.join("autofix.index"),
-        )?;
-        ensure!(
-            tree != git::value(
-                self.paths,
-                &self.config.repository,
-                &["rev-parse", &format!("{parent}^{{tree}}")]
-            )?,
-            "autofix made no source changes"
-        );
-        let candidate = git::commit_tree(
-            self.paths,
-            &self.config.repository,
-            &tree,
-            std::slice::from_ref(&parent),
-            &job.id.0,
-            validation.stamp,
-            "Apply deterministic Telete fixes",
-        )?;
-        if let Some(recorded) = &validation.fixed_candidate {
-            ensure!(recorded == &candidate, "autofix candidate changed");
-        }
-        job.validations
-            .last_mut()
-            .context("autofix record absent")?
-            .fixed_candidate = Some(candidate.clone());
-        self.store.save(job)?;
-        git::advance(
-            self.paths,
-            &self.config.repository,
-            &git::private_ref(&job.id.0, "candidate")?,
-            Some(&parent),
-            &candidate,
-        )?;
-        job.candidate = Some(candidate.clone());
-        git::ensure_worktree(
-            self.paths,
-            &self.config.repository,
-            &self.worktree(job),
-            &candidate,
-        )?;
-        self.save(job, Phase::Checking)
-    }
-
-    fn production_products(&self, job: &Job) -> Result<Vec<String>> {
-        cell_pipeline::production_products(self.paths, job)
-    }
-
-    fn deployment_products(&self, job: &Job) -> Result<Vec<String>> {
-        if job.options.no_deploy {
-            return Ok(Vec::new());
-        }
-        let names = if job.options.deploy.is_empty() {
-            let report = &job
-                .validations
-                .last()
-                .context("deployment has no validation")?
-                .report;
-            let mut names = report.products.clone();
-            names.extend(report.platform_products.iter().cloned());
-            names.retain(|product| product != "telete");
-            names
-        } else {
-            job.options.deploy.clone()
-        };
-        if names.is_empty() {
-            return Ok(Vec::new());
-        }
-        let selected = Inventory::load(&self.worktree(job))?.select(&names)?;
-        ensure!(
-            !selected
-                .iter()
-                .any(|product| product.id.to_string() == "telete"),
-            "Telete installation is a separate explicit operation"
-        );
-        let mut canonical = selected
-            .iter()
-            .map(|product| {
-                if product.id.to_string() == "decisions" {
-                    "krisis".into()
-                } else {
-                    product.id.to_string()
-                }
-            })
-            .collect::<Vec<_>>();
-        canonical.sort();
-        canonical.dedup();
-        Ok(canonical)
-    }
-
-    fn preparing(&self, job: &mut Job) -> Result<()> {
-        self.assert_policy(job)?;
-        let candidate = Self::candidate(job)?.clone();
-        let products = self.production_products(job)?;
-        let directory = self.directory(job)?;
-        let generation = job.preparation_generation;
-        let receipt = directory.join(format!("production-{generation}.json"));
-        let fresh =
-            self.begin_operation(job, format!("production-{generation}"), receipt.clone())?;
-        if fresh {
-            if products.is_empty() {
-                store::atomic_json(
-                    &receipt,
-                    &PreparationOutcome {
-                        prepared: Some(Preparation {
-                            schema: 1,
-                            source: candidate.clone(),
-                            products: Vec::new(),
-                            signing_policy: job.policy.signing()?.clone(),
-                            candidates: BTreeMap::new(),
-                            release_check: true,
-                        }),
-                        compilation_failure: None,
-                    },
-                )?;
-            } else {
-                cell_pipeline::prepare(self.paths, job)?;
-            }
-        }
-        let outcome: PreparationOutcome = serde_json::from_slice(&fs::read(receipt)?)?;
-        ensure!(
-            outcome.prepared.is_some() != outcome.compilation_failure.is_some(),
-            "production outcome is inconsistent"
-        );
-        job.operation = None;
-        job.preparation_generation += 1;
-        if let Some(diagnostic) = outcome.compilation_failure {
-            let path = directory.join(format!("production-{generation}.log"));
-            store::atomic_bytes(&path, diagnostic.as_bytes())?;
-            job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
-            if job.cancel_requested {
-                return self.finish(
-                    job,
-                    Phase::Cancelled,
-                    "Cancelled after release compilation settled".into(),
-                    false,
-                );
-            }
-            return self.finish(
-                job,
-                Phase::Failed,
-                "Release compilation failed".into(),
-                false,
-            );
-        }
-        let prepared = outcome
-            .prepared
-            .context("production receipt has no prepared result")?;
-        correlate_preparation(
-            &prepared,
-            &candidate,
-            &products,
-            job.policy.signing()?,
-            self.paths,
-        )?;
-        job.preparation = Some(prepared);
-        job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
-        if job.cancel_requested {
-            return self.finish(
-                job,
-                Phase::Cancelled,
-                "Cancelled after production preparation settled".into(),
-                false,
-            );
-        }
-        self.save(job, Phase::Accepting)
-    }
-
-    fn accepting(&self, job: &mut Job) -> Result<()> {
-        self.assert_policy(job)?;
-        let candidate = Self::candidate(job)?.clone();
-        let products = self.production_products(job)?;
-        let prepared = job
-            .preparation
-            .as_ref()
-            .context("acceptance has no production receipt")?
-            .clone();
-        correlate_preparation(
-            &prepared,
-            &candidate,
-            &products,
-            job.policy.signing()?,
-            self.paths,
-        )?;
-        git::clean_candidate(self.paths, &self.worktree(job), &candidate)?;
-        git::advance(
-            self.paths,
-            &self.config.repository,
-            git::ACCEPTED,
-            Some(Self::base(job)?),
-            &candidate,
-        )?;
-        job.accepted = true;
-        self.store.save(job)?;
-        let deploy_products = self.deployment_products(job)?;
-        if deploy_products.is_empty() {
-            return self.finish(
-                job,
-                Phase::Succeeded,
-                "Required checks passed; no deployment was selected".into(),
-                false,
-            );
-        }
-        if job.deployment_request.is_none() {
-            job.deployment_request = Some(DeploymentRequest {
-                id: format!("telete-{}-deployment", job.id),
-                source: candidate,
-                products: deploy_products,
-                prepared: prepared.clone(),
-            });
-        }
-        self.save(job, Phase::Deploying)
-    }
-
-    fn deploying(&self, job: &mut Job) -> Result<()> {
-        self.assert_policy(job)?;
-        let request = job
-            .deployment_request
-            .as_ref()
-            .context("deployment has no frozen request")?
-            .clone();
-        ensure!(
-            git::ref_value(self.paths, &self.config.repository, git::ACCEPTED)?.as_ref()
-                == Some(&request.source),
-            "accepted source changed before deployment"
-        );
-        let observed = deployment::observe(self.paths, &request.id)?;
-        if observed.is_none() && job.cancel_requested {
-            return self.finish(
-                job,
-                Phase::Cancelled,
-                "Cancelled after source acceptance and before deployment admission".into(),
-                false,
-            );
-        }
-        let result = match observed {
-            Some(result) => result,
-            None => match cell_pipeline::deploy(self.paths, job) {
-                Ok(result) => result,
-                Err(error) => match deployment::observe(self.paths, &request.id)? {
-                    Some(result) => result,
-                    None => {
-                        return self.finish(
-                            job,
-                            Phase::Failed,
-                            format!("Deployment stopped before admission: {error}"),
-                            false,
-                        );
-                    }
-                },
-            },
-        };
-        correlate_deployment(&result, &request)?;
-        store::atomic_json(&self.directory(job)?.join("deployment.json"), &result)?;
-        job.deployment_result = Some(result.clone());
-        match result.state {
-            DeploymentState::Succeeded => self.finish(
-                job,
-                Phase::Succeeded,
-                "Deployment instructions completed for the accepted candidate".into(),
-                false,
-            ),
-            DeploymentState::Failed => self.finish(
-                job,
-                Phase::Failed,
-                "Deployment instructions failed; accepted source is retained".into(),
-                false,
-            ),
-            DeploymentState::Interrupted if result.acknowledged => self.finish(
-                job,
-                Phase::Failed,
-                "Interrupted deployment was explicitly acknowledged; no instruction was repeated"
-                    .into(),
-                false,
-            ),
-            DeploymentState::Interrupted | DeploymentState::Running => self.finish(
-                job,
-                Phase::Failed,
-                "Deployment instruction effects remain unresolved".into(),
-                true,
-            ),
-        }
-    }
-
-
-}
-
-fn correlate_preparation(
-    prepared: &Preparation,
-    candidate: &CommitId,
-    products: &[String],
-    policy: &SigningPolicy,
-    paths: &Paths,
-) -> Result<()> {
-    ensure!(
-        prepared.schema == 1
-            && prepared.source == *candidate
-            && prepared.products == products
-            && prepared.signing_policy == *policy
-            && prepared.release_check,
-        "production preparation does not match source, scope, signing policy or release checks"
-    );
-    ensure!(
-        prepared.candidates.keys().cloned().collect::<BTreeSet<_>>()
-            == products.iter().cloned().collect(),
-        "prepared candidate scope is incomplete"
-    );
-    for (product, artifact) in &prepared.candidates {
-        ensure!(
-            artifact.schema == 1
-                && artifact.product == *product
-                && artifact.source_commit == *candidate
-                && artifact.signing_policy == *policy
-                && artifact.source_key == candidate.to_string()
-                && !artifact.candidate_id.is_empty()
-                && artifact.candidate_dir.is_absolute()
-                && artifact.candidate_dir.starts_with(&paths.root),
-            "production candidate correlation is invalid"
-        );
-    }
-    Ok(())
-}
-
-fn correlate_deployment(result: &DeploymentResult, request: &DeploymentRequest) -> Result<()> {
-    let result_products = result.products.iter().collect::<BTreeSet<_>>();
-    let request_products = request.products.iter().collect::<BTreeSet<_>>();
-    ensure!(
-        result.schema == 2
-            && result.request_id == request.id
-            && result.source == request.source
-            && result_products.len() == result.products.len()
-            && request_products.len() == request.products.len()
-            && result_products == request_products,
-        "deployment receipt does not match admitted request"
-    );
-    ensure!(
-        !result.run_id.is_empty(),
-        "deployment receipt has no owning run identity"
-    );
-    if result.state == DeploymentState::Succeeded {
-        ensure!(
-            result.exit_code == Some(0)
-                && !result.instructions.is_empty()
-                && result
-                    .instructions
-                    .iter()
-                    .all(
-                        |instruction| instruction.state == InstructionState::Succeeded
-                            && instruction.exit_code == Some(0)
-                    ),
-            "deployment success has incomplete instruction results"
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signing::MacSigning;
     use std::os::unix::fs::PermissionsExt;
-
-    fn policy(paths: &Paths) -> Result<Policy> {
-        let signing_policy = SigningPolicy {
-            schema: 1,
-            macos: MacSigning {
-                profile: "local".into(),
-                certificate_sha1: "a".repeat(40),
-                keychain: paths.root.join("fixture.keychain"),
-                identifier_namespace: "local.fixture".into(),
-            },
-        };
-        store::atomic_json(&paths.root.join("signing.json"), &signing_policy)?;
-        Ok(Policy {
-            commands: None,
-            signing_policy: Some(signing_policy),
-        })
-    }
-
-    fn fixture() -> Result<(tempfile::TempDir, Paths, PathBuf, CommitId)> {
-        let temporary = tempfile::tempdir()?;
-        let paths = Paths::for_test(temporary.path().join("telete"))?;
-        let repo = temporary.path().join("repository");
-        fs::create_dir(&repo)?;
-        git::value(&paths, &repo, &["init", "--initial-branch=main"])?;
-        fs::write(repo.join("file.txt"), "base\n")?;
-        fs::create_dir_all(repo.join("pipeline/products"))?;
-        for product in ["alpha", "beta", "decisions"] {
-            fs::create_dir_all(repo.join(format!("products/{product}")))?;
-            fs::write(repo.join(format!("products/{product}/marker")), product)?;
-            fs::write(
-                repo.join(format!("pipeline/products/{product}.sh")),
-                format!(
-                    "PIPELINE_SCHEMA=1\nPRODUCT_ID={product}\nPRODUCT_NAME={product}\nPRODUCT_DIR=products/{product}\nCARGO_PACKAGES={product}\nPROVIDERS='one|{product}|products/{product}/chancery|{product}'\n{}",
-                    if product == "decisions" {
-                        "PRODUCT_ALIASES=krisis\n"
-                    } else {
-                        ""
-                    }
-                ),
-            )?;
-        }
-        fs::create_dir_all(repo.join("infrastructure/telete"))?;
-        fs::write(
-            repo.join("infrastructure/telete/product.sh"),
-            "PIPELINE_SCHEMA=1\nPRODUCT_ID=telete\nPRODUCT_NAME=Telete\nPRODUCT_DIR=infrastructure/telete\nCARGO_PACKAGES=telete\nPROVIDERS='one|telete|infrastructure/telete/chancery|telete'\n",
-        )?;
-        git::value(&paths, &repo, &["add", "."])?;
-        let tree = git::value(&paths, &repo, &["write-tree"])?;
-        let base = git::commit_tree(
-            &paths,
-            &repo,
-            &tree,
-            &[],
-            "fixture",
-            1_700_000_000,
-            "Fixture baseline",
-        )?;
-        git::value(&paths, &repo, &["update-ref", "HEAD", &base.0])?;
-        init(&paths, &repo, Some(&base.0))?;
-        Ok((temporary, paths, repo, base))
-    }
 
     fn job(paths: &Paths, base: &CommitId, id: &str) -> Result<Job> {
         Ok(new_job(
             JobId::new(id)?,
             format!("request-{id}"),
             base.clone(),
-            SubmitOptions::default(),
-            policy(paths)?,
+            workflow_selection(paths),
+            invocation::capture_environment(paths)?,
         ))
     }
 
@@ -1953,552 +605,21 @@ mod tests {
         })
     }
 
-    fn report(base: &CommitId, candidate: &CommitId, products: &[&str]) -> ValidationReport {
-        ValidationReport {
-            schema: 1,
-            base: base.clone(),
-            candidate: candidate.clone(),
-            state: ValidationState::Passed,
-            products: products.iter().map(|value| (*value).into()).collect(),
-            platform_products: Vec::new(),
-            shared_suites: Vec::new(),
-            tests_run: false,
-            release_builds_deferred: true,
-            required_gates: Vec::new(),
-            gates: Vec::new(),
-            diagnostics: String::new(),
-            autofix_patch: None,
-        }
-    }
-
-    fn retain_check_dispatcher(
-        paths: &Paths,
-        worktree: &Path,
-        base: &CommitId,
-        run_tests: bool,
-        exit_code: Option<i32>,
-    ) -> Result<()> {
-        let key = validation::check_dispatcher_key(base, base, run_tests, true);
-        let command =
-            validation::check_dispatcher_spec(paths, worktree, base, base, run_tests, true);
-        let record = paths
-            .root
-            .join("broker")
-            .join(format!("{}.json", key.replace('/', "_")));
-        let process = record.with_extension("process");
-        let result = exit_code.map(|exit_code| crate::process::ProcessResult {
-            start_error: None,
-            signal: None,
-            output_error: None,
-            exit_code: Some(exit_code),
-            stdout: String::new(),
-            stderr: String::new(),
-            timed_out: false,
-        });
-        store::atomic_json(
-            &record,
-            &json!({"schema":1,"key":key,"class":"supervisor","command":command,
-                "state":if result.is_some() {"finished"} else {"running"},
-                "owner_pid":1,"result":result}),
-        )?;
-        store::atomic_json(&process.join("request.json"), &command)?;
-        if let Some(result) = result {
-            store::atomic_json(
-                &process.join("result.json"),
-                &json!({"schema":1,"request":command,"result":result}),
-            )?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn frozen_check_invocations_follow_each_candidate_and_reject_changed_correlation() -> Result<()>
-    {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let mut job = job(&paths, &base, "frozen-check")?;
-        let mut commands = CommandPolicy::capture(&paths)?;
-        commands
-            .environment
-            .insert("TELETE_TEST_FROZEN".into(), "retained".into());
-        job.policy.commands = Some(commands);
-        job.base = Some(base.clone());
-        let script = repo.join("pipeline/cell/check.sh");
-        fs::create_dir_all(script.parent().context("check script parent")?)?;
-        let candidate = |parent: &CommitId, exit_code: i32| -> Result<CommitId> {
-            fs::write(
-                &script,
-                format!("[ \"$TELETE_TEST_FROZEN\" = retained ] || exit 99\nexit {exit_code}\n"),
-            )?;
-            git::value(&paths, &repo, &["add", "pipeline/cell/check.sh"])?;
-            let tree = git::value(&paths, &repo, &["write-tree"])?;
-            git::commit_tree(
-                &paths,
-                &repo,
-                &tree,
-                std::slice::from_ref(parent),
-                "frozen-check",
-                1_700_000_001,
-                "Candidate check script",
-            )
-        };
-        let first = candidate(&base, 0)?;
-        job.candidate = Some(first.clone());
-        let worktree = paths.job(&job.id.0).join("worktree");
-        git::ensure_worktree(&paths, &repo, &worktree, &first)?;
-        let first_key = validation::job_dispatcher_key(&job)?;
-        let first_command = validation::job_dispatcher_spec(&paths, &worktree, &job)?;
-        assert!(
-            crate::broker::run(
-                &paths,
-                &first_key,
-                crate::broker::ResourceClass::Supervisor,
-                &first_command,
-            )?
-            .success()
-        );
-        validation::require_job_dispatcher(&paths, &worktree, &job)?;
-
-        let mut changed = job.clone();
-        changed.options.run_tests = true;
-        assert!(validation::require_job_dispatcher(&paths, &worktree, &changed).is_err());
-        let mut changed = job.clone();
-        changed
-            .policy
-            .commands
-            .as_mut()
-            .context("frozen commands")?
-            .environment
-            .insert("TELETE_TEST_FROZEN".into(), "changed".into());
-        assert!(validation::require_job_dispatcher(&paths, &worktree, &changed).is_err());
-        let record = paths
-            .root
-            .join("broker")
-            .join(format!("{}.json", first_key.replace('/', "_")));
-        let saved = fs::read(&record)?;
-        let mut changed: Value = serde_json::from_slice(&saved)?;
-        changed["command"]["context"]["value"]["source"]["candidate"] = json!(base);
-        store::atomic_json(&record, &changed)?;
-        assert!(validation::require_job_dispatcher(&paths, &worktree, &job).is_err());
-        store::atomic_bytes(&record, &saved)?;
-
-        let second = candidate(&first, 9)?;
-        let mut next = job.clone();
-        next.candidate = Some(second.clone());
-        assert!(validation::require_job_dispatcher(&paths, &worktree, &next).is_err());
-        git::ensure_worktree(&paths, &repo, &worktree, &second)?;
-        let second_key = validation::job_dispatcher_key(&next)?;
-        let second_command = validation::job_dispatcher_spec(&paths, &worktree, &next)?;
-        assert_ne!(first_key, second_key);
-        let result = crate::broker::run(
-            &paths,
-            &second_key,
-            crate::broker::ResourceClass::Supervisor,
-            &second_command,
-        )?;
-        assert_eq!(result.exit_code, Some(9));
-        assert!(validation::require_job_dispatcher(&paths, &worktree, &next).is_err());
-        validation::require_job_dispatcher(&paths, &worktree, &job)?;
-        let mut first_environment = first_command.env;
-        let mut second_environment = second_command.env;
-        first_environment.remove("TELETE_CONTEXT");
-        second_environment.remove("TELETE_CONTEXT");
-        assert_eq!(first_environment, second_environment);
-        Ok(())
-    }
-
-    #[test]
-    fn cell_commands_use_frozen_host_policy_and_exact_preparation_handoff() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        let mut job = job(&paths, &base, "frozen-cell-commands")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        let host = paths.root.join("retained-host-telete");
-        let environment = BTreeMap::from([("FROZEN_VALUE".into(), "retained".into())]);
-        job.policy.commands = Some(CommandPolicy {
-            check_script: "pipeline/cell/check.sh".into(),
-            host_program: host.clone(),
-            environment: environment.clone(),
-        });
-        let preparation = cell_pipeline::preparation_command(&paths, &job)?;
-        let prepared = Preparation {
-            schema: 1,
-            source: base.clone(),
-            products: vec!["alpha".into()],
-            signing_policy: job.policy.signing()?.clone(),
-            candidates: BTreeMap::from([(
-                "alpha".into(),
-                deployment::Candidate {
-                    schema: 1,
-                    candidate_id: "retained-candidate".into(),
-                    source_commit: base.clone(),
-                    source_key: base.to_string(),
-                    product: "alpha".into(),
-                    candidate_dir: paths.root.join("staged/alpha"),
-                    binaries: BTreeMap::new(),
-                    signing_policy: job.policy.signing()?.clone(),
-                },
-            )]),
-            release_check: true,
-        };
-        let request = DeploymentRequest {
-            id: "retained-deployment".into(),
-            source: base,
-            products: prepared.products.clone(),
-            prepared,
-        };
-        job.deployment_request = Some(request.clone());
-        let deployment = cell_pipeline::deployment_command(&paths, &job)?;
-        for command in [&preparation, &deployment] {
-            assert_eq!(command.program, host);
-            assert_eq!(command.cwd, paths.job(&job.id.0).join("worktree"));
-            assert_eq!(command.timeout_seconds, None);
-            assert!(!command.confined);
-            let context = command.context.as_ref().context("command context")?;
-            let mut expected = environment.clone();
-            expected.insert("TELETE_CONTEXT".into(), context.path.display().to_string());
-            assert_eq!(command.env, expected);
-            assert_eq!(context.value["job_id"], json!(job.id));
-            assert_eq!(context.value["source"]["candidate"], json!(job.candidate));
-        }
-        let context = deployment.context.as_ref().context("deployment context")?;
-        assert_eq!(context.value["inputs"], serde_json::to_value(request)?);
-        assert_eq!(context.value["stage"], "deploy");
-        assert_eq!(
-            preparation
-                .context
-                .as_ref()
-                .context("preparation context")?
-                .value["stage"],
-            "prepare"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn frozen_invocation_joins_exact_completion_without_replaying() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        let mut job = job(&paths, &base, "frozen-invocation")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base);
-        job.policy.commands = Some(CommandPolicy::capture(&paths)?);
-        let marker = paths.root.join("invocation-marker");
-        let command = crate::invocation::bind(
-            &paths,
-            &job,
-            "retained",
-            "check",
-            &json!({}),
-            &json!({"marker": marker}),
-            crate::process::CommandSpec {
-                program: "/bin/sh".into(),
-                args: vec![
-                    "-c".into(),
-                    "printf x >> \"$1\"; printf complete".into(),
-                    "sh".into(),
-                    marker.display().to_string(),
-                ],
-                cwd: paths.root.clone(),
-                env: BTreeMap::new(),
-                timeout_seconds: None,
-                stdin: None,
-                confined: false,
-                context: None,
-            },
-        )?;
-        let first = crate::invocation::run(&paths, &job, "retained", &command)?;
-        assert!(first.success());
-        let joined = crate::invocation::run(&paths, &job, "retained", &command)?;
-        assert_eq!(serde_json::to_value(first)?, serde_json::to_value(joined)?);
-        assert_eq!(fs::read_to_string(&marker)?, "x");
-        let mut changed = command.clone();
-        changed.args.push("changed".into());
-        assert!(crate::invocation::run(&paths, &job, "retained", &changed).is_err());
-        changed = command.clone();
-        changed.context.as_mut().context("command context")?.value["stage"] = json!("deploy");
-        assert!(crate::invocation::run(&paths, &job, "retained", &changed).is_err());
-        let directory = crate::invocation::directory(&paths, &job, "retained")?;
-        fs::remove_file(directory.join("result.json"))?;
-        assert!(crate::invocation::run(&paths, &job, "retained", &command).is_err());
-        assert_eq!(fs::read_to_string(marker)?, "x");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn validation_recovery_requires_successful_wrapper_and_aggregate_report() -> Result<()> {
-        for exit_code in [None, Some(1), Some(0)] {
-            let (_temporary, paths, repo, base) = fixture()?;
-            let worker = worker(&paths)?;
-            let mut blocked = job(&paths, &base, "check-wrapper")?;
-            blocked.base = Some(base.clone());
-            blocked.candidate = Some(base.clone());
-            blocked.phase = Phase::Blocked;
-            blocked.stopped_phase = Some(Phase::Checking);
-            blocked.outcome = Some(Phase::Failed);
-            blocked.unresolved = true;
-            let worktree = worker.worktree(&blocked);
-            git::ensure_worktree(&paths, &repo, &worktree, &base)?;
-            let receipt = worker.directory(&blocked)?.join("validation-0.json");
-            blocked.operation = Some(Operation {
-                phase: Phase::Checking,
-                name: "validation-0".into(),
-                candidate: base.clone(),
-                result: receipt.clone(),
-                started: 1,
-            });
-            let mut passed = report(&base, &base, &[]);
-            for name in ["structure", "recognition", "cargo.metadata"] {
-                passed.required_gates.push(name.into());
-                passed.gates.push(crate::validation::GateReport {
-                    name: name.into(),
-                    class: crate::model::ResourceClass::Light,
-                    command: vec!["fixture".into()],
-                    exit_code: Some(0),
-                    timed_out: false,
-                    diagnostics: String::new(),
-                });
-            }
-            store::atomic_json(
-                &validation::receipt_path(&paths, &base, &base, false, true),
-                &passed,
-            )?;
-            worker.store.insert(&blocked)?;
-            retain_check_dispatcher(&paths, &worktree, &base, false, exit_code)?;
-            drop(worker);
-            let recovered = recover(&paths, &blocked.id.0).await;
-            if exit_code == Some(0) {
-                assert_eq!(recovered?["phase"], "preparing");
-                assert!(receipt.is_file());
-            } else {
-                assert!(recovered.is_err());
-                assert!(!receipt.exists());
-                assert_eq!(
-                    Store::open(&paths.root, false)?.job(&blocked.id.0)?.phase,
-                    Phase::Blocked
-                );
-            }
-            assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn autofix_before_requested_tests_advances_but_cannot_pass() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        for (id, state) in [
-            ("autofix-before-tests", ValidationState::Autofix),
-            ("pass-without-tests", ValidationState::Passed),
-        ] {
-            let mut job = job(&paths, &base, id)?;
-            job.base = Some(base.clone());
-            job.candidate = Some(base.clone());
-            job.phase = Phase::Checking;
-            job.options.run_tests = true;
-            let directory = worker.directory(&job)?;
-            git::ensure_worktree(&paths, &repo, &worker.worktree(&job), &base)?;
-            let receipt = directory.join("validation-0.json");
-            job.operation = Some(Operation {
-                phase: Phase::Checking,
-                name: "validation-0".into(),
-                candidate: base.clone(),
-                result: receipt.clone(),
-                started: 1,
-            });
-            let mut report = report(&base, &base, &["alpha"]);
-            report.state = state.clone();
-            let raw = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-base\n+fixed\n";
-            if state == ValidationState::Autofix {
-                let patch = directory.join("autofix.patch");
-                store::atomic_bytes(&patch, raw.as_bytes())?;
-                report.autofix_patch = Some(patch);
-            }
-            store::atomic_json(&receipt, &report)?;
-            retain_check_dispatcher(&paths, &worker.worktree(&job), &base, true, Some(0))?;
-            let mut job = worker.store.insert(&job)?;
-
-            if state == ValidationState::Autofix {
-                worker.checking(&mut job)?;
-                let saved = worker.store.job(id)?;
-                assert_eq!(saved.phase, Phase::Autofixing);
-                assert!(saved.operation.is_none());
-                assert_eq!(saved.validations.len(), 1);
-                assert!(!saved.validations[0].report.tests_run);
-                assert_eq!(saved.validations[0].patch_content.as_deref(), Some(raw));
-                assert_eq!(saved.candidate, Some(base.clone()));
-            } else {
-                let error = match worker.checking(&mut job) {
-                    Ok(()) => bail!("tests are required"),
-                    Err(error) => error,
-                };
-                assert!(error.to_string().contains("frozen tests"));
-                let saved = worker.store.job(id)?;
-                assert_eq!(saved.phase, Phase::Checking);
-                assert!(saved.operation.is_some());
-                assert!(saved.validations.is_empty());
-            }
-        }
-        assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn blocked_autofix_stop_requires_exact_completion_and_preserves_job() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let store = Store::open(&paths.root, false)?;
-        let mut blocked = job(&paths, &base, "stop-autofix")?;
-        blocked.base = Some(base.clone());
-        blocked.candidate = Some(base.clone());
-        blocked.phase = Phase::Blocked;
-        blocked.stopped_phase = Some(Phase::Checking);
-        blocked.outcome = Some(Phase::Failed);
-        blocked.outcome_message = Some("retained validation policy failure".into());
-        blocked.last_error = blocked.outcome_message.clone();
-        blocked.unresolved = true;
-        blocked.cancel_requested = true;
-        blocked.options.run_tests = true;
-        let directory = paths.job(&blocked.id.0);
-        let worktree = directory.join("worktree");
-        git::ensure_worktree(&paths, &repo, &worktree, &base)?;
-        git::advance(
-            &paths,
-            &repo,
-            &git::private_ref(&blocked.id.0, "candidate")?,
-            None,
-            &base,
-        )?;
-        let receipt = directory.join("validation-0.json");
-        blocked.operation = Some(Operation {
-            phase: Phase::Checking,
-            candidate: base.clone(),
-            name: "validation-0".into(),
-            result: receipt.clone(),
-            started: 1_700_000_002,
-        });
-        let mut blocked = store.insert(&blocked)?;
-        assert!(require_service_stoppable(&paths).is_err());
-        let output = validation::receipt_path(&paths, &base, &base, true, true);
-        let mut report = report(&base, &base, &["alpha"]);
-        report.state = ValidationState::Autofix;
-        let patch = output
-            .parent()
-            .context("validation receipt directory")?
-            .join("autofix.patch");
-        store::atomic_bytes(&patch, b"retained patch")?;
-        report.autofix_patch = Some(patch);
-        store::atomic_json(&receipt, &report)?;
-        store::atomic_json(&output, &report)?;
-        assert!(require_service_stoppable(&paths).is_err());
-
-        let mut env = paths.environment();
-        env.insert("CARGO_BUILD_JOBS".into(), "2".into());
-        let dispatcher = crate::process::CommandSpec {
-            program: paths
-                .targets()
-                .join("candidate-validator")
-                .join(base.to_string())
-                .join("debug/telete"),
-            args: vec![
-                "--state".into(),
-                paths.root.display().to_string(),
-                "internal-validate".into(),
-                "--repo".into(),
-                worktree.display().to_string(),
-                "--base".into(),
-                base.to_string(),
-                "--candidate".into(),
-                base.to_string(),
-                "--receipt".into(),
-                output.display().to_string(),
-                "--run-tests".into(),
-                "--defer-release-builds".into(),
-            ],
-            cwd: worktree.clone(),
-            env,
-            timeout_seconds: None,
-            stdin: None,
-            confined: false,
-            context: None,
-        };
-        let key = format!("validation/{base}/{base}/dispatcher-unbounded-tests-1-defer-1");
-        let record = paths
-            .root
-            .join("broker")
-            .join(format!("{}.json", key.replace('/', "_")));
-        let process = record.with_extension("process");
-        let retain = |exit_code| -> Result<()> {
-            let result = crate::process::ProcessResult {
-                start_error: None,
-                signal: None,
-                output_error: None,
-                exit_code: Some(exit_code),
-                stdout: String::new(),
-                stderr: String::new(),
-                timed_out: false,
-            };
-            store::atomic_json(
-                &record,
-                &json!({"schema":1,"key":key,"class":"supervisor","command":dispatcher,
-                    "state":"finished","owner_pid":1,"result":result}),
-            )?;
-            store::atomic_json(&process.join("request.json"), &dispatcher)?;
-            store::atomic_json(
-                &process.join("result.json"),
-                &json!({"schema":1,"request":dispatcher,"result":result}),
-            )
-        };
-        retain(1)?;
-        assert!(require_service_stoppable(&paths).is_err());
-        retain(0)?;
-        report.products = vec!["beta".into()];
-        store::atomic_json(&output, &report)?;
-        assert!(require_service_stoppable(&paths).is_err());
-        report.products = vec!["alpha".into()];
-        store::atomic_json(&output, &report)?;
-        blocked.preparation_generation = 1;
-        store.save(&mut blocked)?;
-        assert!(require_service_stoppable(&paths).is_err());
-        blocked.preparation_generation = 0;
-        store.save(&mut blocked)?;
-        fs::write(worktree.join("file.txt"), "changed source\n")?;
-        assert!(require_service_stoppable(&paths).is_err());
-        fs::write(worktree.join("file.txt"), "base\n")?;
-        store.set("paused", &false)?;
-        assert!(require_service_stoppable(&paths).is_err());
-        store.set("paused", &true)?;
-
-        let before = serde_json::to_value(store.job(&blocked.id.0)?)?;
-        let receipt_before = fs::read(&receipt)?;
-        let dispatcher_before = fs::read(process.join("result.json"))?;
-        let _resources = crate::broker::settled_guards(&paths)?;
-        let _deployment = store::lock(&paths.root.join("deployments/deployment.lock"), false)?;
-        let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
-        require_service_stoppable(&paths)?;
-        assert_eq!(serde_json::to_value(store.job(&blocked.id.0)?)?, before);
-        assert_eq!(fs::read(&receipt)?, receipt_before);
-        assert_eq!(fs::read(&output)?, receipt_before);
-        assert_eq!(fs::read(process.join("result.json"))?, dispatcher_before);
-        assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-        assert!(require_quiescent(&paths).is_err());
-        Ok(())
-    }
-
     #[test]
     fn store_preserves_cancellation_and_rejects_stale_history() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
+        let (_temporary, paths, _repo, base) = workflow_fixture(true)?;
         let store = Store::open(&paths.root, false)?;
         let queued = job(&paths, &base, "cas-fixture")?;
         let mut first = store.insert(&queued)?;
         let mut stale = first.clone();
         store.cancel(&first.id.0)?;
-        first.waiting_reason = Some("retained".into());
+        first.last_error = Some("retained".into());
         store.save(&mut first)?;
         assert!(first.cancel_requested);
-        stale.waiting_reason = Some("must not overwrite".into());
+        stale.last_error = Some("must not overwrite".into());
         assert!(store.save(&mut stale).is_err());
         assert_eq!(
-            store.job(&first.id.0)?.waiting_reason.as_deref(),
+            store.job(&first.id.0)?.last_error.as_deref(),
             Some("retained")
         );
         assert!(store.insert(&queued).is_err());
@@ -2514,9 +635,9 @@ mod tests {
 
     #[test]
     fn fresh_integration_creates_private_job_directory_before_git() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        fs::write(repo.join("file.txt"), "submitted\n")?;
-        git::value(&paths, &repo, &["add", "file.txt"])?;
+        let (_temporary, paths, repo, base) = workflow_fixture(true)?;
+        fs::write(repo.join("payload.txt"), "submitted\n")?;
+        git::value(&paths, &repo, &["add", "payload.txt"])?;
         let tree = git::value(&paths, &repo, &["write-tree"])?;
         let input = git::commit_tree(
             &paths,
@@ -2531,6 +652,7 @@ mod tests {
         let worker = worker(&paths)?;
         let mut job = job(&paths, &base, "fresh-integration")?;
         job.input = input.clone();
+        job.workflow.integrate = true;
         job.base = Some(base.clone());
         job.phase = Phase::Integrating;
         let mut job = worker.store.insert(&job)?;
@@ -2561,7 +683,7 @@ mod tests {
             Some(candidate.clone())
         );
         assert_eq!(
-            fs::read_to_string(worker.worktree(&job).join("file.txt"))?,
+            fs::read_to_string(worker.worktree(&job).join("payload.txt"))?,
             "submitted\n"
         );
         assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
@@ -2570,430 +692,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_deployment_rechecks_source_already_in_accepted_history() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        let mut ordinary = job(&paths, &base, "already-included")?;
-        ordinary.base = Some(base.clone());
-        ordinary.phase = Phase::Integrating;
-        let mut ordinary = worker.store.insert(&ordinary)?;
-        worker.integrating(&mut ordinary)?;
-        assert_eq!(ordinary.phase, Phase::AlreadyIncluded);
-
-        let mut requested = job(&paths, &base, "explicit-redeployment")?;
-        requested.base = Some(base.clone());
-        requested.phase = Phase::Integrating;
-        requested.options.deploy = vec!["alpha".into()];
-        let mut requested = worker.store.insert(&requested)?;
-        worker.integrating(&mut requested)?;
-        assert_eq!(requested.phase, Phase::Checking);
-        assert!(requested.validations.is_empty());
-        assert!(requested.preparation.is_none());
-        assert!(!requested.accepted);
-        let candidate = requested.candidate.as_ref().context("candidate")?;
-        assert_ne!(candidate, &base);
-        assert_eq!(
-            git::value(
-                &paths,
-                &repo,
-                &["rev-parse", &format!("{candidate}^{{tree}}")]
-            )?,
-            git::value(&paths, &repo, &["rev-parse", &format!("{base}^{{tree}}")])?
-        );
-        assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-        Ok(())
-    }
-
-    #[test]
-    fn settings_are_frozen_and_invalid_submission_choices_are_rejected() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let file = paths.root.join("settings-input.json");
-        fs::write(&file, br#"{"alpha":{"enabled":true}}"#)?;
-        let settings = read_settings(Some(&file))?;
-        fs::write(&file, br#"{"alpha":{"enabled":false}}"#)?;
-        assert_eq!(settings["alpha"], json!({"enabled":true}));
-        assert!(read_settings(Some(Path::new("relative.json"))).is_err());
-        fs::write(&file, b"[]")?;
-        assert!(read_settings(Some(&file)).is_err());
-        for (deploy, settings) in [
-            (Vec::new(), settings.clone()),
-            (vec!["beta".into()], settings),
-            (
-                vec!["alpha".into()],
-                BTreeMap::from([("alpha".into(), json!(true))]),
-            ),
-            (
-                vec!["decisions".into()],
-                BTreeMap::from([("decisions".into(), json!({}))]),
-            ),
-        ] {
-            assert!(
-                submit(
-                    &paths,
-                    &repo,
-                    &base.0,
-                    SubmitOptions {
-                        deploy,
-                        settings,
-                        ..SubmitOptions::default()
-                    }
-                )
-                .is_err()
-            );
-        }
-        let old = serde_json::to_value(SubmitOptions::default())?;
-        assert!(old.get("settings").is_none());
-        assert!(
-            serde_json::from_value::<SubmitOptions>(old)?
-                .settings
-                .is_empty()
-        );
-
-        let mut frozen = job(&paths, &base, "settings-frozen")?;
-        frozen.options.request_id = Some(frozen.request_id.clone());
-        frozen.options.deploy = vec!["alpha".into()];
-        frozen.options.settings = BTreeMap::from([("alpha".into(), json!({"enabled":true}))]);
-        let store = Store::open(&paths.root, false)?;
-        let frozen = store.insert(&frozen)?;
-        let joined = submit(&paths, &repo, &base.0, frozen.options.clone())?;
-        assert_eq!(joined["id"], serde_json::to_value(&frozen.id)?);
-        let mut changed = frozen.options.clone();
-        changed
-            .settings
-            .insert("alpha".into(), json!({"enabled":false}));
-        assert!(submit(&paths, &repo, &base.0, changed).is_err());
-        assert_eq!(store.job(&frozen.id.0)?.options, frozen.options);
-        Ok(())
-    }
-
-    #[test]
-    fn preparation_acknowledgement_abandons_without_replay_or_new_outcome() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let store = Store::open(&paths.root, false)?;
-        let mut blocked = job(&paths, &base, "abandon-preparation")?;
-        blocked.base = Some(base.clone());
-        blocked.candidate = Some(base.clone());
-        blocked.phase = Phase::Blocked;
-        blocked.stopped_phase = Some(Phase::Preparing);
-        blocked.outcome = Some(Phase::Failed);
-        blocked.outcome_message = Some("retained staging failure".into());
-        blocked.last_error = blocked.outcome_message.clone();
-        blocked.unresolved = true;
-        blocked.operation = Some(Operation {
-            phase: Phase::Preparing,
-            candidate: base.clone(),
-            name: "production-0".into(),
-            result: paths.job(&blocked.id.0).join("production-0.json"),
-            started: 1_700_000_002,
-        });
-        let blocked = store.insert(&blocked)?;
-        let directory = paths.job(&blocked.id.0);
-        git::ensure_worktree(&paths, &repo, &directory.join("worktree"), &base)?;
-        store.set("paused", &false)?;
-        assert!(acknowledge_preparation(&paths, &blocked.id.0).is_err());
-        store.set("paused", &true)?;
-        let active_child = store::lock(&paths.root.join("worker.lock"), false)?;
-        assert!(acknowledge_preparation(&paths, &blocked.id.0).is_err());
-        drop(active_child);
-
-        acknowledge_preparation(&paths, &blocked.id.0)?;
-        let settled = store.job(&blocked.id.0)?;
-        assert_eq!(settled.phase, Phase::Failed);
-        assert!(!settled.unresolved);
-        assert!(settled.operation.is_none());
-        assert_eq!(settled.last_error, blocked.last_error);
-        assert_eq!(settled.outcome_message, blocked.outcome_message);
-        assert_eq!(settled.cleanup.state, "removed");
-        assert!(directory.join("production-0.acknowledged.json").is_file());
-        assert!(!directory.join("production-0.json").exists());
-        assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-        acknowledge_preparation(&paths, &blocked.id.0)?;
-        assert_eq!(store.job(&blocked.id.0)?.revision, settled.revision);
-        Ok(())
-    }
-
-    #[test]
-    fn blocked_validation_without_missing_intent_keeps_ordinary_cancellation() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        let store = Store::open(&paths.root, false)?;
-        for (id, receipt) in [("no-operation", false), ("completed-report", true)] {
-            let mut blocked = job(&paths, &base, id)?;
-            blocked.base = Some(base.clone());
-            blocked.candidate = Some(base.clone());
-            blocked.phase = Phase::Blocked;
-            blocked.stopped_phase = Some(Phase::Checking);
-            blocked.outcome = Some(Phase::Failed);
-            blocked.unresolved = true;
-            if receipt {
-                let result = paths.job(id).join("validation-0.json");
-                store::atomic_json(&result, &report(&base, &base, &[]))?;
-                blocked.operation = Some(Operation {
-                    phase: Phase::Checking,
-                    name: "validation-0".into(),
-                    candidate: base.clone(),
-                    result,
-                    started: 1,
-                });
-            }
-            store.insert(&blocked)?;
-            cancel(&paths, id)?;
-            let retained = store.job(id)?;
-            assert!(retained.cancel_requested);
-            assert_eq!(retained.phase, Phase::Blocked);
-            assert!(retained.unresolved);
-            assert_eq!(
-                serde_json::to_value(retained.operation)?,
-                serde_json::to_value(blocked.operation)?
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn timed_out_validation_cancellation_requires_settled_evidence_and_preserves_failure()
-    -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let store = Store::open(&paths.root, false)?;
-        let mut blocked = job(&paths, &base, "cancel-validation")?;
-        blocked.base = Some(base.clone());
-        blocked.candidate = Some(base.clone());
-        blocked.phase = Phase::Blocked;
-        blocked.stopped_phase = Some(Phase::Checking);
-        blocked.outcome = Some(Phase::Failed);
-        blocked.outcome_message = Some("retained validator timeout".into());
-        blocked.last_error = blocked.outcome_message.clone();
-        blocked.unresolved = true;
-        blocked.options.run_tests = true;
-        let directory = paths.job(&blocked.id.0);
-        let worktree = directory.join("worktree");
-        git::ensure_worktree(&paths, &repo, &worktree, &base)?;
-        git::advance(
-            &paths,
-            &repo,
-            &git::private_ref(&blocked.id.0, "candidate")?,
-            None,
-            &base,
-        )?;
-        blocked.operation = Some(Operation {
-            phase: Phase::Checking,
-            candidate: base.clone(),
-            name: "validation-0".into(),
-            result: directory.join("validation-0.json"),
-            started: 1_700_000_002,
-        });
-        let blocked = store.insert(&blocked)?;
-        let output = validation::receipt_path(&paths, &base, &base, true, true);
-        let mut env = paths.environment();
-        env.insert("CARGO_BUILD_JOBS".into(), "2".into());
-        let dispatcher = crate::process::CommandSpec {
-            program: paths
-                .targets()
-                .join("candidate-validator")
-                .join(base.to_string())
-                .join("debug/telete"),
-            args: vec![
-                "--state".into(),
-                paths.root.display().to_string(),
-                "internal-validate".into(),
-                "--repo".into(),
-                worktree.display().to_string(),
-                "--base".into(),
-                base.to_string(),
-                "--candidate".into(),
-                base.to_string(),
-                "--receipt".into(),
-                output.display().to_string(),
-                "--run-tests".into(),
-                "--defer-release-builds".into(),
-            ],
-            cwd: worktree.clone(),
-            env,
-            timeout_seconds: Some(1800),
-            stdin: None,
-            confined: false,
-            context: None,
-        };
-        let retain = |key: &str,
-                      command: &crate::process::CommandSpec,
-                      class: crate::broker::ResourceClass,
-                      result: Option<crate::process::ProcessResult>|
-         -> Result<PathBuf> {
-            let stem = key.replace('/', "_");
-            let record = paths.root.join("broker").join(format!("{stem}.json"));
-            store::atomic_json(
-                &record,
-                &json!({"schema":1,"key":key,"class":class,"command":command,
-                    "state":if result.is_some(){"finished"}else{"running"},
-                    "owner_pid":1,"result":result}),
-            )?;
-            let process = record.with_extension("process");
-            store::atomic_json(&process.join("request.json"), command)?;
-            if let Some(result) = result {
-                store::atomic_json(
-                    &process.join("result.json"),
-                    &json!({"schema":1,"request":command,"result":result}),
-                )?;
-            }
-            Ok(process)
-        };
-        let key = format!("validation/{base}/{base}/dispatcher-tests-1-defer-1");
-        let complete = crate::process::ProcessResult {
-            start_error: None,
-            signal: None,
-            output_error: None,
-            exit_code: Some(0),
-            stdout: String::new(),
-            stderr: String::new(),
-            timed_out: false,
-        };
-        retain(
-            &key,
-            &dispatcher,
-            crate::broker::ResourceClass::Supervisor,
-            Some(complete.clone()),
-        )?;
-        assert!(cancel(&paths, &blocked.id.0).is_err());
-        assert!(!store.job(&blocked.id.0)?.cancel_requested);
-        let timeout = crate::process::ProcessResult {
-            start_error: None,
-            signal: None,
-            output_error: None,
-            exit_code: None,
-            timed_out: true,
-            ..complete.clone()
-        };
-        let dispatcher_process = retain(
-            &key,
-            &dispatcher,
-            crate::broker::ResourceClass::Supervisor,
-            Some(timeout),
-        )?;
-        let retained_dispatcher = fs::read(dispatcher_process.join("result.json"))?;
-        let child_key = format!("validation/{base}/{base}/rust.tests");
-        let child = retain(
-            &child_key,
-            &dispatcher,
-            crate::broker::ResourceClass::Heavy,
-            None,
-        )?;
-        assert!(cancel(&paths, &blocked.id.0).is_err());
-        store::atomic_json(
-            &child.join("result.json"),
-            &json!({"schema":1,"request":dispatcher,"result":complete}),
-        )?;
-        let resource = store::lock(&paths.root.join("broker/slot-heavy-0.lock"), false)?;
-        assert!(cancel(&paths, &blocked.id.0).is_err());
-        drop(resource);
-        let deployment = store::lock(&paths.root.join("deployments/deployment.lock"), false)?;
-        assert!(cancel(&paths, &blocked.id.0).is_err());
-        drop(deployment);
-        store.set("paused", &false)?;
-        assert!(cancel(&paths, &blocked.id.0).is_err());
-        store.set("paused", &true)?;
-        fs::write(worktree.join("file.txt"), "changed source\n")?;
-        assert!(cancel(&paths, &blocked.id.0).is_err());
-        fs::write(worktree.join("file.txt"), "base\n")?;
-        // A blocked worker can remain loaded; settled child ownership is required.
-        let blocked_worker = store::lock(&paths.root.join("worker.lock"), false)?;
-        cancel(&paths, &blocked.id.0)?;
-        drop(blocked_worker);
-        let settled = store.job(&blocked.id.0)?;
-        assert_eq!(settled.phase, Phase::Cancelled);
-        assert!(settled.cancel_requested);
-        assert!(!settled.unresolved);
-        assert!(settled.operation.is_none());
-        assert_eq!(settled.outcome, blocked.outcome);
-        assert_eq!(settled.outcome_message, blocked.outcome_message);
-        assert_eq!(settled.last_error, blocked.last_error);
-        let record: ValidationAbandonment =
-            serde_json::from_slice(&fs::read(directory.join("validation-0.abandoned.json"))?)?;
-        assert_eq!(
-            serde_json::to_value(record.operation)?,
-            serde_json::to_value(&blocked.operation)?
-        );
-        assert_eq!(
-            fs::read(dispatcher_process.join("result.json"))?,
-            retained_dispatcher
-        );
-        assert!(!output.exists());
-        assert!(!directory.join("validation-0.json").exists());
-        assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-        assert!(require_quiescent(&paths).is_ok());
-        cancel(&paths, &blocked.id.0)?;
-        assert_eq!(store.job(&blocked.id.0)?.revision, settled.revision);
-        Ok(())
-    }
-
-    #[test]
-    fn production_and_deployment_scope_preserve_explicit_intent() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "scope-fixture")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        git::ensure_worktree(&paths, &repo, &worker.worktree(&job), &base)?;
-        job.validations.push(Validation {
-            report: report(&base, &base, &["alpha", "telete"]),
-            diagnostics: paths.job(&job.id.0).join("diagnostics"),
-            stamp: 1,
-            patch_content: None,
-            fixed_candidate: None,
-        });
-        job.options.deploy = vec!["beta".into()];
-        assert_eq!(
-            worker.production_products(&job)?,
-            vec!["alpha", "beta", "telete"]
-        );
-        assert_eq!(worker.deployment_products(&job)?, vec!["beta"]);
-        job.options.no_deploy = true;
-        assert_eq!(
-            worker.production_products(&job)?,
-            vec!["alpha", "beta", "telete"]
-        );
-        assert!(worker.deployment_products(&job)?.is_empty());
-        job.options.no_deploy = false;
-        job.options.deploy.clear();
-        assert_eq!(worker.deployment_products(&job)?, vec!["alpha"]);
-        job.validations
-            .last_mut()
-            .context("validation")?
-            .report
-            .products = vec!["decisions".into()];
-        assert_eq!(worker.production_products(&job)?, vec!["krisis"]);
-        assert_eq!(worker.deployment_products(&job)?, vec!["krisis"]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn missing_validation_completion_blocks_and_cannot_be_replayed() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "lost-validator")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        job.phase = Phase::Checking;
-        let directory = worker.directory(&job)?;
-        job.operation = Some(Operation {
-            phase: Phase::Checking,
-            name: "validation-0".into(),
-            candidate: base.clone(),
-            result: directory.join("validation-0.json"),
-            started: 1,
-        });
-        worker.store.insert(&job)?;
-        drop(worker);
-        let result = worker_once(&paths).await?;
-        assert_eq!(result["phase"], "blocked");
-        assert_eq!(result["unresolved"], true);
-        assert!(recover(&paths, "lost-validator").await.is_err());
-        assert_eq!(status(&paths, Some("lost-validator"))?["phase"], "blocked");
-        Ok(())
-    }
-
-    #[test]
     fn cleanup_removes_only_settled_private_worktree_and_registration() -> Result<()> {
-        let (_temporary, paths, repo, base) = fixture()?;
+        let (_temporary, paths, repo, base) = workflow_fixture(true)?;
         let worker = worker(&paths)?;
         let mut job = job(&paths, &base, "cleanup-fixture")?;
         job.base = Some(base.clone());
@@ -3021,25 +721,8 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_requires_paused_and_settled_queue() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        assert!(require_quiescent(&paths).is_ok());
-        let store = Store::open(&paths.root, false)?;
-        store.set("paused", &false)?;
-        assert!(require_quiescent(&paths).is_err());
-        store.set("paused", &true)?;
-        let queued = job(&paths, &base, "maintenance-fixture")?;
-        store.insert(&queued)?;
-        assert!(require_quiescent(&paths).is_err());
-        drop(store);
-        cancel(&paths, &queued.id.0)?;
-        assert!(require_quiescent(&paths).is_ok());
-        Ok(())
-    }
-
-    #[test]
     fn maintenance_drain_keeps_active_operations_visible() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
+        let (_temporary, paths, _repo, base) = workflow_fixture(true)?;
         let store = Store::open(&paths.root, false)?;
         let mut active = job(&paths, &base, "drain-fixture")?;
         active.phase = Phase::Preparing;
@@ -3054,179 +737,5 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn recovery_reads_completed_preparation_without_repeating_it() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "prepared-fixture")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        job.phase = Phase::Blocked;
-        job.stopped_phase = Some(Phase::Preparing);
-        job.unresolved = true;
-        job.outcome = Some(Phase::Failed);
-        job.validations.push(Validation {
-            report: report(&base, &base, &[]),
-            diagnostics: paths.job(&job.id.0).join("diagnostics"),
-            stamp: 1,
-            patch_content: None,
-            fixed_candidate: None,
-        });
-        let directory = worker.directory(&job)?;
-        let receipt = directory.join("production-0.json");
-        job.operation = Some(Operation {
-            phase: Phase::Preparing,
-            name: "production-0".into(),
-            candidate: base.clone(),
-            result: receipt.clone(),
-            started: 1,
-        });
-        let prepared = Preparation {
-            schema: 1,
-            source: base.clone(),
-            products: Vec::new(),
-            signing_policy: job.policy.signing()?.clone(),
-            candidates: BTreeMap::new(),
-            release_check: true,
-        };
-        store::atomic_json(&directory.join("production-0/result.json"), &prepared)?;
-        worker.store.insert(&job)?;
-        drop(worker);
-        let recovered = recover(&paths, &job.id.0).await?;
-        assert_eq!(recovered["phase"], "accepting");
-        assert_eq!(recovered["unresolved"], false);
-        assert_eq!(recovered["preparation_generation"], 1);
-        let retained: PreparationOutcome = serde_json::from_slice(&fs::read(receipt)?)?;
-        assert_eq!(
-            retained.prepared.context("recovered preparation")?,
-            prepared
-        );
-        assert!(retained.compilation_failure.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn cell_preparation_command_requires_the_exact_retained_operation() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "cell-preparation-command")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        job.phase = Phase::Preparing;
-        job.validations.push(Validation {
-            report: report(&base, &base, &[]),
-            diagnostics: paths.job(&job.id.0).join("diagnostics"),
-            stamp: 1,
-            patch_content: None,
-            fixed_candidate: None,
-        });
-        let directory = worker.directory(&job)?;
-        let receipt = directory.join("production-0.json");
-        job.operation = Some(Operation {
-            phase: Phase::Preparing,
-            name: "production-0".into(),
-            candidate: base.clone(),
-            result: receipt.clone(),
-            started: 1,
-        });
-        worker.store.insert(&job)?;
-        let command = cell_pipeline::preparation_command(&paths, &job)?;
-        assert_eq!(command.program, std::env::current_exe()?);
-        assert_eq!(command.cwd, worker.worktree(&job));
-        assert_eq!(command.timeout_seconds, None);
-        assert!(!command.confined);
-        assert_eq!(
-            command.args,
-            vec![
-                "--state".to_owned(),
-                paths.root.display().to_string(),
-                "internal-cell-prepare".to_owned(),
-                "--job".to_owned(),
-                job.id.to_string(),
-                "--generation".to_owned(),
-                "0".to_owned(),
-                "--candidate".to_owned(),
-                base.to_string(),
-            ]
-        );
-        assert!(cell_pipeline::execute_prepare(&paths, &job.id.0, 1, &base).is_err());
-        let other = CommitId::new("b".repeat(40))?;
-        assert!(cell_pipeline::execute_prepare(&paths, &job.id.0, 0, &other).is_err());
-        assert!(!receipt.try_exists()?);
-        cell_pipeline::execute_prepare(&paths, &job.id.0, 0, &base)?;
-        let bytes = fs::read(&receipt)?;
-        let outcome: PreparationOutcome = serde_json::from_slice(&bytes)?;
-        assert_eq!(outcome.prepared.context("prepared outcome")?.source, base);
-        assert!(outcome.compilation_failure.is_none());
-        assert!(cell_pipeline::execute_prepare(&paths, &job.id.0, 0, &base).is_err());
-        assert_eq!(fs::read(receipt)?, bytes);
-        assert_eq!(worker.store.job(&job.id.0)?.phase, Phase::Preparing);
-        assert_eq!(
-            git::ref_value(&paths, &worker.config.repository, git::ACCEPTED)?,
-            Some(base)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cell_deployment_command_requires_the_exact_accepted_request() -> Result<()> {
-        let (_temporary, paths, _repo, base) = fixture()?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "cell-deployment-command")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        job.phase = Phase::Deploying;
-        job.accepted = true;
-        let request_id = "cell-deployment-fixture";
-        job.deployment_request = Some(DeploymentRequest {
-            id: request_id.into(),
-            source: base.clone(),
-            products: vec!["alpha".into()],
-            prepared: Preparation {
-                schema: 1,
-                source: base.clone(),
-                products: vec!["alpha".into()],
-                signing_policy: job.policy.signing()?.clone(),
-                candidates: BTreeMap::new(),
-                release_check: true,
-            },
-        });
-        let mut job = worker.store.insert(&job)?;
-        let command = cell_pipeline::deployment_command(&paths, &job)?;
-        assert_eq!(command.program, std::env::current_exe()?);
-        assert_eq!(command.cwd, worker.worktree(&job));
-        assert_eq!(command.timeout_seconds, None);
-        assert!(!command.confined);
-        assert_eq!(
-            command.args,
-            vec![
-                "--state".to_owned(),
-                paths.root.display().to_string(),
-                "internal-cell-deploy".to_owned(),
-                "--job".to_owned(),
-                job.id.to_string(),
-                "--request-id".to_owned(),
-                request_id.to_owned(),
-                "--candidate".to_owned(),
-                base.to_string(),
-            ]
-        );
-        assert!(cell_pipeline::execute_deploy(&paths, &job.id.0, "other-request", &base).is_err());
-        let other = CommitId::new("b".repeat(40))?;
-        assert!(cell_pipeline::execute_deploy(&paths, &job.id.0, request_id, &other).is_err());
-        job.accepted = false;
-        worker.store.save(&mut job)?;
-        assert!(cell_pipeline::execute_deploy(&paths, &job.id.0, request_id, &base).is_err());
-        job.accepted = true;
-        job.options.no_deploy = true;
-        worker.store.save(&mut job)?;
-        assert!(cell_pipeline::execute_deploy(&paths, &job.id.0, request_id, &base).is_err());
-        assert!(!paths.root.join("deployments/index.json").try_exists()?);
-        assert_eq!(worker.store.job(&job.id.0)?.phase, Phase::Deploying);
-        Ok(())
-    }
-
     include!("workflow_tests.rs");
-    include!("bootstrap_cancel_tests.rs");
-    include!("preparation_stop_tests.rs");
 }

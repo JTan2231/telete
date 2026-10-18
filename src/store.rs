@@ -1,5 +1,6 @@
 //! Private durable queue records.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -10,12 +11,10 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::deployment::{DeploymentResult, Preparation};
-use crate::manager::{Policy, SubmitOptions};
 use crate::model::{CommitId, JobId};
-use crate::validation::ValidationReport;
+use crate::workflow::{StageRun, Workflow};
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const APPLICATION: u32 = 0x5445_4c45;
 
 pub(crate) fn now() -> u64 {
@@ -70,38 +69,12 @@ pub(crate) fn lock(path: &Path, blocking: bool) -> Result<crate::paths::FileLock
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub project: bool,
-    /// A derived binding for new local project queues. Absence retains Cell storage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<PathBuf>,
+    pub state_root: PathBuf,
     pub repository: PathBuf,
     pub common_git_dir: PathBuf,
-    #[serde(default)]
     pub accepted_baseline: Option<CommitId>,
-}
-
-impl Config {
-    pub(crate) fn local_workspace(&self, state: &Path) -> Result<bool> {
-        let Some(workspace) = &self.workspace else {
-            return Ok(false);
-        };
-        ensure!(self.project, "Cell queues cannot select a local workspace");
-        ensure!(
-            crate::paths::normalized_absolute(workspace) && workspace == state,
-            "retained local workspace must equal the selected normalized state path"
-        );
-        Ok(true)
-    }
-
-    pub(crate) fn accepted_ref(&self) -> &'static str {
-        if self.project {
-            crate::git::PROJECT_ACCEPTED
-        } else {
-            crate::git::ACCEPTED
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -110,7 +83,6 @@ pub(crate) enum Phase {
     Queued,
     Integrating,
     Checking,
-    Autofixing,
     Preparing,
     Accepting,
     Deploying,
@@ -118,22 +90,17 @@ pub(crate) enum Phase {
     Succeeded,
     Failed,
     Cancelled,
-    AlreadyIncluded,
 }
 
 impl Phase {
     pub(crate) fn terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::AlreadyIncluded
-        )
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Integrating => "integrating",
             Self::Checking => "checking",
-            Self::Autofixing => "autofixing",
             Self::Preparing => "preparing",
             Self::Accepting => "accepting",
             Self::Deploying => "deploying",
@@ -141,12 +108,12 @@ impl Phase {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::AlreadyIncluded => "already_included",
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Operation {
     pub phase: Phase,
     pub name: String,
@@ -156,23 +123,7 @@ pub(crate) struct Operation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Validation {
-    pub report: ValidationReport,
-    pub diagnostics: PathBuf,
-    pub stamp: u64,
-    pub patch_content: Option<String>,
-    pub fixed_candidate: Option<CommitId>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct DeploymentRequest {
-    pub id: String,
-    pub source: CommitId,
-    pub products: Vec<String>,
-    pub prepared: Preparation,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Cleanup {
     pub state: String,
     pub registration: Option<PathBuf>,
@@ -194,6 +145,7 @@ impl Default for Cleanup {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 // Persist orthogonal facts independently of the phase: cancellation, acceptance,
 // and uncertain operations can coexist and must survive recovery.
 pub(crate) struct Job {
@@ -206,25 +158,17 @@ pub(crate) struct Job {
     pub created: u64,
     pub updated: u64,
     pub input: CommitId,
-    pub options: SubmitOptions,
-    pub policy: Policy,
+    pub workflow: Workflow,
+    pub environment: BTreeMap<String, String>,
     pub base: Option<CommitId>,
     pub candidate: Option<CommitId>,
-    #[serde(default)]
     pub accepted: bool,
-    pub validations: Vec<Validation>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workflow_runs: Vec<crate::workflow::StageRun>,
-    pub preparation: Option<Preparation>,
-    pub preparation_generation: u64,
-    pub deployment_request: Option<DeploymentRequest>,
-    pub deployment_result: Option<DeploymentResult>,
+    pub runs: Vec<StageRun>,
     pub operation: Option<Operation>,
     pub outcome: Option<Phase>,
     pub outcome_message: Option<String>,
     pub stopped_phase: Option<Phase>,
     pub unresolved: bool,
-    pub waiting_reason: Option<String>,
     pub last_error: Option<String>,
     pub cleanup: Cleanup,
 }
@@ -232,61 +176,58 @@ pub(crate) struct Job {
 impl Job {
     pub(crate) fn output(&self) -> Result<serde_json::Value> {
         let mut value = serde_json::to_value(self)?;
-        if let Some(workflow) = &self.options.workflow {
-            value["stages"] = serde_json::Value::Array(
-                [
-                    ("integrate", workflow.integrate, Phase::Integrating),
-                    ("check", true, Phase::Checking),
-                    ("prepare", workflow.prepare.is_some(), Phase::Preparing),
-                    ("accept", workflow.accept, Phase::Accepting),
-                    ("deploy", workflow.deploy.is_some(), Phase::Deploying),
-                ]
-                .into_iter()
-                .map(|(stage, requested, phase)| {
-                    let run = self.workflow_runs.iter().rev().find(|run| {
-                        run.stage == stage && self.candidate.as_ref() == Some(&run.candidate)
-                    });
-                    let active = self
-                        .operation
-                        .as_ref()
-                        .is_some_and(|operation| operation.phase == phase)
-                        || self.phase == phase;
-                    let stopped = self.stopped_phase == Some(phase);
-                    let status = if !requested {
-                        "not_requested"
-                    } else if stage == "integrate"
-                        && self.candidate.is_some()
-                        && self.base.is_some()
-                        || stage == "accept" && self.accepted
-                    {
+        let workflow = &self.workflow;
+        value["stages"] = serde_json::Value::Array(
+            [
+                ("integrate", workflow.integrate, Phase::Integrating),
+                ("check", true, Phase::Checking),
+                ("prepare", workflow.prepare.is_some(), Phase::Preparing),
+                ("accept", workflow.accept, Phase::Accepting),
+                ("deploy", workflow.deploy.is_some(), Phase::Deploying),
+            ]
+            .into_iter()
+            .map(|(stage, requested, phase)| {
+                let run = self.runs.iter().rev().find(|run| {
+                    run.stage == stage && self.candidate.as_ref() == Some(&run.candidate)
+                });
+                let active = self
+                    .operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.phase == phase)
+                    || self.phase == phase;
+                let stopped = self.stopped_phase == Some(phase);
+                let status = if !requested {
+                    "not_requested"
+                } else if stage == "integrate" && self.candidate.is_some() && self.base.is_some()
+                    || stage == "accept" && self.accepted
+                {
+                    "succeeded"
+                } else if let Some(run) = run {
+                    if run.result.success() {
                         "succeeded"
-                    } else if let Some(run) = run {
-                        if run.result.success() {
-                            "succeeded"
-                        } else {
-                            "failed"
-                        }
-                    } else if (active || stopped) && self.unresolved {
-                        "unresolved"
-                    } else if stopped && self.outcome == Some(Phase::Failed) {
-                        "failed"
-                    } else if active {
-                        "running"
-                    } else if self.phase.terminal() || self.outcome.is_some() {
-                        "not_run"
                     } else {
-                        "pending"
-                    };
-                    serde_json::json!({
-                        "stage": stage,
-                        "status": status,
-                        "candidate": self.candidate,
-                        "operation": run.map(|run| &run.operation),
-                    })
+                        "failed"
+                    }
+                } else if (active || stopped) && self.unresolved {
+                    "unresolved"
+                } else if stopped && self.outcome == Some(Phase::Failed) {
+                    "failed"
+                } else if active {
+                    "running"
+                } else if self.phase.terminal() || self.outcome.is_some() {
+                    "not_run"
+                } else {
+                    "pending"
+                };
+                serde_json::json!({
+                    "stage": stage,
+                    "status": status,
+                    "candidate": self.candidate,
+                    "operation": run.map(|run| &run.operation),
                 })
-                .collect(),
-            );
-        }
+            })
+            .collect(),
+        );
         Ok(value)
     }
 }
@@ -306,8 +247,8 @@ fn row_u64(row: &rusqlite::Row<'_>, name: &str) -> rusqlite::Result<u64> {
     })
 }
 
-/// Read only the retained layout selection before path initialization. Do not
-/// use `Store::open(false)`: that applies write pragmas and may create sidecars.
+/// Inspect retained state before initializing directories. Reading must not
+/// apply writable `SQLite` pragmas or create journal sidecars.
 pub(crate) fn probe_config(root: &Path) -> Result<Option<Config>> {
     if !crate::paths::private_directory_exists(root)? {
         return Ok(None);
@@ -321,7 +262,7 @@ pub(crate) fn probe_config(root: &Path) -> Result<Option<Config>> {
     ensure!(
         metadata.is_file()
             && !metadata.file_type().is_symlink()
-            && metadata.uid() == crate::host_setup::uid()
+            && metadata.uid() == rustix::process::getuid().as_raw()
             && metadata.mode() & 0o777 == 0o600,
         "queue database must be a private user-owned regular file"
     );
@@ -575,17 +516,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_config_keeps_its_accepted_baseline_and_generic_config_can_omit_it() -> Result<()> {
-        let baseline = "a".repeat(40);
-        let legacy: Config = serde_json::from_value(serde_json::json!({
-            "repository": "/repository", "common_git_dir": "/repository/.git",
-            "accepted_baseline": baseline,
-        }))?;
-        assert_eq!(legacy.accepted_baseline, Some(CommitId::new(baseline)?));
-        let generic: Config = serde_json::from_value(serde_json::json!({
-            "repository": "/repository", "common_git_dir": "/repository/.git",
-        }))?;
-        assert!(generic.accepted_baseline.is_none());
+    fn config_requires_explicit_state_binding_and_rejects_unknown_fields() -> Result<()> {
+        let value = serde_json::json!({
+            "state_root": "/state", "repository": "/repository",
+            "common_git_dir": "/repository/.git", "accepted_baseline": null,
+        });
+        let config: Config = serde_json::from_value(value.clone())?;
+        assert_eq!(config.state_root, PathBuf::from("/state"));
+        assert!(config.accepted_baseline.is_none());
+        let mut missing = value.clone();
+        missing
+            .as_object_mut()
+            .context("configuration object")?
+            .remove("state_root");
+        assert!(serde_json::from_value::<Config>(missing).is_err());
+        let mut unknown = value;
+        unknown["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Config>(unknown).is_err());
         Ok(())
     }
 
