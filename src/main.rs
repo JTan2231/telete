@@ -8,7 +8,7 @@ mod process;
 mod store;
 mod workflow;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -19,9 +19,9 @@ use std::path::PathBuf;
     about = "Committed-source CI for repository workflows"
 )]
 struct Cli {
-    /// Absolute private directory for the queue and its working files.
-    #[arg(long)]
-    state: PathBuf,
+    /// Project JSON configuration. Relative paths are allowed.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -30,23 +30,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a paused queue, optionally with an accepted-source baseline.
-    Init {
-        #[arg(long)]
-        repo: PathBuf,
-        #[arg(long)]
-        accepted_baseline: Option<String>,
-    },
-    /// Freeze committed source and workflow commands for a new job.
+    /// Run an exact committed revision using the selected project configuration.
     Submit {
-        commit: String,
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        #[arg(long)]
-        request_id: Option<String>,
-        /// Freeze commands and parameters from an absolute JSON file.
-        #[arg(long)]
-        workflow: PathBuf,
+        #[arg(default_value = "HEAD")]
+        revision: String,
     },
     Status {
         job: Option<String>,
@@ -77,6 +64,8 @@ enum Command {
     Gates,
     #[command(hide = true)]
     InternalExecute {
+        #[arg(long)]
+        state: PathBuf,
         #[arg(long)]
         directory: PathBuf,
     },
@@ -123,26 +112,26 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> Result<serde_json::Value> {
-    let paths = paths::Paths::selected(cli.state, matches!(cli.command, Command::Init { .. }))?;
+    if let Command::InternalExecute { state, directory } = &cli.command {
+        let paths = paths::Paths::selected(state.clone(), false)?;
+        process::execute_request(&paths, directory)?;
+        return Ok(serde_json::json!({"state":"completed"}));
+    }
+    let project = workflow::read(cli.config.as_deref().context("--config is required")?)?;
+    let create = !matches!(
+        cli.command,
+        Command::Status { .. }
+            | Command::Wait { .. }
+            | Command::Gates
+            | Command::Maintenance {
+                command: Maintenance::Status
+            }
+    );
+    let paths = manager::select(&project, create)?;
     match cli.command {
-        Command::Init {
-            repo,
-            accepted_baseline,
-        } => manager::init(&paths, &repo, accepted_baseline.as_deref()),
-        Command::Submit {
-            commit,
-            repo,
-            request_id,
-            workflow,
-        } => manager::submit(
-            &paths,
-            &repo,
-            &commit,
-            manager::SubmitOptions {
-                request_id,
-                workflow: workflow::read(&workflow)?,
-            },
-        ),
+        Command::Submit { revision } => {
+            manager::submit(&paths, &project.repo, &revision, project.workflow)
+        }
         Command::Status { job } => manager::status(&paths, job.as_deref()),
         Command::Wait { job, timeout } => manager::wait(&paths, &job, timeout).await,
         Command::Pause => manager::pause(&paths),
@@ -163,9 +152,56 @@ async fn execute(cli: Cli) -> Result<serde_json::Value> {
             Maintenance::Release { owner } => manager::maintenance_release(&paths, &owner),
         },
         Command::Gates => broker::status(&paths),
-        Command::InternalExecute { directory } => {
-            process::execute_request(&paths, &directory)?;
-            Ok(serde_json::json!({"state":"completed"}))
+        Command::InternalExecute { .. } => unreachable!("handled before config selection"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_defaults_to_head_and_uses_only_config_selection() {
+        let cli = Cli::try_parse_from(["telete", "--config", "ci/workflow.json", "submit"])
+            .expect("config and submit parse");
+        assert!(matches!(cli.command, Command::Submit { revision } if revision == "HEAD"));
+        for args in [
+            vec!["telete", "--state", "/tmp/state", "submit"],
+            vec!["telete", "--config", "telete.json", "init"],
+            vec!["telete", "--config", "telete.json", "submit", "--repo", "."],
+            vec![
+                "telete",
+                "--config",
+                "telete.json",
+                "submit",
+                "--workflow",
+                "workflow.json",
+            ],
+            vec![
+                "telete",
+                "--config",
+                "telete.json",
+                "submit",
+                "--request-id",
+                "key",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn supervisor_can_execute_without_config() {
+        let cli = Cli::try_parse_from([
+            "telete",
+            "internal-execute",
+            "--state",
+            "/tmp/state",
+            "--directory",
+            "/tmp/request",
+        ])
+        .expect("internal execution needs only its own arguments");
+        assert!(cli.config.is_none());
+        assert!(matches!(cli.command, Command::InternalExecute { .. }));
     }
 }

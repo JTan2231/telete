@@ -10,17 +10,4 @@ fi
 if [ "$#" -eq 0 ]; then
     exec "$binary" --help
 fi
-command=$1
-shift
-case "$command" in
-    init)
-        exec "$binary" --state "$repo/.telete" init --repo "$repo" "$@"
-        ;;
-    submit)
-        exec "$binary" --state "$repo/.telete" submit "$@" --repo "$repo" \
-            --workflow "$repo/ci/workflow.json"
-        ;;
-    *)
-        exec "$binary" --state "$repo/.telete" "$command" "$@"
-        ;;
-esac
+exec "$binary" --config "$repo/ci/workflow.json" "$@"

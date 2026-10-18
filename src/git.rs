@@ -1,4 +1,4 @@
-//! Git owns merge and patch interpretation. Telete owns only its private refs.
+//! Committed-source selection and temporary private worktrees.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,8 +9,6 @@ use anyhow::{Context, Result, ensure};
 use crate::model::CommitId;
 use crate::paths::Paths;
 use crate::process::{self, CommandSpec, ProcessResult};
-
-pub(crate) const ACCEPTED: &str = "refs/telete/accepted";
 
 pub(crate) fn run(
     paths: &Paths,
@@ -31,11 +29,17 @@ pub(crate) fn run(
         repo.display().to_string(),
     ];
     arguments.extend_from_slice(args);
-    let mut environment = paths.environment();
+    let mut environment = BTreeMap::new();
     environment.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
     environment.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
     environment.extend(extra);
-    process::run(
+    // Ambient repository selectors must not override the configured project.
+    // Workflow commands still inherit their ordinary environment.
+    let removed = std::env::vars_os()
+        .filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_"))
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    process::run_without(
         paths,
         &CommandSpec {
             program: PathBuf::from("/usr/bin/git"),
@@ -44,9 +48,9 @@ pub(crate) fn run(
             env: environment,
             timeout_seconds: Some(120),
             stdin,
-            confined: false,
             context: None,
         },
+        &removed,
     )
 }
 
@@ -94,24 +98,14 @@ pub(crate) fn repository(paths: &Paths, repo: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(value(paths, repo, &["rev-parse", "--show-toplevel"])?).canonicalize()?)
 }
 
-pub(crate) fn private_ref(job: &str, name: &str) -> Result<String> {
-    ensure!(
-        !job.is_empty()
-            && job
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-        "invalid private Git job identity"
-    );
-    ensure!(
-        ["input", "candidate"].contains(&name),
-        "invalid private Git ref kind"
-    );
-    Ok(format!("refs/telete/jobs/{job}/{name}"))
+pub(crate) fn private_ref(job: &str) -> Result<String> {
+    crate::model::JobId::new(job)?;
+    Ok(format!("refs/telete/jobs/{job}"))
 }
 
 pub(crate) fn ref_value(paths: &Paths, repo: &Path, reference: &str) -> Result<Option<CommitId>> {
     ensure!(
-        reference == ACCEPTED || reference.starts_with("refs/telete/jobs/"),
+        reference.starts_with("refs/telete/jobs/"),
         "Telete cannot read another manager's refs"
     );
     let result = run(
@@ -137,7 +131,7 @@ pub(crate) fn advance(
     new: &CommitId,
 ) -> Result<()> {
     ensure!(
-        reference == ACCEPTED || reference.starts_with("refs/telete/jobs/"),
+        reference.starts_with("refs/telete/jobs/"),
         "Telete cannot mutate another manager's refs"
     );
     let observed = ref_value(paths, repo, reference)?;
@@ -162,25 +156,16 @@ pub(crate) fn advance(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn ancestor(
-    paths: &Paths,
-    repo: &Path,
-    older: &CommitId,
-    newer: &CommitId,
-) -> Result<bool> {
-    let result = run(
-        paths,
-        repo,
-        &strings(&["merge-base", "--is-ancestor", &older.0, &newer.0]),
-        None,
-        BTreeMap::new(),
-    )?;
-    ensure!(
-        result.exited_with(&[0, 1]),
-        "Git ancestry observation failed"
-    );
-    Ok(result.exit_code == Some(0))
+pub(crate) fn forget(paths: &Paths, repo: &Path, job: &str, commit: &CommitId) -> Result<()> {
+    let reference = private_ref(job)?;
+    if let Some(observed) = ref_value(paths, repo, &reference)? {
+        ensure!(
+            observed == *commit,
+            "private source ref changed before cleanup"
+        );
+        value(paths, repo, &["update-ref", "-d", &reference, &commit.0])?;
+    }
+    Ok(())
 }
 
 fn private_worktree(paths: &Paths, path: &Path) -> Result<()> {
@@ -227,75 +212,6 @@ pub(crate) fn ensure_worktree(
     value(paths, path, &["reset", "--hard", &revision.0])?;
     value(paths, path, &["clean", "-ffd"])?;
     Ok(())
-}
-
-pub(crate) fn clean_candidate(paths: &Paths, path: &Path, revision: &CommitId) -> Result<()> {
-    ensure!(
-        commit(paths, path, "HEAD")? == *revision
-            && value(
-                paths,
-                path,
-                &["status", "--porcelain", "--untracked-files=all"]
-            )?
-            .is_empty(),
-        "candidate changed outside its recorded operation"
-    );
-    Ok(())
-}
-
-pub(crate) fn merge(paths: &Paths, path: &Path, input: &CommitId) -> Result<ProcessResult> {
-    run(
-        paths,
-        path,
-        &strings(&[
-            "-c",
-            "merge.autoStash=false",
-            "merge",
-            "--no-commit",
-            "--no-ff",
-            &input.0,
-        ]),
-        None,
-        BTreeMap::new(),
-    )
-}
-
-pub(crate) fn commit_tree(
-    paths: &Paths,
-    repo: &Path,
-    tree: &str,
-    parents: &[CommitId],
-    job: &str,
-    stamp: u64,
-    message: &str,
-) -> Result<CommitId> {
-    let mut arguments = vec!["commit-tree".into(), tree.into()];
-    for parent in parents {
-        arguments.extend(["-p".into(), parent.0.clone()]);
-    }
-    let mut env = BTreeMap::new();
-    for key in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
-        env.insert(key.into(), "Telete".into());
-    }
-    for key in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
-        env.insert(key.into(), "telete@localhost".into());
-    }
-    for key in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
-        env.insert(key.into(), format!("{stamp} +0000"));
-    }
-    let result = run(
-        paths,
-        repo,
-        &arguments,
-        Some(format!("{message}\n\nTelete-Job: {job}\n")),
-        env,
-    )?;
-    ensure!(
-        result.success(),
-        "Git could not record private candidate: {}",
-        result.stderr.trim()
-    );
-    CommitId::new(result.stdout.trim())
 }
 
 fn validate_registration(

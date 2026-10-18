@@ -23,7 +23,6 @@ pub(crate) struct CommandSpec {
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) timeout_seconds: Option<u64>,
     pub(crate) stdin: Option<String>,
-    pub(crate) confined: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) context: Option<CommandContext>,
 }
@@ -161,32 +160,24 @@ fn prepare_context(paths: &Paths, spec: &CommandSpec) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn run(paths: &Paths, spec: &CommandSpec) -> Result<ProcessResult> {
+    run_without(paths, spec, &[])
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn run_without(
+    paths: &Paths,
+    spec: &CommandSpec,
+    removed: &[std::ffi::OsString],
+) -> Result<ProcessResult> {
     ensure!(
         spec.timeout_seconds.is_none_or(|seconds| seconds > 0) && spec.cwd.is_absolute(),
         "invalid process timeout or working directory"
     );
     prepare_context(paths, spec)?;
-    let mut command = if spec.confined {
-        ensure!(
-            PathBuf::from("/usr/bin/sandbox-exec").is_file(),
-            "confined execution requires macOS sandbox-exec"
-        );
-        let base = serde_json::to_string(&paths.root.display().to_string())?;
-        let profile = format!(
-            "(version 1) (allow default) (deny file-write*) (allow file-write* (subpath {base}) (literal \"/dev/null\") (literal \"/dev/tty\"))"
-        );
-        let mut cmd = Command::new("/usr/bin/sandbox-exec");
-        cmd.args(["-p", &profile]).arg(&spec.program);
-        cmd
-    } else {
-        Command::new(&spec.program)
-    };
-    if spec.context.is_some() {
-        command.env_clear();
-    } else {
-        command.envs(paths.environment());
+    let mut command = Command::new(&spec.program);
+    for name in removed {
+        command.env_remove(name);
     }
     command
         .args(&spec.args)
@@ -358,14 +349,13 @@ pub(crate) fn supervise(
             .open(directory.join("supervisor.log"))?;
         log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         let mut child = Command::new(std::env::current_exe()?)
-            .arg("--state")
+            .args(["internal-execute", "--state"])
             .arg(&paths.root)
-            .args(["internal-execute", "--directory"])
+            .arg("--directory")
             .arg(directory)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
-            .envs(paths.environment())
             .process_group(0)
             .spawn()?;
         paths::atomic_json(
@@ -428,7 +418,6 @@ mod tests {
             env: BTreeMap::new(),
             timeout_seconds: Some(5),
             stdin: None,
-            confined: false,
             context: None,
         };
         (directory, paths, request)
@@ -545,31 +534,49 @@ mod tests {
     }
 
     #[test]
-    fn context_commands_use_only_the_complete_saved_environment() {
+    fn context_commands_inherit_environment_with_explicit_overrides() {
         let (_temporary, paths, mut request) = fixture();
         with_context(&paths, &mut request);
-        request.program = "/usr/bin/env".into();
-        request.args.clear();
+        request.args = vec![
+            "-c".into(),
+            "printf '%s\\n' \"$HOME\" \"$PATH\" \"$LITERAL_VALUE\" \"$TELETE_CONTEXT\"".into(),
+        ];
         request
             .env
             .insert("LITERAL_VALUE".into(), "$HOME; $(printf changed)".into());
+        request.env.insert("PATH".into(), "/explicit/path".into());
         let result = run(&paths, &request).unwrap();
         assert!(result.success());
-        let observed: BTreeMap<_, _> = result
-            .stdout
-            .lines()
-            .map(|line| {
-                let (key, value) = line.split_once('=').unwrap();
-                (key.to_owned(), value.to_owned())
-            })
-            .collect();
-        assert_eq!(observed, request.env);
+        let observed: Vec<_> = result.stdout.lines().collect();
+        assert_eq!(
+            observed,
+            [
+                std::env::var("HOME").unwrap_or_default().as_str(),
+                request.env["PATH"].as_str(),
+                request.env["LITERAL_VALUE"].as_str(),
+                request.env["TELETE_CONTEXT"].as_str(),
+            ]
+        );
         let context = request.context.as_ref().unwrap();
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&context.path).unwrap()).unwrap();
         assert_eq!(saved, context.value);
         let metadata = std::fs::metadata(&context.path).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn selected_environment_removals_allow_explicit_overrides() {
+        let (_temporary, paths, mut request) = fixture();
+        request.args = vec!["-c".into(), "printf '%s' \"${HOME-unset}\"".into()];
+        let removed = [std::ffi::OsString::from("HOME")];
+        let result = run_without(&paths, &request, &removed).unwrap();
+        assert!(result.success());
+        assert_eq!(result.stdout, "unset");
+        request.env.insert("HOME".into(), "/explicit/home".into());
+        let result = run_without(&paths, &request, &removed).unwrap();
+        assert!(result.success());
+        assert_eq!(result.stdout, "/explicit/home");
     }
 
     #[test]

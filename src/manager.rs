@@ -1,6 +1,5 @@
-//! Serial workflow orchestration, with intent retained before effects.
+//! Serial execution of configured committed-source workflows.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -9,31 +8,39 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 use crate::git;
-use crate::invocation;
 use crate::model::{CommitId, JobId};
 use crate::paths::Paths;
 use crate::store::{self, Cleanup, Config, Job, Operation, Phase, Store};
-use crate::workflow::{StageRun, Workflow};
+use crate::workflow::{ProjectConfig, StageRun, Workflow};
 
 #[path = "workflow_manager.rs"]
 mod workflow_manager;
 
-#[derive(Clone, Debug)]
-pub(crate) struct SubmitOptions {
-    pub request_id: Option<String>,
-    pub workflow: Workflow,
-}
-
-fn check_identity(value: &str, label: &str) -> Result<()> {
-    ensure!(
-        !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control),
-        "{label} must have 1 to 256 non-control characters"
-    );
-    Ok(())
+/// Validate the project before creating any operational state.
+pub(crate) fn select(project: &ProjectConfig, create: bool) -> Result<Paths> {
+    project.workflow.validate()?;
+    let mut paths = Paths::selected(project.state.clone(), false)?;
+    let repository = git::repository(&paths, &project.repo)?;
+    let binding = Config {
+        state_root: paths.root.clone(),
+        common_git_dir: git::common(&paths, &repository)?,
+        repository,
+    };
+    if let Some(previous) = store::probe_config(&paths.root)? {
+        ensure!(
+            previous == binding,
+            "configured repository or state identity changed"
+        );
+    } else if create {
+        paths = Paths::selected(project.state.clone(), true)?;
+        let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
+        Store::create(&paths.root, &binding)?;
+    }
+    Ok(paths)
 }
 
 fn configured(paths: &Paths) -> Result<(Store, Config)> {
-    let store = Store::open(&paths.root, false)?;
+    let store = Store::open(&paths.root)?;
     let config = store.config()?;
     paths.verify_config(&config)?;
     ensure!(
@@ -43,111 +50,58 @@ fn configured(paths: &Paths) -> Result<(Store, Config)> {
     Ok((store, config))
 }
 
-pub(crate) fn init(paths: &Paths, repo: &Path, accepted_baseline: Option<&str>) -> Result<Value> {
-    let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
-    let store = Store::open(&paths.root, true)?;
-    let repository = git::repository(paths, repo)?;
-    let baseline = accepted_baseline
-        .map(|value| git::commit(paths, &repository, value))
-        .transpose()?;
-    let config = Config {
-        state_root: paths.root.clone(),
-        common_git_dir: git::common(paths, &repository)?,
-        repository,
-        accepted_baseline: baseline.clone(),
-    };
-    if let Some(previous) = store.get::<Config>("config")? {
-        ensure!(
-            previous == config,
-            "initialization cannot replace Telete's repository, baseline, or state directory"
-        );
-        if let Some(baseline) = &baseline {
-            ensure!(
-                git::ref_value(paths, &config.repository, git::ACCEPTED)?.as_ref()
-                    == Some(baseline),
-                "accepted history already advanced; initialization cannot rewind it"
-            );
-        }
-        return Ok(
-            json!({"state":"initialized","paused":store.paused()?,"accepted":baseline,"config":config}),
-        );
-    }
-    if let Some(baseline) = &baseline {
-        git::advance(paths, &config.repository, git::ACCEPTED, None, baseline)?;
-    }
-    store.transaction(|| {
-        store.set("config", &config)?;
-        store.set("paused", &true)
-    })?;
-    Ok(json!({"state":"initialized","paused":true,"accepted":baseline,"config":config}))
-}
-
 pub(crate) fn submit(
     paths: &Paths,
     repo: &Path,
     revision: &str,
-    options: SubmitOptions,
+    workflow: Workflow,
 ) -> Result<Value> {
+    workflow.validate()?;
     let (store, config) = configured(paths)?;
     ensure!(
-        git::common(paths, repo)? == config.common_git_dir,
-        "submit from a worktree of Telete's configured repository"
+        git::repository(paths, repo)? == config.repository,
+        "submit must select the configured repository checkout"
     );
-    let input = git::commit(paths, repo, revision)?;
-    options.workflow.validate()?;
-    ensure!(
-        !options.workflow.integrate || config.accepted_baseline.is_some(),
-        "integration requires an initialized accepted baseline"
-    );
-    let request_id = options
-        .request_id
-        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-    check_identity(&request_id, "submission request identity")?;
+    let commit = git::commit(paths, repo, revision)?;
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
-    if let Some(previous) = store.by_request(&request_id)? {
-        ensure!(
-            previous.input == input && previous.workflow == options.workflow,
-            "submission request identity belongs to different inputs"
-        );
-        return previous.output();
-    }
-    paths.require_capacity()?;
-    let environment = invocation::capture_environment(paths)?;
-    let id = JobId::new(uuid::Uuid::now_v7().to_string())?;
-    let job = new_job(id, request_id, input, options.workflow, environment);
-    git::advance(
+    let job = new_job(
+        JobId::new(uuid::Uuid::now_v7().to_string())?,
+        commit,
+        workflow,
+    );
+    let mut admitted = store.transaction(|| store.insert(&job))?;
+    // A queued record makes an interrupted submission visible. Starting the
+    // job also ensures its private ref, without an unrecorded resubmission.
+    if let Err(error) = git::advance(
         paths,
         repo,
-        &git::private_ref(&job.id.0, "input")?,
+        &git::private_ref(&job.id.0)?,
         None,
-        &job.input,
-    )?;
-    let admitted = store.transaction(|| store.insert(&job))?;
+        &job.commit,
+    ) {
+        let message = format!("could not retain submitted source: {error:#}");
+        admitted.phase = Phase::Failed;
+        admitted.outcome = Some(Phase::Failed);
+        admitted.stopped_phase = Some(Phase::Queued);
+        admitted.last_error = Some(message.clone());
+        admitted.outcome_message = Some(message.clone());
+        store.save(&mut admitted)?;
+        bail!("job {} failed: {message}", admitted.id);
+    }
     admitted.output()
 }
 
-fn new_job(
-    id: JobId,
-    request_id: String,
-    input: CommitId,
-    workflow: Workflow,
-    environment: BTreeMap<String, String>,
-) -> Job {
+fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
     Job {
         id,
         sequence: 0,
         revision: 0,
-        request_id,
         phase: Phase::Queued,
         cancel_requested: false,
         created: store::now(),
         updated: store::now(),
-        input,
+        commit,
         workflow,
-        environment,
-        base: None,
-        candidate: None,
-        accepted: false,
         runs: Vec::new(),
         operation: None,
         outcome: None,
@@ -159,21 +113,41 @@ fn new_job(
     }
 }
 
+fn job_status(store: &Store, id: &str) -> Result<Value> {
+    if let Some(completion) = store.completion(id)? {
+        return Ok(completion);
+    }
+    store.job(id)?.output()
+}
+
 pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
+    if store::probe_config(&paths.root)?.is_none() {
+        ensure!(id.is_none(), "no retained result for this job");
+        return Ok(json!({"schema_version":3,"paused":false,"active":null,
+            "queue":[],"failure":null,"completions":[],"maintenance_owners":[]}));
+    }
     let (store, config) = configured(paths)?;
     if let Some(id) = id {
-        return store.job(id)?.output();
+        return job_status(&store, id);
     }
-    let active = store.active()?.map(|job| job.output()).transpose()?;
-    let queue = store
-        .jobs()?
-        .into_iter()
+    let jobs = store.jobs()?;
+    let queue = jobs
+        .iter()
         .filter(|job| job.phase == Phase::Queued)
-        .map(|job| job.output())
+        .map(Job::output)
         .collect::<Result<Vec<_>>>()?;
+    let failure = jobs
+        .iter()
+        .rev()
+        .find(|job| job.phase == Phase::Failed)
+        .map(Job::output)
+        .transpose()?;
     Ok(
-        json!({"schema_version":2,"version":env!("CARGO_PKG_VERSION"),"paused":store.paused()?,
-        "config":config,"accepted":git::ref_value(paths,&config.repository,git::ACCEPTED)?,"active":active,"queue":queue,"maintenance_owners":store.holds()?}),
+        json!({"schema_version":3,"version":env!("CARGO_PKG_VERSION"),
+        "paused":store.paused()?,"config":config,
+        "active":store.active()?.map(|job|job.output()).transpose()?,
+        "queue":queue,"failure":failure,"completions":store.completion_list()?,
+        "maintenance_owners":store.holds()?}),
     )
 }
 
@@ -181,15 +155,15 @@ pub(crate) async fn wait(paths: &Paths, id: &str, timeout_seconds: u64) -> Resul
     ensure!(timeout_seconds > 0, "wait timeout must be positive");
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
-        let (store, _) = configured(paths)?;
-        let job = store.job(id)?;
-        if job.phase.terminal() || job.phase == Phase::Blocked {
-            return Ok(json!({"observation":"terminal","job":job.output()?}));
+        let value = status(paths, Some(id))?;
+        let phase = value["phase"].as_str().context("job has no phase")?;
+        if matches!(phase, "succeeded" | "failed" | "cancelled" | "blocked") {
+            return Ok(json!({"observation":"terminal","job":value}));
         }
         if Instant::now() >= deadline {
-            return Ok(json!({"observation":"timeout","job":job.output()?}));
+            return Ok(json!({"observation":"timeout","job":value}));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -205,8 +179,8 @@ pub(crate) fn resume(paths: &Paths) -> Result<Value> {
     let (store, _) = configured(paths)?;
     if let Some(active) = store.active()? {
         ensure!(
-            active.phase != Phase::Blocked && !active.unresolved,
-            "recover the unresolved Telete job before resuming"
+            !active.unresolved,
+            "recover the unresolved job before resuming"
         );
     }
     store.set("paused", &false)?;
@@ -223,12 +197,20 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
             job.cancel_requested = true;
             job.phase = Phase::Cancelled;
             job.outcome = Some(Phase::Cancelled);
-            job.outcome_message = Some("Cancelled before queue admission".into());
+            job.outcome_message = Some("Cancelled before execution".into());
             store.save(&mut job)?;
         }
         Ok(())
     })?;
-    store.job(id)?.output()
+    job_status(&store, id)
+}
+
+fn check_identity(value: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control),
+        "maintenance owner must have 1 to 256 non-control characters"
+    );
+    Ok(())
 }
 
 pub(crate) fn maintenance_hold(paths: &Paths, owner: &str) -> Result<Value> {
@@ -243,7 +225,10 @@ pub(crate) fn maintenance_release(paths: &Paths, owner: &str) -> Result<Value> {
 
 fn maintenance(paths: &Paths, owner: Option<&str>, action: &str) -> Result<Value> {
     if let Some(owner) = owner {
-        check_identity(owner, "maintenance owner")?;
+        check_identity(owner)?;
+    }
+    if store::probe_config(&paths.root)?.is_none() {
+        return Ok(json!({"held":false,"drained":true,"owners":[],"active_job":null}));
     }
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
     let (store, _) = configured(paths)?;
@@ -256,27 +241,25 @@ fn maintenance(paths: &Paths, owner: Option<&str>, action: &str) -> Result<Value
     }
     let active = store.active()?;
     let owners = store.holds()?;
-    let drained = active.is_none() && store.jobs()?.iter().all(|job| !job.unresolved);
-    Ok(json!({"held":!owners.is_empty(),"drained":drained,
-        "owner_held":owner.map(|owner| owners.iter().any(|held| held == owner)),"owners":owners,"active_job":active.map(|job|job.id)}))
+    Ok(json!({"held":!owners.is_empty(),"drained":active.is_none(),
+        "owner_held":owner.map(|owner|owners.iter().any(|held|held == owner)),
+        "owners":owners,"active_job":active.map(|job|job.id)}))
 }
 
-/// Recover only a command with correlated terminal process evidence. Recovery
-/// consumes the saved result; it never admits the same command again.
 pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
     let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
     let (store, config) = configured(paths)?;
     let mut job = store.job(id)?;
     ensure!(
         job.phase == Phase::Blocked,
-        "only a blocked Telete job can be recovered"
+        "only a blocked job can be recovered"
     );
     let phase = job
         .stopped_phase
-        .context("blocked job has no retained operation phase")?;
+        .context("blocked job has no operation phase")?;
     ensure!(
         matches!(phase, Phase::Checking | Phase::Preparing | Phase::Deploying),
-        "recovery has no authoritative continuation for this phase"
+        "blocked job has no command to reconcile"
     );
     let mut worker = Worker {
         paths,
@@ -291,18 +274,18 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
     job.last_error = None;
     worker.store.save(&mut job)?;
     worker.tick()?;
-    worker.store.job(id)?.output()
+    job_status(&worker.store, id)
 }
 
 pub(crate) fn worker_once(paths: &Paths) -> Result<Value> {
     let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
     let (store, config) = configured(paths)?;
-    let mut worker = Worker {
+    Worker {
         paths,
         store,
         config,
-    };
-    worker.tick()
+    }
+    .tick()
 }
 
 pub(crate) async fn worker(paths: &Paths) -> Result<()> {
@@ -315,7 +298,7 @@ pub(crate) async fn worker(paths: &Paths) -> Result<()> {
     };
     loop {
         worker.tick()?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -335,14 +318,6 @@ impl Worker<'_> {
     fn worktree(&self, job: &Job) -> PathBuf {
         self.paths.job(&job.id.0).join("worktree")
     }
-    fn candidate(job: &Job) -> Result<&CommitId> {
-        job.candidate
-            .as_ref()
-            .context("active job has no candidate")
-    }
-    fn base(job: &Job) -> Result<&CommitId> {
-        job.base.as_ref().context("active job has no fixed base")
-    }
 
     fn save(&self, job: &mut Job, phase: Phase) -> Result<()> {
         job.phase = phase;
@@ -350,6 +325,7 @@ impl Worker<'_> {
     }
 
     fn claim(&self) -> Result<Option<Job>> {
+        let _admission = store::lock(&self.paths.root.join("admission.lock"), true)?;
         self.store.transaction(|| {
             if let Some(job) = self.store.active()? {
                 return Ok(Some(job));
@@ -360,26 +336,13 @@ impl Worker<'_> {
             let Some(mut job) = self.store.queued()? else {
                 return Ok(None);
             };
-            self.paths.require_capacity()?;
-            if job.workflow.integrate {
-                job.base = Some(git::commit(
-                    self.paths,
-                    &self.config.repository,
-                    git::ACCEPTED,
-                )?);
-            }
-            self.save(&mut job, Phase::Integrating)?;
+            self.save(&mut job, Phase::Starting)?;
             Ok(Some(job))
         })
     }
 
     fn tick(&mut self) -> Result<Value> {
-        self.paths.require_capacity()?;
-        for mut job in self.store.jobs()? {
-            if (job.phase.terminal() || job.outcome.is_some()) && !job.unresolved {
-                self.cleanup(&mut job)?;
-            }
-        }
+        self.cleanup_settled()?;
         let Some(mut job) = self.claim()? else {
             return Ok(json!({"state":"idle","paused":self.store.paused()?}));
         };
@@ -391,38 +354,42 @@ impl Worker<'_> {
             let unresolved = job.operation.is_some();
             self.finish(&mut job, Phase::Failed, message, unresolved)?;
         }
-        self.store.job(&job.id.0)?.output()
+        self.cleanup_settled()?;
+        job_status(&self.store, &job.id.0)
     }
 
-    fn step(&mut self, job: &mut Job) -> Result<()> {
+    fn step(&self, job: &mut Job) -> Result<()> {
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
-        if job.cancel_requested
-            && job.operation.is_none()
-            && !matches!(job.phase, Phase::Deploying | Phase::Blocked)
-        {
-            // Git promotion may have completed before the worker saved its
-            // acceptance fact. Cancellation must retain that existing effect.
-            if job.phase == Phase::Accepting
-                && git::ref_value(self.paths, &self.config.repository, git::ACCEPTED)?.as_ref()
-                    == Some(Self::candidate(job)?)
-            {
-                job.accepted = true;
-            }
+        if job.cancel_requested && job.operation.is_none() && job.phase != Phase::Blocked {
             return self.finish(
                 job,
                 Phase::Cancelled,
-                "Cancelled before the next operation".into(),
+                "Cancelled before the next command".into(),
                 false,
             );
         }
         match job.phase {
-            Phase::Integrating => self.integrating(job),
+            Phase::Starting => {
+                git::advance(
+                    self.paths,
+                    &self.config.repository,
+                    &git::private_ref(&job.id.0)?,
+                    None,
+                    &job.commit,
+                )?;
+                git::ensure_worktree(
+                    self.paths,
+                    &self.config.repository,
+                    &self.worktree(job),
+                    &job.commit,
+                )?;
+                self.save(job, Phase::Checking)
+            }
             Phase::Checking => self.workflow_stage(job, "check"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
-            Phase::Accepting => self.workflow_accept(job),
             Phase::Deploying => self.workflow_stage(job, "deploy"),
             Phase::Blocked => Ok(()),
-            _ => bail!("unexpected active Telete phase: {:?}", job.phase),
+            _ => bail!("unexpected active phase: {:?}", job.phase),
         }
     }
 
@@ -433,146 +400,98 @@ impl Worker<'_> {
         message: String,
         unresolved: bool,
     ) -> Result<()> {
-        ensure!(outcome.terminal(), "invalid terminal workflow outcome");
+        ensure!(outcome.terminal(), "invalid terminal outcome");
         job.stopped_phase = Some(job.phase);
-        job.outcome = Some(outcome);
+        job.outcome = (!unresolved).then_some(outcome);
         job.outcome_message = Some(message);
         job.unresolved = unresolved;
-        if outcome != Phase::Succeeded {
-            self.store.set("paused", &true)?;
+        self.save(job, if unresolved { Phase::Blocked } else { outcome })
+    }
+
+    /// Keep only the newest finished workflow's failure details.
+    fn cleanup_settled(&self) -> Result<()> {
+        let jobs = self.store.jobs()?;
+        let completions = self.store.completion_list()?;
+        let previous = self.store.get::<u64>("latest_finished_sequence")?;
+        let latest = jobs
+            .iter()
+            .filter(|job| matches!(job.phase, Phase::Failed | Phase::Succeeded))
+            .map(|job| job.sequence)
+            .chain(
+                completions
+                    .iter()
+                    .filter(|value| matches!(value["phase"].as_str(), Some("failed" | "succeeded")))
+                    .filter_map(|value| value["sequence"].as_u64()),
+            )
+            .chain(previous)
+            .max();
+        if latest != previous
+            && let Some(sequence) = latest
+        {
+            self.store.set("latest_finished_sequence", &sequence)?;
         }
-        let phase = if unresolved { Phase::Blocked } else { outcome };
-        self.save(job, phase)?;
-        self.cleanup(job)
+        for mut job in jobs {
+            if job.phase.terminal()
+                && !job.unresolved
+                && (job.phase != Phase::Failed || Some(job.sequence) != latest)
+            {
+                self.cleanup(&mut job)?;
+            }
+        }
+        Ok(())
     }
 
     fn cleanup(&self, job: &mut Job) -> Result<()> {
-        if job.outcome.is_none() || job.unresolved || job.cleanup.state == "removed" {
-            return Ok(());
-        }
-        let worktree = self.worktree(job);
-        if !job.cleanup.recorded {
-            match git::registration(self.paths, &self.config.repository, &worktree) {
-                Ok(registration) => {
-                    job.cleanup.registration = registration;
-                    job.cleanup.recorded = true;
-                }
-                Err(error) => {
-                    job.cleanup.state = "failed".into();
-                    job.cleanup.error = Some(format!("{error:#}"));
-                    job.cleanup.updated = store::now();
-                    return self.store.save(job);
-                }
+        let result = (|| {
+            let worktree = self.worktree(job);
+            if !job.cleanup.recorded {
+                job.cleanup.registration =
+                    git::registration(self.paths, &self.config.repository, &worktree)?;
+                job.cleanup.recorded = true;
+                self.store.save(job)?;
             }
-            self.store.save(job)?;
-        }
-        match git::remove_worktree(
-            self.paths,
-            &self.config.repository,
-            &worktree,
-            job.cleanup.registration.as_deref(),
-        ) {
-            Ok(()) => {
-                job.cleanup.state = "removed".into();
-                job.cleanup.error = None;
-            }
-            Err(error) => {
-                job.cleanup.state = "failed".into();
-                job.cleanup.error = Some(format!("{error:#}"));
-            }
-        }
-        job.cleanup.updated = store::now();
-        self.store.save(job)
-    }
-
-    fn integrating(&self, job: &mut Job) -> Result<()> {
-        if !job.workflow.integrate {
-            let candidate = job.input.clone();
-            job.candidate = Some(candidate.clone());
-            self.store.save(job)?;
-            git::advance(
+            crate::broker::forget_job(self.paths, &job.id.0)?;
+            git::remove_worktree(
                 self.paths,
                 &self.config.repository,
-                &git::private_ref(&job.id.0, "candidate")?,
-                None,
-                &candidate,
+                &worktree,
+                job.cleanup.registration.as_deref(),
             )?;
-            git::ensure_worktree(
-                self.paths,
-                &self.config.repository,
-                &self.worktree(job),
-                &candidate,
-            )?;
-            return self.save(job, Phase::Checking);
+            git::forget(self.paths, &self.config.repository, &job.id.0, &job.commit)?;
+            let directory = self.paths.job(&job.id.0);
+            if crate::paths::private_directory_exists(&directory)? {
+                fs::remove_dir_all(directory)?;
+            }
+            self.store.retire(job)
+        })();
+        if let Err(error) = result {
+            job.cleanup.state = "failed".into();
+            job.cleanup.error = Some(format!("{error:#}"));
+            job.cleanup.updated = store::now();
+            self.store.save(job)?;
         }
-        let base = Self::base(job)?.clone();
-        let worktree = self.worktree(job);
-        git::ensure_worktree(self.paths, &self.config.repository, &worktree, &base)?;
-        let merge = git::merge(self.paths, &worktree, &job.input)?;
-        store::atomic_bytes(
-            &self.directory(job)?.join("merge.log"),
-            format!("{}{}", merge.stdout, merge.stderr).as_bytes(),
-        )?;
-        if !merge.success() {
-            return self.finish(
-                job,
-                Phase::Failed,
-                "Integration failed. Merge conflicts require source changes".into(),
-                false,
-            );
-        }
-        let tree = git::value(self.paths, &worktree, &["write-tree"])?;
-        let parents = if base == job.input {
-            vec![base]
-        } else {
-            vec![base, job.input.clone()]
-        };
-        let candidate = git::commit_tree(
-            self.paths,
-            &self.config.repository,
-            &tree,
-            &parents,
-            &job.id.0,
-            job.created,
-            "Integrate Telete submission",
-        )?;
-        job.candidate = Some(candidate.clone());
-        self.store.save(job)?;
-        git::advance(
-            self.paths,
-            &self.config.repository,
-            &git::private_ref(&job.id.0, "candidate")?,
-            None,
-            &candidate,
-        )?;
-        git::ensure_worktree(self.paths, &self.config.repository, &worktree, &candidate)?;
-        self.save(job, Phase::Checking)
+        Ok(())
     }
 
     fn begin_operation(&self, job: &mut Job, name: String, result: PathBuf) -> Result<bool> {
-        let candidate = Self::candidate(job)?.clone();
         if let Some(operation) = &job.operation {
             ensure!(
                 operation.name == name
-                    && operation.candidate == candidate
+                    && operation.commit == job.commit
                     && operation.phase == job.phase
                     && operation.result == result,
                 "retained operation does not match current stage"
-            );
-            ensure!(
-                result.is_file(),
-                "interrupted operation has no terminal receipt; recovery is required"
             );
             return Ok(false);
         }
         ensure!(
             !result.exists(),
-            "unattributed operation receipt already exists"
+            "unattributed command result already exists"
         );
         job.operation = Some(Operation {
             phase: job.phase,
             name,
-            candidate,
+            commit: job.commit.clone(),
             result,
             started: store::now(),
         });
@@ -584,158 +503,8 @@ impl Worker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-
-    fn job(paths: &Paths, base: &CommitId, id: &str) -> Result<Job> {
-        Ok(new_job(
-            JobId::new(id)?,
-            format!("request-{id}"),
-            base.clone(),
-            workflow_selection(paths),
-            invocation::capture_environment(paths)?,
-        ))
-    }
-
-    fn worker(paths: &Paths) -> Result<Worker<'_>> {
-        let (store, config) = configured(paths)?;
-        Ok(Worker {
-            paths,
-            store,
-            config,
-        })
-    }
-
-    #[test]
-    fn store_preserves_cancellation_and_rejects_stale_history() -> Result<()> {
-        let (_temporary, paths, _repo, base) = workflow_fixture(true)?;
-        let store = Store::open(&paths.root, false)?;
-        let queued = job(&paths, &base, "cas-fixture")?;
-        let mut first = store.insert(&queued)?;
-        let mut stale = first.clone();
-        store.cancel(&first.id.0)?;
-        first.last_error = Some("retained".into());
-        store.save(&mut first)?;
-        assert!(first.cancel_requested);
-        stale.last_error = Some("must not overwrite".into());
-        assert!(store.save(&mut stale).is_err());
-        assert_eq!(
-            store.job(&first.id.0)?.last_error.as_deref(),
-            Some("retained")
-        );
-        assert!(store.insert(&queued).is_err());
-        assert_eq!(
-            store
-                .by_request(&queued.request_id)?
-                .context("saved request")?
-                .id,
-            queued.id
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn fresh_integration_creates_private_job_directory_before_git() -> Result<()> {
-        let (_temporary, paths, repo, base) = workflow_fixture(true)?;
-        fs::write(repo.join("payload.txt"), "submitted\n")?;
-        git::value(&paths, &repo, &["add", "payload.txt"])?;
-        let tree = git::value(&paths, &repo, &["write-tree"])?;
-        let input = git::commit_tree(
-            &paths,
-            &repo,
-            &tree,
-            std::slice::from_ref(&base),
-            "fixture",
-            1_700_000_001,
-            "Fixture submission",
-        )?;
-        git::value(&paths, &repo, &["reset", "--hard", &input.0])?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "fresh-integration")?;
-        job.input = input.clone();
-        job.workflow.integrate = true;
-        job.base = Some(base.clone());
-        job.phase = Phase::Integrating;
-        let mut job = worker.store.insert(&job)?;
-        let directory = paths.job(&job.id.0);
-        assert!(!directory.exists());
-
-        worker.integrating(&mut job)?;
-
-        assert_eq!(job.phase, Phase::Checking);
-        assert_eq!(
-            fs::metadata(&directory)?.permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(directory.join("merge.log"))?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        let candidate = job.candidate.as_ref().context("integrated candidate")?;
-        assert_eq!(
-            git::commit(&paths, &worker.worktree(&job), "HEAD")?,
-            *candidate
-        );
-        assert_eq!(
-            git::ref_value(&paths, &repo, &git::private_ref(&job.id.0, "candidate")?)?,
-            Some(candidate.clone())
-        );
-        assert_eq!(
-            fs::read_to_string(worker.worktree(&job).join("payload.txt"))?,
-            "submitted\n"
-        );
-        assert_eq!(git::ref_value(&paths, &repo, git::ACCEPTED)?, Some(base));
-        assert_eq!(git::commit(&paths, &repo, "HEAD")?, input);
-        Ok(())
-    }
-
-    #[test]
-    fn cleanup_removes_only_settled_private_worktree_and_registration() -> Result<()> {
-        let (_temporary, paths, repo, base) = workflow_fixture(true)?;
-        let worker = worker(&paths)?;
-        let mut job = job(&paths, &base, "cleanup-fixture")?;
-        job.base = Some(base.clone());
-        job.candidate = Some(base.clone());
-        job.phase = Phase::Checking;
-        let mut job = worker.store.insert(&job)?;
-        store::private_directory(&paths.job(&job.id.0))?;
-        git::ensure_worktree(&paths, &repo, &worker.worktree(&job), &base)?;
-        fs::write(worker.worktree(&job).join("private-untracked"), "private")?;
-        let registration = git::registration(&paths, &repo, &worker.worktree(&job))?
-            .context("linked registration")?;
-        worker.finish(&mut job, Phase::Failed, "fixture failure".into(), true)?;
-        assert!(worker.worktree(&job).exists());
-        assert!(registration.exists());
-        job.unresolved = false;
-        job.phase = Phase::Cancelled;
-        job.outcome = Some(Phase::Cancelled);
-        worker.store.save(&mut job)?;
-        worker.cleanup(&mut job)?;
-        assert_eq!(job.cleanup.state, "removed");
-        assert!(!worker.worktree(&job).exists());
-        assert!(!registration.exists());
-        assert_eq!(git::commit(&paths, &repo, "HEAD")?, base);
-        Ok(())
-    }
-
-    #[test]
-    fn maintenance_drain_keeps_active_operations_visible() -> Result<()> {
-        let (_temporary, paths, _repo, base) = workflow_fixture(true)?;
-        let store = Store::open(&paths.root, false)?;
-        let mut active = job(&paths, &base, "drain-fixture")?;
-        active.phase = Phase::Preparing;
-        active.base = Some(base.clone());
-        active.candidate = Some(base);
-        store.insert(&active)?;
-        drop(store);
-        let held = maintenance_hold(&paths, "fixture-owner")?;
-        assert_eq!(held["held"], true);
-        assert_eq!(held["drained"], false);
-        assert_eq!(held["active_job"], "drain-fixture");
-        Ok(())
-    }
 
     include!("workflow_tests.rs");
 }

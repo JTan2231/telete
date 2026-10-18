@@ -1,6 +1,5 @@
-//! Frozen command environment and candidate-specific invocation context.
+//! Command overrides and run-specific invocation context.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
@@ -9,35 +8,6 @@ use serde_json::{Value, json};
 use crate::paths::Paths;
 use crate::process::{CommandContext, CommandSpec};
 use crate::store::Job;
-
-pub(crate) fn capture_environment(paths: &Paths) -> Result<BTreeMap<String, String>> {
-    // Retain tool and locale selections, not the unrestricted submission shell.
-    let mut environment = BTreeMap::new();
-    for name in [
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "RUSTUP_TOOLCHAIN",
-        "SDKROOT",
-        "DEVELOPER_DIR",
-        "MACOSX_DEPLOYMENT_TARGET",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            environment.insert(
-                name.into(),
-                value
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("non-UTF-8 command environment: {name}"))?,
-            );
-        }
-    }
-    environment.extend(paths.environment());
-    environment.insert("CARGO_BUILD_JOBS".into(), "2".into());
-    Ok(environment)
-}
 
 pub(crate) fn directory(paths: &Paths, job: &Job, operation: &str) -> Result<PathBuf> {
     ensure!(
@@ -60,7 +30,6 @@ pub(crate) fn bind(
     mut command: CommandSpec,
 ) -> Result<CommandSpec> {
     let context = directory(paths, job, operation)?.join("context.json");
-    command.env = job.environment.clone();
     command
         .env
         .insert("TELETE_CONTEXT".into(), context.display().to_string());
@@ -71,7 +40,7 @@ pub(crate) fn bind(
             "job_id": job.id,
             "stage": stage,
             "checkout": command.cwd,
-            "source": {"input": job.input, "base": job.base, "candidate": job.candidate},
+            "source": {"commit": job.commit},
             "parameters": job.workflow.parameters,
             "inputs": inputs,
             "outputs": outputs,

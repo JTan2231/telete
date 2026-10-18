@@ -1,6 +1,5 @@
 //! Private durable queue records.
 
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -14,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::model::{CommitId, JobId};
 use crate::workflow::{StageRun, Workflow};
 
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
+const COMPLETION_LIMIT: usize = 128;
 const APPLICATION: u32 = 0x5445_4c45;
 
 pub(crate) fn now() -> u64 {
@@ -74,17 +74,15 @@ pub(crate) struct Config {
     pub state_root: PathBuf,
     pub repository: PathBuf,
     pub common_git_dir: PathBuf,
-    pub accepted_baseline: Option<CommitId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
     Queued,
-    Integrating,
+    Starting,
     Checking,
     Preparing,
-    Accepting,
     Deploying,
     Blocked,
     Succeeded,
@@ -99,10 +97,9 @@ impl Phase {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Queued => "queued",
-            Self::Integrating => "integrating",
+            Self::Starting => "starting",
             Self::Checking => "checking",
             Self::Preparing => "preparing",
-            Self::Accepting => "accepting",
             Self::Deploying => "deploying",
             Self::Blocked => "blocked",
             Self::Succeeded => "succeeded",
@@ -117,7 +114,7 @@ impl Phase {
 pub(crate) struct Operation {
     pub phase: Phase,
     pub name: String,
-    pub candidate: CommitId,
+    pub commit: CommitId,
     pub result: PathBuf,
     pub started: u64,
 }
@@ -146,23 +143,18 @@ impl Default for Cleanup {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-// Persist orthogonal facts independently of the phase: cancellation, acceptance,
+// Persist orthogonal facts independently of the phase: cancellation
 // and uncertain operations can coexist and must survive recovery.
 pub(crate) struct Job {
     pub id: JobId,
     pub sequence: u64,
     pub revision: u64,
-    pub request_id: String,
     pub phase: Phase,
     pub cancel_requested: bool,
     pub created: u64,
     pub updated: u64,
-    pub input: CommitId,
+    pub commit: CommitId,
     pub workflow: Workflow,
-    pub environment: BTreeMap<String, String>,
-    pub base: Option<CommitId>,
-    pub candidate: Option<CommitId>,
-    pub accepted: bool,
     pub runs: Vec<StageRun>,
     pub operation: Option<Operation>,
     pub outcome: Option<Phase>,
@@ -179,17 +171,17 @@ impl Job {
         let workflow = &self.workflow;
         value["stages"] = serde_json::Value::Array(
             [
-                ("integrate", workflow.integrate, Phase::Integrating),
                 ("check", true, Phase::Checking),
                 ("prepare", workflow.prepare.is_some(), Phase::Preparing),
-                ("accept", workflow.accept, Phase::Accepting),
                 ("deploy", workflow.deploy.is_some(), Phase::Deploying),
             ]
             .into_iter()
             .map(|(stage, requested, phase)| {
-                let run = self.runs.iter().rev().find(|run| {
-                    run.stage == stage && self.candidate.as_ref() == Some(&run.candidate)
-                });
+                let run = self
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|run| run.stage == stage && self.commit == run.commit);
                 let active = self
                     .operation
                     .as_ref()
@@ -198,10 +190,6 @@ impl Job {
                 let stopped = self.stopped_phase == Some(phase);
                 let status = if !requested {
                     "not_requested"
-                } else if stage == "integrate" && self.candidate.is_some() && self.base.is_some()
-                    || stage == "accept" && self.accepted
-                {
-                    "succeeded"
                 } else if let Some(run) = run {
                     if run.result.success() {
                         "succeeded"
@@ -222,7 +210,7 @@ impl Job {
                 serde_json::json!({
                     "stage": stage,
                     "status": status,
-                    "candidate": self.candidate,
+                    "commit": self.commit,
                     "operation": run.map(|run| &run.operation),
                 })
             })
@@ -273,71 +261,115 @@ pub(crate) fn probe_config(root: &Path) -> Result<Option<Config>> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     db.busy_timeout(Duration::from_secs(30))?;
+    Ok(Some(validate_schema(&db)?))
+}
+
+fn validate_schema(db: &Connection) -> Result<Config> {
     let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let application: u32 = db.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     ensure!(
         version == SCHEMA && application == APPLICATION,
-        "unsupported or foreign Telete journal"
+        "unsupported or foreign Telete journal; existing runs require their original Telete version"
     );
-    let text: Option<String> = db
+    // Validate required table shapes before treating this as usable state.
+    db.prepare("SELECT owner,created FROM holds LIMIT 0")?;
+    db.prepare(
+        "SELECT sequence,id,phase,cancel_requested,revision,created,updated,data FROM jobs LIMIT 0",
+    )?;
+    db.prepare("SELECT id,phase,sequence,updated FROM completions LIMIT 0")?;
+    let config: String = db
         .query_row("SELECT value FROM control WHERE key='config'", [], |row| {
             row.get(0)
         })
-        .optional()?;
-    let config = text.context("Telete initialization is incomplete")?;
-    Ok(Some(serde_json::from_str(&config)?))
+        .optional()?
+        .context("Telete journal is incomplete")?;
+    let paused: String = db
+        .query_row("SELECT value FROM control WHERE key='paused'", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .context("Telete journal is incomplete")?;
+    serde_json::from_str::<bool>(&paused)?;
+    Ok(serde_json::from_str(&config)?)
 }
 
 impl Store {
-    pub(crate) fn open(root: &Path, create: bool) -> Result<Self> {
-        ensure!(
-            create || root.exists(),
-            "Telete is not initialized; run telete init"
-        );
+    /// Publish a complete initial journal atomically, so readers observe either
+    /// an absent queue or its repository binding and ready admission state.
+    pub(crate) fn create(root: &Path, config: &Config) -> Result<Self> {
         private_directory(root)?;
-        let path = root.join("queue.sqlite3");
-        if !path.exists() {
-            ensure!(create, "Telete is not initialized; run telete init");
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?
-                .sync_all()?;
+        if root.join("queue.sqlite3").exists() {
+            let store = Self::open(root)?;
+            ensure!(
+                store.config()? == *config,
+                "queue belongs to a different repository or state directory"
+            );
+            return Ok(store);
         }
-        let metadata = fs::symlink_metadata(&path)?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".queue-")
+            .suffix(".sqlite3")
+            .tempfile_in(root)?;
+        let db = Connection::open(temporary.path())?;
+        db.execute_batch("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; BEGIN IMMEDIATE;
+            CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE holds(owner TEXT PRIMARY KEY,created INTEGER NOT NULL);
+            CREATE TABLE jobs(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,
+                phase TEXT NOT NULL,cancel_requested INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,updated INTEGER NOT NULL,data TEXT NOT NULL);
+            CREATE TABLE completions(id TEXT PRIMARY KEY,phase TEXT NOT NULL,
+                sequence INTEGER UNIQUE NOT NULL,updated INTEGER NOT NULL);")?;
+        db.execute(
+            "INSERT INTO control VALUES('config',?)",
+            [serde_json::to_string(config)?],
+        )?;
+        db.execute("INSERT INTO control VALUES('paused','false')", [])?;
+        db.execute_batch(&format!(
+            "PRAGMA application_id={APPLICATION}; PRAGMA user_version={SCHEMA}; COMMIT;"
+        ))?;
+        drop(db);
+        temporary.as_file().sync_all()?;
+        match temporary.persist_noclobber(root.join("queue.sqlite3")) {
+            Ok(file) => {
+                file.sync_all()?;
+                File::open(root)?.sync_all()?;
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error.into()),
+        }
+        let store = Self::open(root)?;
+        ensure!(
+            store.config()? == *config,
+            "queue belongs to a different repository or state directory"
+        );
+        Ok(store)
+    }
+
+    pub(crate) fn open(root: &Path) -> Result<Self> {
+        ensure!(
+            crate::paths::private_directory_exists(root)?,
+            "no Telete queue exists"
+        );
+        let path = root.join("queue.sqlite3");
+        let metadata = fs::symlink_metadata(&path).context("no Telete queue exists")?;
         ensure!(
             metadata.is_file()
                 && !metadata.file_type().is_symlink()
+                && metadata.uid() == rustix::process::getuid().as_raw()
                 && metadata.permissions().mode() & 0o777 == 0o600,
-            "queue database must be private and regular"
+            "queue database must be a private user-owned regular file"
         );
-        let db = Connection::open(&path)?;
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         db.busy_timeout(Duration::from_secs(30))?;
-        db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
-        let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let application: u32 = db.query_row("PRAGMA application_id", [], |row| row.get(0))?;
-        if version == 0 && application == 0 && create {
-            let objects: i64 = db.query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get(0),
-            )?;
-            ensure!(objects == 0, "refusing to initialize foreign state");
-            db.execute_batch(&format!("BEGIN IMMEDIATE;
-                CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                CREATE TABLE holds(owner TEXT PRIMARY KEY,created INTEGER NOT NULL);
-                CREATE TABLE jobs(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,
-                    request_id TEXT UNIQUE NOT NULL,phase TEXT NOT NULL,cancel_requested INTEGER NOT NULL DEFAULT 0,
-                    revision INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,updated INTEGER NOT NULL,data TEXT NOT NULL);
-                INSERT INTO control VALUES('paused','true');
-                PRAGMA application_id={APPLICATION}; PRAGMA user_version={SCHEMA}; COMMIT;"))?;
-        } else {
-            ensure!(
-                version == SCHEMA && application == APPLICATION,
-                "unsupported or foreign Telete journal"
-            );
-        }
+        validate_schema(&db)?;
+        db.execute_batch(
+            "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",
+        )?;
         Ok(Self { db })
     }
 
@@ -376,8 +408,7 @@ impl Store {
     }
 
     pub(crate) fn config(&self) -> Result<Config> {
-        self.get("config")?
-            .context("Telete initialization is incomplete")
+        self.get("config")?.context("Telete journal is incomplete")
     }
     pub(crate) fn paused(&self) -> Result<bool> {
         Ok(self.get::<bool>("paused")?.unwrap_or(true))
@@ -412,23 +443,11 @@ impl Store {
             .context("unknown Telete job")
     }
 
-    pub(crate) fn by_request(&self, request: &str) -> Result<Option<Job>> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT * FROM jobs WHERE request_id=?",
-                [request],
-                Self::decode,
-            )
-            .optional()?)
-    }
-
     pub(crate) fn insert(&self, job: &Job) -> Result<Job> {
         self.db.execute(
-            "INSERT INTO jobs(id,request_id,phase,created,updated,data) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO jobs(id,phase,created,updated,data) VALUES(?,?,?,?,?)",
             params![
                 job.id.0,
-                job.request_id,
                 job.phase.name(),
                 i64::try_from(job.created)?,
                 i64::try_from(job.updated)?,
@@ -489,6 +508,53 @@ impl Store {
         Ok(())
     }
 
+    fn decode_completion(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+        let id: String = row.get("id")?;
+        let phase: String = row.get("phase")?;
+        Ok(serde_json::json!({
+            "id": id, "phase": phase, "outcome": phase,
+            "sequence": row_u64(row, "sequence")?, "updated": row_u64(row, "updated")?,
+        }))
+    }
+
+    pub(crate) fn completion(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT * FROM completions WHERE id=?",
+                [id],
+                Self::decode_completion,
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn completion_list(&self) -> Result<Vec<serde_json::Value>> {
+        Ok(self
+            .db
+            .prepare("SELECT * FROM completions ORDER BY sequence DESC")?
+            .query_map([], Self::decode_completion)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replace settled run details with a bounded completion signal. The caller
+    /// first removes its checkout, logs, and any remaining run-owned files.
+    pub(crate) fn retire(&self, job: &Job) -> Result<()> {
+        ensure!(
+            job.phase.terminal() && !job.unresolved && job.operation.is_none(),
+            "only settled terminal runs may be retired"
+        );
+        self.transaction(|| {
+            let current = self.job(&job.id.0)?;
+            ensure!(current.revision == job.revision && current.phase == job.phase,
+                "Telete job changed concurrently; reload before continuing");
+            self.db.execute("INSERT INTO completions(id,phase,sequence,updated) VALUES(?,?,?,?)",
+                params![job.id.0, job.phase.name(), i64::try_from(job.sequence)?, i64::try_from(job.updated)?])?;
+            self.db.execute("DELETE FROM jobs WHERE id=? AND revision=?", params![job.id.0,i64::try_from(job.revision)?])?;
+            self.db.execute("DELETE FROM completions WHERE id IN (SELECT id FROM completions ORDER BY sequence DESC LIMIT -1 OFFSET ?)", [i64::try_from(COMPLETION_LIMIT)?])?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn holds(&self) -> Result<Vec<String>> {
         Ok(self
             .db
@@ -515,15 +581,22 @@ impl Store {
 mod tests {
     use super::*;
 
+    fn fixture_config(root: &Path) -> Config {
+        Config {
+            state_root: root.to_path_buf(),
+            repository: root.join("repository"),
+            common_git_dir: root.join("repository/.git"),
+        }
+    }
+
     #[test]
     fn config_requires_explicit_state_binding_and_rejects_unknown_fields() -> Result<()> {
         let value = serde_json::json!({
             "state_root": "/state", "repository": "/repository",
-            "common_git_dir": "/repository/.git", "accepted_baseline": null,
+            "common_git_dir": "/repository/.git",
         });
         let config: Config = serde_json::from_value(value.clone())?;
         assert_eq!(config.state_root, PathBuf::from("/state"));
-        assert!(config.accepted_baseline.is_none());
         let mut missing = value.clone();
         missing
             .as_object_mut()
@@ -537,11 +610,13 @@ mod tests {
     }
 
     #[test]
-    fn initialized_store_is_private_paused_and_rejects_foreign_state() -> Result<()> {
+    fn created_store_is_private_ready_and_rejects_foreign_state() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().join("state");
-        let store = Store::open(&root, true)?;
-        assert!(store.paused()?);
+        let config = fixture_config(&root);
+        let store = Store::create(&root, &config)?;
+        assert!(!store.paused()?);
+        assert_eq!(probe_config(&root)?, Some(config));
         assert!(store.active()?.is_none());
         store.hold("fixture")?;
         store.hold("fixture")?;
@@ -559,7 +634,119 @@ mod tests {
         let foreign = Connection::open(root.join("queue.sqlite3"))?;
         foreign.execute_batch("PRAGMA application_id=0")?;
         drop(foreign);
-        assert!(Store::open(&root, false).is_err());
+        assert!(Store::open(&root).is_err());
+        Ok(())
+    }
+
+    fn fixture_job(index: usize) -> Result<Job> {
+        Ok(Job {
+            id: JobId::new(format!("job-{index}"))?,
+            sequence: 0,
+            revision: 0,
+            phase: Phase::Succeeded,
+            cancel_requested: false,
+            created: now(),
+            updated: now(),
+            commit: CommitId::new("a".repeat(40))?,
+            workflow: serde_json::from_value(serde_json::json!({
+                "check": {"program": "/bin/true"},
+                "parameters": {"debug": "private-run-diagnostic-sentinel"},
+            }))?,
+            runs: Vec::new(),
+            operation: None,
+            outcome: Some(Phase::Succeeded),
+            outcome_message: None,
+            stopped_phase: None,
+            unresolved: false,
+            last_error: None,
+            cleanup: Cleanup::default(),
+        })
+    }
+
+    #[test]
+    fn existing_binding_preserves_pause_and_rejects_different_repository() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("state");
+        let config = fixture_config(&root);
+        let store = Store::create(&root, &config)?;
+        store.set("paused", &true)?;
+        drop(store);
+        assert!(Store::create(&root, &config)?.paused()?);
+        let mut different = config.clone();
+        different.repository = root.join("another-repository");
+        assert!(Store::create(&root, &different).is_err());
+        assert_eq!(probe_config(&root)?, Some(config));
+        assert!(Store::open(&root)?.paused()?);
+        Ok(())
+    }
+
+    #[test]
+    fn retired_runs_keep_only_the_latest_128_completion_signals() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("state");
+        let store = Store::create(&root, &fixture_config(&root))?;
+        for index in 0..130 {
+            let job = store.insert(&fixture_job(index)?)?;
+            store.retire(&job)?;
+            assert!(store.job(&job.id.0).is_err());
+        }
+        let completions = store.completion_list()?;
+        assert_eq!(completions.len(), 128);
+        assert_eq!(completions[0]["id"], "job-129");
+        assert_eq!(completions[127]["id"], "job-2");
+        assert!(store.completion("job-1")?.is_none());
+        let completion = store.completion("job-129")?.context("completion")?;
+        assert_eq!(completion["phase"], "succeeded");
+        assert!(completion.get("workflow").is_none());
+        assert!(completion.get("commit").is_none());
+        assert!(store.jobs()?.is_empty());
+        drop(store);
+        let bytes = fs::read(root.join("queue.sqlite3"))?;
+        assert!(
+            !bytes
+                .windows(b"private-run-diagnostic-sentinel".len())
+                .any(|window| window == b"private-run-diagnostic-sentinel")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_rejects_uncertain_and_stale_runs() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("state");
+        let store = Store::create(&root, &fixture_config(&root))?;
+        let mut job = store.insert(&fixture_job(0)?)?;
+        job.unresolved = true;
+        store.save(&mut job)?;
+        assert!(store.retire(&job).is_err());
+        assert!(store.completion(&job.id.0)?.is_none());
+        job.unresolved = false;
+        store.save(&mut job)?;
+        let stale = job.clone();
+        job.last_error = Some("a newer terminal update".into());
+        store.save(&mut job)?;
+        assert!(store.retire(&stale).is_err());
+        assert!(store.completion(&job.id.0)?.is_none());
+        store.retire(&job)?;
+        assert!(store.completion(&job.id.0)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn probes_do_not_create_state_and_reject_legacy_or_incomplete_journals() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("state");
+        assert!(probe_config(&root)?.is_none());
+        assert!(!root.exists());
+        let store = Store::create(&root, &fixture_config(&root))?;
+        store.db.execute_batch("PRAGMA user_version=2")?;
+        assert!(probe_config(&root).is_err());
+        assert!(Store::open(&root).is_err());
+        store
+            .db
+            .execute_batch("PRAGMA user_version=3; DELETE FROM control WHERE key='config'")?;
+        assert!(probe_config(&root).is_err());
+        assert!(Store::create(&root, &fixture_config(&root)).is_err());
         Ok(())
     }
 

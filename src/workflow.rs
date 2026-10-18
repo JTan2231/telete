@@ -1,4 +1,4 @@
-//! Caller-selected project commands, frozen with each submission.
+//! Configured project commands, frozen with each submission.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -22,7 +22,7 @@ pub(crate) struct WorkflowCommand {
 }
 
 impl WorkflowCommand {
-    fn validate(&self, stage: &str, host: bool) -> Result<()> {
+    fn validate(&self, stage: &str) -> Result<()> {
         ensure!(
             !self.program.as_os_str().is_empty(),
             "{stage} program is empty"
@@ -30,24 +30,16 @@ impl WorkflowCommand {
         ensure!(
             self.program
                 .components()
-                .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+                && self
+                    .program
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .split(|byte| *byte == b'/')
+                    .enumerate()
+                    .all(|(index, part)| (index == 0 && self.program.is_absolute())
+                        || (!part.is_empty() && part != b"." && part != b"..")),
             "{stage} program must be an absolute or normalized repository-relative path"
-        );
-        // Path components omit interior `.` and repeated separators. Check the
-        // source spelling too, so the retained selection has one clear path.
-        ensure!(
-            self.program
-                .as_os_str()
-                .as_encoded_bytes()
-                .split(|byte| *byte == b'/')
-                .enumerate()
-                .all(|(index, part)| (index == 0 && self.program.is_absolute())
-                    || (!part.is_empty() && part != b"." && part != b"..")),
-            "{stage} program must be an absolute or normalized repository-relative path"
-        );
-        ensure!(
-            !host || self.program.is_absolute(),
-            "{stage} program must be an absolute trusted host path"
         );
         ensure!(
             self.timeout_seconds != Some(0),
@@ -68,32 +60,13 @@ impl WorkflowCommand {
                 "{stage} has an invalid environment name: {name}"
             );
             ensure!(
-                !name.starts_with("TELETE_")
-                    && !matches!(
-                        name.as_str(),
-                        "HOME"
-                            | "TMPDIR"
-                            | "TMP"
-                            | "TEMP"
-                            | "CARGO_HOME"
-                            | "CARGO_TARGET_DIR"
-                            | "RUSTUP_HOME"
-                            | "XDG_CACHE_HOME"
-                            | "CLANG_MODULE_CACHE_PATH"
-                            | "SWIFT_MODULECACHE_PATH"
-                    ),
+                !name.starts_with("TELETE_"),
                 "{stage} cannot override reserved environment: {name}"
             );
             ensure!(
                 !value.contains('\0'),
                 "{stage} environment value contains NUL: {name}"
             );
-            if name == "PATH" {
-                ensure!(
-                    std::env::split_paths(value).all(|directory| directory.is_absolute()),
-                    "{stage} PATH must contain only absolute nonempty directories"
-                );
-            }
         }
         Ok(())
     }
@@ -114,10 +87,6 @@ fn empty_parameters() -> serde_json::Value {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Workflow {
-    #[serde(default)]
-    pub integrate: bool,
-    #[serde(default)]
-    pub accept: bool,
     pub check: WorkflowCommand,
     #[serde(default)]
     pub prepare: Option<WorkflowCommand>,
@@ -133,44 +102,92 @@ impl Workflow {
             self.parameters.is_object(),
             "workflow parameters must be an object"
         );
-        ensure!(
-            !self.accept || self.integrate,
-            "workflow acceptance requires integration"
-        );
-        ensure!(
-            self.deploy.is_none() || self.prepare.is_some(),
-            "workflow deployment requires preparation"
-        );
-        self.check.validate("check", false)?;
+        self.check.validate("check")?;
         if let Some(command) = &self.prepare {
-            command.validate("prepare", true)?;
+            command.validate("prepare")?;
         }
         if let Some(command) = &self.deploy {
-            command.validate("deploy", true)?;
+            command.validate("deploy")?;
         }
         Ok(())
     }
 }
 
-pub(crate) fn read(path: &Path) -> Result<Workflow> {
-    ensure!(path.is_absolute(), "workflow file must be an absolute path");
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectConfig {
+    pub repo: PathBuf,
+    pub state: PathBuf,
+    pub workflow: Workflow,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectFile {
+    repo: PathBuf,
+    state: PathBuf,
+    check: WorkflowCommand,
+    #[serde(default)]
+    prepare: Option<WorkflowCommand>,
+    #[serde(default)]
+    deploy: Option<WorkflowCommand>,
+    #[serde(default = "empty_parameters")]
+    parameters: serde_json::Value,
+}
+
+fn normalized_absolute(path: &Path, directory: &Path) -> PathBuf {
+    let joined = directory.join(path);
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+pub(crate) fn read(path: &Path) -> Result<ProjectConfig> {
+    ensure!(!path.as_os_str().is_empty(), "config path is empty");
+    let path = normalized_absolute(path, &std::env::current_dir()?);
     ensure!(
-        std::fs::symlink_metadata(path)?.is_file(),
-        "workflow must be a regular JSON file"
+        std::fs::metadata(&path)?.is_file(),
+        "config must be a regular JSON file"
     );
-    let workflow: Workflow = serde_json::from_slice(
-        &std::fs::read(path).with_context(|| format!("read workflow {}", path.display()))?,
+    let file: ProjectFile = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("read config {}", path.display()))?,
     )
-    .with_context(|| format!("decode workflow {}", path.display()))?;
+    .with_context(|| format!("decode config {}", path.display()))?;
+    ensure!(
+        !file.repo.as_os_str().is_empty(),
+        "config repo path is empty"
+    );
+    ensure!(
+        !file.state.as_os_str().is_empty(),
+        "config state path is empty"
+    );
+    let workflow = Workflow {
+        check: file.check,
+        prepare: file.prepare,
+        deploy: file.deploy,
+        parameters: file.parameters,
+    };
     workflow.validate()?;
-    Ok(workflow)
+    let directory = path.parent().context("config has no parent directory")?;
+    Ok(ProjectConfig {
+        repo: normalized_absolute(&file.repo, directory),
+        state: normalized_absolute(&file.state, directory),
+        workflow,
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StageRun {
     pub stage: String,
-    pub candidate: CommitId,
+    pub commit: CommitId,
     pub operation: String,
     pub command: CommandSpec,
     pub result: ProcessResult,
@@ -188,12 +205,14 @@ mod tests {
     }
 
     #[test]
-    fn check_only_defaults_and_literal_arguments_are_retained() -> Result<()> {
-        let workflow = workflow(
-            json!({"check":{"program":"scripts/check","args":["one two", "$(touch /tmp/no)", "", "--x=y"]}}),
-        );
+    fn commands_keep_literal_arguments_and_allow_project_environment() -> Result<()> {
+        let workflow = workflow(json!({
+            "check":{"program":"scripts/check","args":["one two", "$(touch /tmp/no)", "", "--x=y"],
+                "env":{"HOME":"/project/home","CARGO_TARGET_DIR":"/project/target","PATH":"relative:/bin"}},
+            "prepare":{"program":"scripts/prepare"},
+            "deploy":{"program":"scripts/deploy"}
+        }));
         workflow.validate()?;
-        assert!(!workflow.integrate && !workflow.accept);
         assert_eq!(workflow.parameters, json!({}));
         assert_eq!(
             workflow.check.args,
@@ -203,25 +222,17 @@ mod tests {
             workflow.check.program(Path::new("/checkout")),
             Path::new("/checkout/scripts/check")
         );
+        assert!(workflow.deploy.is_some());
         Ok(())
     }
 
     #[test]
-    fn invalid_stage_selections_are_rejected() {
-        for value in [
-            json!({"check":{"program":"check"},"accept":true}),
-            json!({"check":{"program":"check"},"deploy":{"program":"/host/deploy"}}),
-            json!({"check":{"program":"check"},"prepare":{"program":"prepare"}}),
-            json!({"check":{"program":"check"},"prepare":{"program":"/host/prepare"},"deploy":{"program":"deploy"}}),
-            json!({"check":{"program":"check"},"parameters":[]}),
-        ] {
-            assert!(workflow(value).validate().is_err());
-        }
-        assert!(workflow(json!({"integrate":true,"accept":true,"check":{"program":"check"},"prepare":{"program":"/host/prepare"},"deploy":{"program":"/host/deploy"}})).validate().is_ok());
+    fn deployment_does_not_require_preparation() -> Result<()> {
+        workflow(json!({"check":{"program":"check"},"deploy":{"program":"deploy"}})).validate()
     }
 
     #[test]
-    fn ambiguous_paths_environment_and_zero_timeout_are_rejected() {
+    fn ambiguous_paths_invalid_environment_and_zero_timeout_are_rejected() {
         for program in [
             "",
             ".",
@@ -243,11 +254,6 @@ mod tests {
             json!({"program":"check","timeout_seconds":0}),
             json!({"program":"check","args":["\u{0}"]}),
             json!({"program":"check","env":{"TELETE_CONTEXT":"elsewhere"}}),
-            json!({"program":"check","env":{"TELETE_STATE":"elsewhere"}}),
-            json!({"program":"check","env":{"CARGO_TARGET_DIR":"/elsewhere"}}),
-            json!({"program":"check","env":{"HOME":"/elsewhere"}}),
-            json!({"program":"check","env":{"PATH":"/bin::/usr/bin"}}),
-            json!({"program":"check","env":{"PATH":"relative:/bin"}}),
             json!({"program":"check","env":{"BAD=NAME":"value"}}),
             json!({"program":"check","env":{"1BAD":"value"}}),
             json!({"program":"check","env":{"VALID":"\u{0}"}}),
@@ -257,17 +263,27 @@ mod tests {
     }
 
     #[test]
-    fn workflow_file_is_validated_and_unknown_selections_are_rejected() -> Result<()> {
-        assert!(read(Path::new("workflow.json")).is_err());
+    fn config_paths_are_relative_to_config_and_old_fields_are_rejected() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("workflow.json");
-        std::fs::write(&path, r#"{"check":{"program":"check"},"unknown":true}"#)?;
-        assert!(read(&path).is_err());
+        let config_dir = directory.path().join("config");
+        std::fs::create_dir(&config_dir)?;
+        let path = config_dir.join("telete.json");
         std::fs::write(
             &path,
-            r#"{"check":{"program":"check","env":{"PROJECT_MODE":"ci"}}}"#,
+            r#"{"repo":"..","state":"../.telete","check":{"program":"check"}}"#,
         )?;
-        assert_eq!(read(&path)?.check.env["PROJECT_MODE"], "ci");
+        let project = read(&path)?;
+        assert_eq!(project.repo, directory.path());
+        assert_eq!(project.state, directory.path().join(".telete"));
+        for value in [
+            json!({"check":{"program":"check"}}),
+            json!({"repo":"..","state":"../.telete","check":{"program":"check"},"integrate":true}),
+            json!({"repo":"..","state":"../.telete","check":{"program":"check"},"accept":true}),
+            json!({"repo":"..","state":"../.telete","check":{"program":"check"},"unknown":true}),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&value)?)?;
+            assert!(read(&path).is_err());
+        }
         Ok(())
     }
 }

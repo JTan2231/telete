@@ -1,6 +1,5 @@
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -16,18 +15,14 @@ pub(crate) struct Paths {
 }
 
 impl Paths {
-    pub(crate) fn selected(root: PathBuf, initialize: bool) -> Result<Self> {
+    pub(crate) fn selected(root: PathBuf, create: bool) -> Result<Self> {
         if let Some(config) = crate::store::probe_config(&root)? {
             ensure!(config.state_root == root, "queue state directory changed");
-        } else {
-            ensure!(initialize, "Telete is not initialized; run telete init");
-            ensure!(
-                !private_directory_exists(&root)? || fs::read_dir(&root)?.next().is_none(),
-                "refusing to initialize nonempty state without a Telete journal"
-            );
         }
         let paths = Self { root };
-        paths.initialize()?;
+        if create {
+            paths.create_directories()?;
+        }
         Ok(paths)
     }
 
@@ -39,18 +34,9 @@ impl Paths {
         Ok(())
     }
 
-    fn initialize(&self) -> Result<()> {
+    fn create_directories(&self) -> Result<()> {
         ensure_private(&self.root)?;
-        for name in [
-            "jobs",
-            "tmp",
-            "targets",
-            "broker",
-            "deployments",
-            "logs",
-            "cargo",
-            "cache",
-        ] {
+        for name in ["jobs", "tmp", "broker", "deployments"] {
             ensure_private(&self.root.join(name))?;
         }
         Ok(())
@@ -59,51 +45,12 @@ impl Paths {
     #[cfg(test)]
     pub(crate) fn for_test(root: PathBuf) -> Result<Self> {
         let paths = Self { root };
-        paths.initialize()?;
+        paths.create_directories()?;
         Ok(paths)
     }
 
     pub(crate) fn job(&self, id: &str) -> PathBuf {
         self.root.join("jobs").join(id)
-    }
-
-    pub(crate) fn targets(&self) -> PathBuf {
-        self.root.join("targets")
-    }
-
-    pub(crate) fn require_capacity(&self) -> Result<()> {
-        ensure!(
-            fs2::available_space(&self.root)? >= 2 * 1024 * 1024 * 1024,
-            "selected state directory has less than 2 GiB free"
-        );
-        Ok(())
-    }
-
-    pub(crate) fn environment(&self) -> BTreeMap<String, String> {
-        let temporary = self.root.join("tmp").display().to_string();
-        let cache = self.root.join("cache").display().to_string();
-        let home = std::env::var("HOME").unwrap_or_default();
-        BTreeMap::from([
-            (
-                "PATH".into(),
-                format!("{home}/.cargo/bin:{home}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
-            ),
-            ("RUSTUP_HOME".into(), format!("{home}/.rustup")),
-            ("TMPDIR".into(), temporary.clone()),
-            ("TMP".into(), temporary.clone()),
-            ("TEMP".into(), temporary),
-            (
-                "CARGO_HOME".into(),
-                self.root.join("cargo").display().to_string(),
-            ),
-            (
-                "CARGO_TARGET_DIR".into(),
-                self.targets().display().to_string(),
-            ),
-            ("XDG_CACHE_HOME".into(), cache.clone()),
-            ("CLANG_MODULE_CACHE_PATH".into(), format!("{cache}/clang")),
-            ("SWIFT_MODULECACHE_PATH".into(), format!("{cache}/swift")),
-        ])
     }
 }
 
@@ -152,8 +99,10 @@ pub(crate) fn private_directory_exists(path: &Path) -> Result<bool> {
 
 pub(crate) fn ensure_private(path: &Path) -> Result<()> {
     if !private_directory_exists(path)? {
-        fs::create_dir_all(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(path)?;
         ensure!(
             private_directory_exists(path)?,
             "private directory is missing"

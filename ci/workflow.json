@@ -1,4 +1,6 @@
 {
+  "repo": "..",
+  "state": "../.telete",
   "check": {
     "program": "ci/check.sh",
     "args": [],

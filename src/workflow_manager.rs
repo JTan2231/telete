@@ -1,22 +1,19 @@
-//! Frozen workflow stages and correlated command completion.
+//! Current command selection and reconciliation; recovery never launches work.
 
-use super::{
-    BTreeMap, Context, Job, Phase, Result, StageRun, Worker, bail, ensure, fs, git, json, store,
-};
-use crate::broker;
-use crate::invocation;
-use crate::process::CommandSpec;
+use super::{Context, Job, Phase, Result, StageRun, Worker, bail, ensure, fs, json, store};
+use crate::{broker, invocation, process::CommandSpec};
 
 impl Worker<'_> {
     fn workflow_command(&self, job: &Job, stage: &str, operation: &str) -> Result<CommandSpec> {
-        let workflow = &job.workflow;
         let selected = match stage {
-            "check" => &workflow.check,
-            "prepare" => workflow
+            "check" => &job.workflow.check,
+            "prepare" => job
+                .workflow
                 .prepare
                 .as_ref()
                 .context("preparation not selected")?,
-            "deploy" => workflow
+            "deploy" => job
+                .workflow
                 .deploy
                 .as_ref()
                 .context("deployment not selected")?,
@@ -25,59 +22,33 @@ impl Worker<'_> {
         let preparation = job
             .runs
             .iter()
-            .rev()
-            .find(|run| {
-                run.stage == "prepare"
-                    && Some(&run.candidate) == job.candidate.as_ref()
-                    && run.result.success()
-            })
-            .map(|run| {
-                self.paths
-                    .job(&job.id.0)
-                    .join(format!("{}.json", run.operation))
-            });
+            .find(|run| run.stage == "prepare" && run.result.success())
+            .and_then(|run| run.command.context.as_ref())
+            .map(|context| context.value["outputs"]["directory"].clone());
         let output = self.paths.job(&job.id.0).join("outputs").join(operation);
-        let mut command = invocation::bind(
+        crate::invocation::bind(
             self.paths,
             job,
             operation,
             stage,
-            &json!({"preparation": preparation}),
-            &json!({"directory": output}),
+            &json!({"preparation":preparation}),
+            &json!({"directory":output}),
             CommandSpec {
                 program: selected.program(&self.worktree(job)),
                 args: selected.args.clone(),
                 cwd: self.worktree(job),
-                env: BTreeMap::new(),
+                env: selected.env.clone(),
                 timeout_seconds: selected.timeout_seconds,
                 stdin: None,
-                confined: stage != "deploy" && !cfg!(test),
                 context: None,
             },
-        )?;
-        command.env.extend(selected.env.clone());
-        Ok(command)
+        )
     }
 
     fn workflow_key(job: &Job, operation: &str) -> String {
         format!("{}-{operation}", job.id)
     }
 
-    fn require_workflow_success(job: &Job, stage: &str) -> Result<()> {
-        ensure!(
-            job.runs
-                .iter()
-                .rev()
-                .find(|run| {
-                    run.stage == stage && Some(&run.candidate) == job.candidate.as_ref()
-                })
-                .is_some_and(|run| run.result.success()),
-            "workflow has no successful {stage} for this candidate"
-        );
-        Ok(())
-    }
-
-    // Reconcile only terminal broker evidence. No recovery path launches commands.
     pub(super) fn reconcile_workflow(&self, job: &Job) -> Result<()> {
         let operation = job
             .operation
@@ -93,13 +64,10 @@ impl Worker<'_> {
         ensure!(
             operation.name == expected
                 && operation.result == self.paths.job(&job.id.0).join(format!("{expected}.json"))
+                && operation.commit == job.commit
                 && (job.phase == operation.phase
                     || (job.phase == Phase::Blocked && job.stopped_phase == Some(operation.phase))),
-            "workflow intent does not match its stage and owned receipt"
-        );
-        ensure!(
-            Some(&operation.candidate) == job.candidate.as_ref(),
-            "workflow intent names another candidate"
+            "workflow intent does not match its stage and owned result"
         );
         let command = self.workflow_command(job, stage, &operation.name)?;
         let saved: CommandSpec = serde_json::from_slice(&fs::read(
@@ -107,7 +75,7 @@ impl Worker<'_> {
         )?)?;
         ensure!(
             serde_json::to_value(&saved)? == serde_json::to_value(&command)?,
-            "workflow invocation differs from frozen workflow"
+            "workflow command differs from selected configuration"
         );
         let result = broker::completed(
             self.paths,
@@ -116,7 +84,7 @@ impl Worker<'_> {
         )?;
         let run = StageRun {
             stage: stage.into(),
-            candidate: operation.candidate.clone(),
+            commit: job.commit.clone(),
             operation: operation.name.clone(),
             command: saved,
             result,
@@ -126,7 +94,7 @@ impl Worker<'_> {
             let previous: StageRun = serde_json::from_slice(&fs::read(&operation.result)?)?;
             ensure!(
                 serde_json::to_value(&previous)? == serde_json::to_value(&run)?,
-                "workflow receipt differs from terminal process evidence"
+                "command result differs from terminal process evidence"
             );
         } else {
             store::atomic_json(&operation.result, &run)?;
@@ -134,61 +102,53 @@ impl Worker<'_> {
         Ok(())
     }
 
-    fn verify_workflow_stage(&self, job: &Job, stage: &str) -> Result<()> {
-        if stage != "check" {
-            Self::require_workflow_success(job, "check")?;
-        }
-        if stage == "deploy" {
-            Self::require_workflow_success(job, "prepare")?;
-            if job.workflow.accept {
-                ensure!(
-                    job.accepted
-                        && git::ref_value(self.paths, &self.config.repository, git::ACCEPTED)?
-                            .as_ref()
-                            == job.candidate.as_ref(),
-                    "accepted source changed before deployment"
-                );
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn workflow_stage(&self, job: &mut Job, stage: &str) -> Result<()> {
-        self.verify_workflow_stage(job, stage)?;
-        let candidate = Self::candidate(job)?.clone();
-        if job.cancel_requested && job.operation.is_none() {
-            return self.finish(
-                job,
-                Phase::Cancelled,
-                format!("Cancelled before workflow {stage} admission"),
-                false,
+        if stage != "check" {
+            ensure!(
+                job.runs
+                    .iter()
+                    .any(|run| run.stage == "check" && run.result.success()),
+                "workflow has no successful check"
             );
         }
         let operation = format!("workflow-{stage}-{}", job.runs.len());
-        let receipt = self.directory(job)?.join(format!("{operation}.json"));
+        let result_path = self.directory(job)?.join(format!("{operation}.json"));
         let command = self.workflow_command(job, stage, &operation)?;
-        let directory = invocation::directory(self.paths, job, &operation)?;
-        let request = directory.join("request.json");
+        let request = invocation::directory(self.paths, job, &operation)?.join("request.json");
         if request.exists() {
             let saved: CommandSpec = serde_json::from_slice(&fs::read(&request)?)?;
             ensure!(
-                serde_json::to_value(&saved)? == serde_json::to_value(&command)?,
+                serde_json::to_value(saved)? == serde_json::to_value(&command)?,
                 "workflow invocation identity changed"
             );
         } else {
             ensure!(
                 job.operation.is_none(),
-                "admitted workflow invocation is missing"
+                "admitted command request is missing"
             );
-            git::clean_candidate(self.paths, &self.worktree(job), &candidate)?;
-            if stage == "check" && !job.workflow.check.program.is_absolute() {
-                let program = command
-                    .program
-                    .canonicalize()
-                    .context("candidate check program is unavailable")?;
+            let selected = match stage {
+                "check" => &job.workflow.check,
+                "prepare" => job
+                    .workflow
+                    .prepare
+                    .as_ref()
+                    .context("preparation not selected")?,
+                "deploy" => job
+                    .workflow
+                    .deploy
+                    .as_ref()
+                    .context("deployment not selected")?,
+                _ => bail!("unknown workflow stage"),
+            };
+            // A missing absolute executable is a recorded start failure. A
+            // relative path must also remain inside its source checkout.
+            if !selected.program.is_absolute() && command.program.exists() {
                 ensure!(
-                    program.starts_with(self.worktree(job).canonicalize()?),
-                    "candidate check program escapes its checkout"
+                    command
+                        .program
+                        .canonicalize()?
+                        .starts_with(self.worktree(job).canonicalize()?),
+                    "relative workflow program escapes its checkout"
                 );
             }
             store::private_directory(&self.paths.job(&job.id.0).join("outputs").join(&operation))?;
@@ -202,17 +162,27 @@ impl Worker<'_> {
         } else {
             None
         };
-        if self.begin_operation(job, operation.clone(), receipt.clone())? {
+        if self.begin_operation(job, operation.clone(), result_path.clone())? {
             broker::run(self.paths, &Self::workflow_key(job, &operation), &command)?;
         }
         self.reconcile_workflow(job)?;
-        let run: StageRun = serde_json::from_slice(&fs::read(receipt)?)?;
+        let run: StageRun = serde_json::from_slice(&fs::read(result_path)?)?;
         let success = run.result.success();
-        let diagnostic = self.directory(job)?.join(format!("{operation}.log"));
-        store::atomic_bytes(&diagnostic, run.result.diagnostics().as_bytes())?;
+        store::atomic_bytes(
+            &self.directory(job)?.join(format!("{operation}.log")),
+            run.result.diagnostics().as_bytes(),
+        )?;
         job.runs.push(run);
         job.operation = None;
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
+        if !success {
+            return self.finish(
+                job,
+                Phase::Failed,
+                format!("Workflow {stage} failed for {}", job.commit),
+                false,
+            );
+        }
         if job.cancel_requested {
             return self.finish(
                 job,
@@ -221,63 +191,17 @@ impl Worker<'_> {
                 false,
             );
         }
-        if stage != "deploy" {
-            git::clean_candidate(self.paths, &self.worktree(job), &candidate)?;
-        }
-        if !success {
-            return self.finish(
-                job,
-                Phase::Failed,
-                format!("Workflow {stage} failed for {candidate}"),
-                false,
-            );
-        }
-        self.workflow_next(job, stage)
-    }
-
-    fn workflow_next(&self, job: &mut Job, completed: &str) -> Result<()> {
-        let workflow = &job.workflow;
-        if completed == "check" && workflow.prepare.is_some() {
+        if stage == "check" && job.workflow.prepare.is_some() {
             return self.save(job, Phase::Preparing);
         }
-        if matches!(completed, "check" | "prepare") && workflow.accept {
-            return self.save(job, Phase::Accepting);
-        }
-        if completed != "deploy" && workflow.deploy.is_some() {
+        if stage != "deploy" && job.workflow.deploy.is_some() {
             return self.save(job, Phase::Deploying);
         }
         self.finish(
             job,
             Phase::Succeeded,
-            format!(
-                "Requested workflow stages succeeded for {}",
-                Self::candidate(job)?
-            ),
+            "Configured workflow succeeded".into(),
             false,
         )
-    }
-
-    pub(super) fn workflow_accept(&self, job: &mut Job) -> Result<()> {
-        let workflow = &job.workflow;
-        ensure!(
-            workflow.accept && workflow.integrate,
-            "workflow did not select conditional acceptance"
-        );
-        Self::require_workflow_success(job, "check")?;
-        if workflow.prepare.is_some() {
-            Self::require_workflow_success(job, "prepare")?;
-        }
-        let candidate = Self::candidate(job)?.clone();
-        git::clean_candidate(self.paths, &self.worktree(job), &candidate)?;
-        git::advance(
-            self.paths,
-            &self.config.repository,
-            git::ACCEPTED,
-            Some(Self::base(job)?),
-            &candidate,
-        )?;
-        job.accepted = true;
-        self.store.save(job)?;
-        self.workflow_next(job, "accept")
     }
 }

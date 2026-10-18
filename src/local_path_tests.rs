@@ -7,36 +7,34 @@ fn path_fixture() -> Result<(tempfile::TempDir, PathBuf)> {
 }
 
 fn retain_config(root: &Path, state_root: &Path) -> Result<()> {
-    let store = crate::store::Store::open(root, true)?;
-    let config = crate::store::Config {
-        state_root: state_root.to_path_buf(),
+    let mut config = crate::store::Config {
+        state_root: root.to_path_buf(),
         repository: "/fixture".into(),
         common_git_dir: "/fixture/.git".into(),
-        accepted_baseline: None,
     };
+    let store = crate::store::Store::create(root, &config)?;
+    config.state_root = state_root.to_path_buf();
     store.set("config", &config)
 }
 
 #[test]
-fn selected_state_contains_all_working_directories_and_reopens() -> Result<()> {
+fn selected_state_creates_only_telete_working_directories() -> Result<()> {
     let (_directory, root) = path_fixture()?;
     let paths = Paths::selected(root.clone(), true)?;
     assert_eq!(paths.root, root);
-    let environment = paths.environment();
-    for (key, relative) in [
-        ("CARGO_HOME", "cargo"),
-        ("CARGO_TARGET_DIR", "targets"),
-        ("TMPDIR", "tmp"),
-        ("XDG_CACHE_HOME", "cache"),
-    ] {
-        assert_eq!(environment[key], root.join(relative).display().to_string());
-        assert!(root.join(relative).is_dir());
+    for name in ["jobs", "tmp", "broker", "deployments"] {
+        assert!(root.join(name).is_dir());
+    }
+    for name in ["cargo", "cache", "targets", "logs"] {
+        assert!(!root.join(name).exists());
     }
     retain_config(&root, &root)?;
     let config = crate::store::probe_config(&root)?.context("retained configuration")?;
     paths.verify_config(&config)?;
-    let reopened = Paths::selected(root, false)?;
-    assert_eq!(reopened.environment(), environment);
+    fs::remove_dir(root.join("tmp"))?;
+    let reopened = Paths::selected(root.clone(), false)?;
+    assert_eq!(reopened.root, root);
+    assert!(!root.join("tmp").exists());
     Ok(())
 }
 
@@ -54,20 +52,24 @@ fn changed_state_binding_fails_before_creating_working_directories() -> Result<(
 }
 
 #[test]
-fn initialization_requires_explicit_selection_of_empty_state() -> Result<()> {
+fn read_only_selection_accepts_absent_state_without_creating_it() -> Result<()> {
     let (_directory, root) = path_fixture()?;
-    assert!(Paths::selected(root.clone(), false).is_err());
+    let paths = Paths::selected(root.clone(), false)?;
+    assert_eq!(paths.root, root);
     assert!(!root.exists());
     ensure_private(&root)?;
     fs::write(root.join("unrecognized"), "retained")?;
-    assert!(Paths::selected(root.clone(), true).is_err());
+    Paths::selected(root.clone(), false)?;
     assert!(!root.join("queue.sqlite3").exists());
     assert!(!root.join("jobs").exists());
+    Paths::selected(root.clone(), true)?;
+    assert_eq!(fs::read_to_string(root.join("unrecognized"))?, "retained");
+    assert!(root.join("jobs").is_dir());
     Ok(())
 }
 
 #[test]
-fn incomplete_foreign_and_malformed_journals_cannot_initialize_state() -> Result<()> {
+fn incomplete_foreign_and_malformed_journals_fail_before_directory_creation() -> Result<()> {
     for kind in [
         "empty",
         "foreign",
@@ -92,9 +94,13 @@ fn incomplete_foreign_and_malformed_journals_cannot_initialize_state() -> Result
                 }
             }
             _ => {
-                let store = crate::store::Store::open(&root, true)?;
+                retain_config(&root, &root)?;
                 if kind == "malformed" {
+                    let store = crate::store::Store::open(&root)?;
                     store.set("config", &"unfinished config")?;
+                } else {
+                    let db = rusqlite::Connection::open(&database)?;
+                    db.execute("DELETE FROM control WHERE key='config'", [])?;
                 }
             }
         }
