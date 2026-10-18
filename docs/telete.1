@@ -1,4 +1,4 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.1.0" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.1.1" "General Commands Manual"
 .SH NAME
 telete \- run a serial queue of committed repository workflows
 .SH SYNOPSIS
@@ -41,6 +41,69 @@ Creating a development worktree binds the Git common directory to one queue.
 The original checkout, every linked worktree, and alternate configurations then
 share that queue, including worktrees created directly with Git.
 Separate clones retain independent queues.
+.SH INSTALLATION
+From this repository, run:
+.PP
+.RS
+.nf
+\&./ci/install.sh
+.fi
+.RE
+.PP
+The script builds the release binary with Cargo's locked dependency versions,
+then installs
+.I ~/.local/bin/telete
+and
+.IR ~/.local/share/man/man1/telete.1 .
+It replaces the executable atomically after a successful build.
+Use
+.B ./ci/install.sh \-\-prefix
+.I path
+to select another installation prefix.
+The script does not edit shell profiles.
+.PP
+Add the following to your shell profile once, then open a new shell or run the
+line in your current shell:
+.PP
+.RS
+.nf
+export PATH="$HOME/.local/bin:$PATH"
+.fi
+.RE
+.PP
+The command is then available from any directory.
+Project operations still require
+.BR \-\-config ;
+use an absolute configuration path when invoking from another directory.
+If the installed manual is not found, run
+.BR "man \-M \(dq$HOME/.local/share/man\(dq telete" .
+.PP
+This repository's
+.B ci.sh
+wrapper selects
+.BR ci/workflow.json .
+Its workflow runs
+.B ci/check.sh
+and then
+.B ci/install.sh
+from the submitted commit, installing only after checks succeed.
+Restart running workers to use an upgraded executable.
+See RECOVERY for runtime version compatibility.
+.SS Release versions
+.B Cargo.toml
+owns the package version displayed by
+.BR "telete \-\-version" .
+Before committing a release, run
+.B ./ci/bump-version.sh
+to bump the patch version, or pass
+.B minor
+or
+.BR major .
+Minor and major bumps reset lower version components.
+The helper updates the package manifest, the package's lockfile entry, and this
+manual's version header together.
+Review and commit these changes before submitting the workflow.
+Deployment installs the version in the submitted commit without bumping it.
 .SH OPTIONS
 The following global options may appear before or after a subcommand.
 .TP
