@@ -103,9 +103,18 @@ pub(crate) fn private_ref(job: &str) -> Result<String> {
     Ok(format!("refs/telete/jobs/{job}"))
 }
 
+pub(crate) fn result_ref(job: &str) -> Result<String> {
+    crate::model::JobId::new(job)?;
+    Ok(format!("refs/telete/results/{job}"))
+}
+
+fn managed_ref(reference: &str) -> bool {
+    reference.starts_with("refs/telete/jobs/") || reference.starts_with("refs/telete/results/")
+}
+
 pub(crate) fn ref_value(paths: &Paths, repo: &Path, reference: &str) -> Result<Option<CommitId>> {
     ensure!(
-        reference.starts_with("refs/telete/jobs/"),
+        managed_ref(reference),
         "Telete cannot read another manager's refs"
     );
     let result = run(
@@ -131,7 +140,7 @@ pub(crate) fn advance(
     new: &CommitId,
 ) -> Result<()> {
     ensure!(
-        reference.starts_with("refs/telete/jobs/"),
+        managed_ref(reference),
         "Telete cannot mutate another manager's refs"
     );
     let observed = ref_value(paths, repo, reference)?;
@@ -331,4 +340,143 @@ pub(crate) fn remove_worktree(
         fs::remove_dir_all(path)?;
     }
     Ok(())
+}
+
+/// Retain automatic edits independently of the execution checkout. A separate
+/// index excludes untracked generated files and ignores a command's staging.
+pub(crate) fn retain_fixes(
+    paths: &Paths,
+    repo: &Path,
+    checkout: &Path,
+    job: &crate::store::Job,
+) -> Result<CommitId> {
+    ensure!(
+        common(paths, checkout)? == common(paths, repo)?,
+        "fix checkout belongs to another repository"
+    );
+    let symbolic = run(
+        paths,
+        checkout,
+        &strings(&["symbolic-ref", "-q", "HEAD"]),
+        None,
+        BTreeMap::new(),
+    )?;
+    ensure!(
+        symbolic.exited_with(&[1]),
+        "fix checkout must keep a detached HEAD"
+    );
+    let reference = result_ref(&job.id.0)?;
+    let head = commit(paths, checkout, "HEAD")?;
+    if let Some(retained) = ref_value(paths, repo, &reference)? {
+        ensure!(
+            head == job.commit || head == retained,
+            "fix command changed its checkout HEAD"
+        );
+        if retained != job.commit {
+            let parent = value(
+                paths,
+                repo,
+                &["rev-list", "--parents", "-n", "1", &retained.0],
+            )?;
+            ensure!(
+                parent == format!("{} {}", retained, job.commit),
+                "retained fix commit is not a child of submitted source"
+            );
+        }
+        value(paths, checkout, &["reset", "--hard", &retained.0])?;
+        return Ok(retained);
+    }
+    ensure!(head == job.commit, "fix command changed its checkout HEAD");
+    let environment = BTreeMap::from([(
+        "GIT_INDEX_FILE".into(),
+        paths.job(&job.id.0).join("fix.index").display().to_string(),
+    )]);
+    for args in [
+        vec!["read-tree", &job.commit.0],
+        vec!["add", "-u", "--", "."],
+    ] {
+        let result = run(paths, checkout, &strings(&args), None, environment.clone())?;
+        ensure!(
+            result.success(),
+            "could not stage automatic edits: {}",
+            result.stderr.trim()
+        );
+    }
+    let tree = run(
+        paths,
+        checkout,
+        &strings(&["write-tree"]),
+        None,
+        environment.clone(),
+    )?;
+    ensure!(
+        tree.success(),
+        "could not record automatic source tree: {}",
+        tree.stderr.trim()
+    );
+    let tree = tree.stdout.trim();
+    let original_tree = value(
+        paths,
+        checkout,
+        &["rev-parse", &format!("{}^{{tree}}", job.commit)],
+    )?;
+    let result = if tree == original_tree {
+        job.commit.clone()
+    } else {
+        automatic_commit(paths, checkout, tree, job)?
+    };
+    advance(paths, repo, &reference, None, &result)?;
+    value(paths, checkout, &["reset", "--hard", &result.0])?;
+    Ok(result)
+}
+
+pub(crate) fn unchanged(paths: &Paths, checkout: &Path, revision: &CommitId) -> Result<()> {
+    ensure!(
+        commit(paths, checkout, "HEAD")? == *revision,
+        "workflow changed its checked commit"
+    );
+    let diff = value(
+        paths,
+        checkout,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?;
+    ensure!(
+        diff.is_empty(),
+        "workflow changed tracked source after automatic edits"
+    );
+    Ok(())
+}
+
+fn automatic_commit(
+    paths: &Paths,
+    checkout: &Path,
+    tree: &str,
+    job: &crate::store::Job,
+) -> Result<CommitId> {
+    let mut environment = BTreeMap::new();
+    for name in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
+        environment.insert(name.into(), "Telete".into());
+    }
+    for name in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
+        environment.insert(name.into(), "telete@localhost".into());
+    }
+    for name in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
+        environment.insert(name.into(), format!("@{} +0000", job.created));
+    }
+    let generated = run(
+        paths,
+        checkout,
+        &strings(&["commit-tree", tree, "-p", &job.commit.0]),
+        Some(format!(
+            "Apply automatic source updates\n\nTelete-Job: {}\n",
+            job.id
+        )),
+        environment,
+    )?;
+    ensure!(
+        generated.success(),
+        "could not commit automatic edits: {}",
+        generated.stderr.trim()
+    );
+    CommitId::new(generated.stdout.trim())
 }

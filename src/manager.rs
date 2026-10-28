@@ -93,6 +93,7 @@ fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
         created: store::now(),
         updated: store::now(),
         commit,
+        resulting_commit: None,
         workflow,
         runs: Vec::new(),
         operation: None,
@@ -251,7 +252,10 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
         .stopped_phase
         .context("blocked job has no operation phase")?;
     ensure!(
-        matches!(phase, Phase::Checking | Phase::Preparing | Phase::Deploying),
+        matches!(
+            phase,
+            Phase::Fixing | Phase::Checking | Phase::Preparing | Phase::Deploying
+        ),
         "blocked job has no command to reconcile"
     );
     let mut worker = Worker {
@@ -397,8 +401,16 @@ impl Worker<'_> {
                     &self.worktree(job),
                     &job.commit,
                 )?;
-                self.save(job, Phase::Checking)
+                self.save(
+                    job,
+                    if job.workflow.fix.is_some() {
+                        Phase::Fixing
+                    } else {
+                        Phase::Checking
+                    },
+                )
             }
+            Phase::Fixing => self.workflow_stage(job, "fix"),
             Phase::Checking => self.workflow_stage(job, "check"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
             Phase::Deploying => self.workflow_stage(job, "deploy"),
@@ -496,7 +508,7 @@ impl Worker<'_> {
         if let Some(operation) = &job.operation {
             ensure!(
                 operation.name == name
-                    && operation.commit == job.commit
+                    && operation.commit == *job.effective_commit()
                     && operation.phase == job.phase
                     && operation.result == result,
                 "retained operation does not match current stage"
@@ -510,7 +522,7 @@ impl Worker<'_> {
         job.operation = Some(Operation {
             phase: job.phase,
             name,
-            commit: job.commit.clone(),
+            commit: job.effective_commit().clone(),
             result,
             started: store::now(),
         });

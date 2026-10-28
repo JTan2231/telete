@@ -1,8 +1,8 @@
 # Operate Telete
 
 Telete runs a serial queue for committed repository source on macOS. The project
-config selects one required check command and optional preparation and deployment
-commands. Telete owns the queue and execution records. Configured commands own
+config selects one required check command and optional fix, preparation, and
+deployment commands. Telete owns the queue and execution records. Configured commands own
 the meaning of their checks, outputs, and deployment effects.
 
 ## Select a project
@@ -128,20 +128,37 @@ after the job was admitted, the receipt still identifies that job and includes
 Inspect the admitted job rather than submitting it again. With `--follow`, a
 second JSON result reports the final observation.
 
-Each job runs that exact commit in a clean private checkout. Telete does not
-merge source, maintain an accepted baseline, accept commits, or advance project
-branches. The execution context identifies one commit throughout the workflow.
+Each job starts from that exact commit in a clean private checkout. An optional
+`fix` command edits tracked source before checks. Telete records those edits in
+one direct child commit with `Telete <telete@localhost>` as both author and
+committer. No changes produce no new commit. The command keeps a detached HEAD;
+Telete stages existing tracked paths with its own index. New untracked files,
+build outputs, and command staging are excluded.
+
+Telete retains the resulting commit at `refs/telete/results/JOB`. It creates this
+ref even when corrections produce no changes or the fix command fails. A failed
+fix command stops the workflow after retaining its edits. Cancellation and
+scratch cleanup preserve the ref. The ref belongs to source history and remains
+until the project explicitly removes it. Telete does not merge or advance project
+branches; the project can integrate the returned commit.
+
+`commit` in job status remains the submitted SHA. After fixes, `resulting_commit`
+and `result_ref` identify the retained source. All subsequent commands run on
+that resulting commit. Commands after fixes must preserve HEAD and tracked
+source. A violation fails the job. Resuming the job consumes saved command
+evidence and reuses its result commit instead of applying corrections again.
 
 The supported workflow fields are:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `check` | required | Check the selected commit. |
+| `fix` | absent | Apply tracked source corrections before checks. |
+| `check` | required | Check the resulting commit. |
 | `prepare` | absent | Run after a successful check. |
 | `deploy` | absent | Run after successful preceding stages. |
 | `parameters` | `{}` | Pass the supplied object unchanged to commands. |
 
-The order is check, optional preparation, and optional deployment. Deployment can
+The order is optional fixes, check, optional preparation, and optional deployment. Deployment can
 be selected without preparation. A stage that was not selected does not become
 a successful execution. Unknown config and command fields are rejected.
 
@@ -185,8 +202,15 @@ before launch. Retaining the exact command lets recovery reconcile the same
 execution instead of constructing another command from current settings.
 
 The context contains the job and operation identity, stage, checkout,
-`source.commit`, parameters, inputs, and outputs. `outputs.directory` names the private output
-directory for the command. When preparation was selected and succeeded,
+`source.commit`, parameters, inputs, and outputs. For a workflow with fixes,
+`source.submitted_commit` preserves the submitted SHA and `source.result_ref`
+names the retained result. `source.commit` identifies the submitted source in
+the fix command and the resulting source in every later command. Workflows
+without a fix command keep their previous context shape.
+
+`outputs.directory` names the private output directory for the command. With
+fixes selected, `inputs.fix` is null during fixes and names the completed fix
+command's output directory in subsequent commands. When preparation was selected and succeeded,
 `inputs.preparation` contains its absolute output directory; otherwise it is
 null. Telete
 defines no package or installation format.
@@ -252,8 +276,9 @@ finishes successfully or fails. Cancellation does not supersede that failure.
 Successful and cancelled jobs release their scratch files and full execution
 records; superseded failures do likewise.
 
-Telete retains at most 128 small settled-job markers containing only job ID,
-phase, queue sequence, and update time. Markers contain no commit, command,
+Telete retains at most 128 small settled-job markers containing job ID, phase,
+queue sequence, and update time. Jobs with completed fixes also retain the
+submitted commit, resulting commit, and result ref. Markers contain no command,
 parameters, environment, or output. Old markers are pruned, and `wait JOB` then
 reports that the job is unavailable. Archive any project outputs through the
 configured commands when they need a longer lifetime.

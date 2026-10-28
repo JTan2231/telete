@@ -5,33 +5,30 @@ use crate::{broker, invocation, process::CommandSpec};
 
 impl Worker<'_> {
     fn workflow_command(&self, job: &Job, stage: &str, operation: &str) -> Result<CommandSpec> {
-        let selected = match stage {
-            "check" => &job.workflow.check,
-            "prepare" => job
-                .workflow
-                .prepare
-                .as_ref()
-                .context("preparation not selected")?,
-            "deploy" => job
-                .workflow
-                .deploy
-                .as_ref()
-                .context("deployment not selected")?,
-            _ => bail!("unknown workflow stage"),
-        };
+        let selected = job.workflow.command(stage)?;
         let preparation = job
             .runs
             .iter()
             .find(|run| run.stage == "prepare" && run.result.success())
             .and_then(|run| run.command.context.as_ref())
             .map(|context| context.value["outputs"]["directory"].clone());
+        let fix = job
+            .runs
+            .iter()
+            .find(|run| run.stage == "fix")
+            .and_then(|run| run.command.context.as_ref())
+            .map(|context| context.value["outputs"]["directory"].clone());
+        let mut inputs = json!({"preparation":preparation});
+        if job.workflow.fix.is_some() {
+            inputs["fix"] = json!(fix);
+        }
         let output = self.paths.job(&job.id.0).join("outputs").join(operation);
         crate::invocation::bind(
             self.paths,
             job,
             operation,
             stage,
-            &json!({"preparation":preparation}),
+            &inputs,
             &json!({"directory":output}),
             CommandSpec {
                 program: selected.program(&self.worktree(job)),
@@ -55,6 +52,7 @@ impl Worker<'_> {
             .as_ref()
             .context("workflow has no retained intent")?;
         let stage = match operation.phase {
+            Phase::Fixing => "fix",
             Phase::Checking => "check",
             Phase::Preparing => "prepare",
             Phase::Deploying => "deploy",
@@ -64,7 +62,7 @@ impl Worker<'_> {
         ensure!(
             operation.name == expected
                 && operation.result == self.paths.job(&job.id.0).join(format!("{expected}.json"))
-                && operation.commit == job.commit
+                && operation.commit == *job.effective_commit()
                 && (job.phase == operation.phase
                     || (job.phase == Phase::Blocked && job.stopped_phase == Some(operation.phase))),
             "workflow intent does not match its stage and owned result"
@@ -84,7 +82,7 @@ impl Worker<'_> {
         )?;
         let run = StageRun {
             stage: stage.into(),
-            commit: job.commit.clone(),
+            commit: job.effective_commit().clone(),
             operation: operation.name.clone(),
             command: saved,
             result,
@@ -103,7 +101,7 @@ impl Worker<'_> {
     }
 
     pub(super) fn workflow_stage(&self, job: &mut Job, stage: &str) -> Result<()> {
-        if stage != "check" {
+        if !matches!(stage, "fix" | "check") {
             ensure!(
                 job.runs
                     .iter()
@@ -126,20 +124,7 @@ impl Worker<'_> {
                 job.operation.is_none(),
                 "admitted command request is missing"
             );
-            let selected = match stage {
-                "check" => &job.workflow.check,
-                "prepare" => job
-                    .workflow
-                    .prepare
-                    .as_ref()
-                    .context("preparation not selected")?,
-                "deploy" => job
-                    .workflow
-                    .deploy
-                    .as_ref()
-                    .context("deployment not selected")?,
-                _ => bail!("unknown workflow stage"),
-            };
+            let selected = job.workflow.command(stage)?;
             // A missing absolute executable is a recorded start failure. A
             // relative path must also remain inside its source checkout.
             if !selected.program.is_absolute() && command.program.exists() {
@@ -172,14 +157,25 @@ impl Worker<'_> {
             &self.directory(job)?.join(format!("{operation}.log")),
             run.result.diagnostics().as_bytes(),
         )?;
-        job.runs.push(run);
+        // Terminal process evidence is known before source finalization.
         job.operation = None;
+        if stage == "fix" {
+            job.resulting_commit = Some(crate::git::retain_fixes(
+                self.paths,
+                &self.config.common_git_dir,
+                &self.worktree(job),
+                job,
+            )?);
+        } else if job.workflow.fix.is_some() {
+            crate::git::unchanged(self.paths, &self.worktree(job), job.effective_commit())?;
+        }
+        job.runs.push(run);
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
         if !success {
             return self.finish(
                 job,
                 Phase::Failed,
-                format!("Workflow {stage} failed for {}", job.commit),
+                format!("Workflow {stage} failed for {}", job.effective_commit()),
                 false,
             );
         }
@@ -190,6 +186,9 @@ impl Worker<'_> {
                 format!("Cancelled after {stage} settled"),
                 false,
             );
+        }
+        if stage == "fix" {
+            return self.save(job, Phase::Checking);
         }
         if stage == "check" && job.workflow.prepare.is_some() {
             return self.save(job, Phase::Preparing);

@@ -17,9 +17,13 @@ and stop it after settlement and cleanup. Users do not manage a worker lifecycle
 A private supervisor restarts its worker; losing that supervisor or restarting
 the machine requires a later queue mutation to arrange execution again.
 
-Run the selected committed revision directly, defaulting to HEAD resolved at
-submission. Do not add integration, accepted baselines, source acceptance, or
-project branch updates. Preserve stage order and exact command correlation.
+Resolve the submitted revision once, defaulting to HEAD. An optional fix command
+runs first and may edit tracked source. Telete commits those edits as a direct
+child with Telete as author and committer. Preserve the submitted identity and
+the resulting checked identity separately. Retain generated commits under normal
+Git refs after scratch cleanup. Run checks, preparation, and deployment on the
+resulting commit. Do not add general integration or project branch updates.
+Preserve stage order and exact command correlation.
 An interrupted command without terminal evidence remains unresolved; recovery
 must not replay uncertain effects.
 

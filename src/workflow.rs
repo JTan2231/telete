@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::model::CommitId;
@@ -87,6 +87,8 @@ fn empty_parameters() -> serde_json::Value {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Workflow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<WorkflowCommand>,
     pub check: WorkflowCommand,
     #[serde(default)]
     pub prepare: Option<WorkflowCommand>,
@@ -97,11 +99,24 @@ pub(crate) struct Workflow {
 }
 
 impl Workflow {
+    pub(crate) fn command(&self, stage: &str) -> Result<&WorkflowCommand> {
+        match stage {
+            "fix" => self.fix.as_ref().context("automatic fixes not selected"),
+            "check" => Ok(&self.check),
+            "prepare" => self.prepare.as_ref().context("preparation not selected"),
+            "deploy" => self.deploy.as_ref().context("deployment not selected"),
+            _ => bail!("unknown workflow stage"),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.parameters.is_object(),
             "workflow parameters must be an object"
         );
+        if let Some(command) = &self.fix {
+            command.validate("fix")?;
+        }
         self.check.validate("check")?;
         if let Some(command) = &self.prepare {
             command.validate("prepare")?;
@@ -125,6 +140,8 @@ pub(crate) struct ProjectConfig {
 struct ProjectFile {
     repo: PathBuf,
     state: PathBuf,
+    #[serde(default)]
+    fix: Option<WorkflowCommand>,
     check: WorkflowCommand,
     #[serde(default)]
     prepare: Option<WorkflowCommand>,
@@ -169,6 +186,7 @@ pub(crate) fn read(path: &Path) -> Result<ProjectConfig> {
         "config state path is empty"
     );
     let workflow = Workflow {
+        fix: file.fix,
         check: file.check,
         prepare: file.prepare,
         deploy: file.deploy,

@@ -33,6 +33,11 @@ pub(crate) fn bind(
     command
         .env
         .insert("TELETE_CONTEXT".into(), context.display().to_string());
+    let mut source = json!({"commit": job.effective_commit()});
+    if job.workflow.fix.is_some() {
+        source["submitted_commit"] = json!(job.commit);
+        source["result_ref"] = json!(crate::git::result_ref(&job.id.0)?);
+    }
     command.context = Some(CommandContext {
         path: context,
         value: json!({
@@ -40,7 +45,7 @@ pub(crate) fn bind(
             "job_id": job.id,
             "stage": stage,
             "checkout": command.cwd,
-            "source": {"commit": job.commit},
+            "source": source,
             "parameters": job.workflow.parameters,
             "inputs": inputs,
             "outputs": outputs,

@@ -1,4 +1,4 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.2.0" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.3.0" "General Commands Manual"
 .SH NAME
 telete \- run a serial queue of committed repository workflows
 .SH SYNOPSIS
@@ -17,9 +17,9 @@ telete \- run a serial queue of committed repository workflows
 .B telete
 runs committed source from a local Git repository on macOS.
 A project JSON configuration selects the repository, initial private runtime
-directory, required check command, optional preparation and deployment commands,
+directory, required check command, optional fix, preparation, and deployment commands,
 and parameters.
-Each submitted job runs one exact commit in a private checkout.
+Each submitted job starts from one exact commit in a private checkout.
 Jobs run serially, in queue order.
 .PP
 Submission resolves the requested revision once and freezes the workflow and
@@ -27,8 +27,9 @@ parameters with the job.
 The default revision is HEAD in the configured repository at submission time.
 Uncommitted changes are not included.
 Later changes to HEAD or the configuration do not alter a submitted job.
-Telete runs the selected commit directly; it does not merge source or update
-project branches.
+An optional fix command edits tracked source before checks. Telete commits these
+edits as a direct child and checks and deploys that result. Telete does not merge
+source or update project branches.
 .PP
 Submission queues work and arranges background execution.
 Telete manages the worker while unfinished work exists and stops it after
@@ -285,8 +286,15 @@ field cannot redirect the queue.
 A populated directory is bound to its repository and runtime path and cannot
 be reassigned to another repository or moved by changing the configuration.
 .TP
+.B fix
+Optional command object, run before checks. Telete commits tracked source edits
+as one direct child with Telete as both author and committer. No edits produce
+no new commit. The command must preserve detached HEAD. Untracked files and the
+command's index changes are excluded. A failed fix command retains edits before
+stopping the workflow.
+.TP
 .B check
-Required command object for checking the selected commit.
+Required command object for checking the resulting commit.
 .TP
 .B prepare
 Optional command object, run after a successful check.
@@ -309,7 +317,7 @@ paths resolve against the configuration file's directory.
 They are normalized to absolute paths.
 Ignore the runtime directory in Git if it is inside the repository.
 .SS Command fields
-The same command object format applies to all three stages.
+The same command object format applies to all stages.
 .TP
 .B program
 Required executable path, either absolute or normalized relative to the private
@@ -393,7 +401,8 @@ If the binding survives but the runtime directory or queue database is missing,
 queue operations fail and require restoration of that operational state.
 Telete does not create an empty replacement queue behind an existing binding.
 .SH EXECUTION
-Stages run in this order: check, optional preparation, optional deployment.
+Stages run in this order: optional fixes, check, optional preparation, optional
+deployment.
 A stage succeeds only when its command exits with status 0 without a timeout,
 signal, start error, or output collection error.
 A failed stage stops the job.
@@ -437,7 +446,17 @@ The execution identity, job identity, and stage name.
 The absolute private checkout path.
 .TP
 .B source.commit
-The full commit ID selected at submission.
+The submitted commit during fixes, and the resulting checked commit in later
+commands. Without a fix command, this remains the submitted commit.
+.TP
+.B source.submitted_commit, source.result_ref
+Present when fixes are selected. Preserve the submitted SHA and name its durable
+result ref, refs/telete/results/JOB. The ref survives failure, cancellation, and
+scratch cleanup. A resumed job reuses its result instead of applying fixes again.
+.TP
+.B inputs.fix
+Present when fixes are selected. Null during fixes; the completed fix command's
+output directory in subsequent stages.
 .TP
 .B parameters
 The submitted parameters object.
@@ -482,6 +501,7 @@ Restarting a worker does not authorize replay of uncertain command effects.
 Job phases are
 .BR queued ,
 .BR starting ,
+.BR fixing ,
 .BR checking ,
 .BR preparing ,
 .BR deploying ,
@@ -607,8 +627,10 @@ workflow succeeds or fails; cancellation does not supersede that failure.
 Superseded failure details are also removed.
 .PP
 At most 128 small settled-job markers are retained.
-They contain the job ID, phase, queue sequence, and update time, without source,
-commands, parameters, environment, or output.
+They contain the job ID, phase, queue sequence, and update time, without commands,
+parameters, environment, or output. Jobs with completed fixes also retain commit,
+resulting_commit, and result_ref. The commit field preserves the submitted SHA;
+resulting_commit identifies checked and deployed source.
 After pruning,
 .B status job
 and

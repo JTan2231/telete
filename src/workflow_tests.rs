@@ -24,7 +24,7 @@ fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
     script(&repo.join("check.sh"), "cat payload.txt >> \"$MARKER\"")?;
     let commit = record_commit(&paths, &repo)?;
     let project = ProjectConfig { repo, state:paths.root.clone(), workflow:Workflow {
-        check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
+        fix:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
             timeout_seconds:Some(10), env:BTreeMap::from([("MARKER".into(),
                 paths.root.join("observed").display().to_string())]) },
         prepare:None, deploy:None, parameters:json!({"suite":"fixture"}),
@@ -345,5 +345,135 @@ fn store_save_preserves_cancellation_and_rejects_stale_updates() -> Result<()> {
     assert!(first.cancel_requested);
     assert!(store.save(&mut stale).is_err());
     assert_eq!(store.job(&id)?.last_error.as_deref(), Some("retained"));
+    Ok(())
+}
+
+fn automatic_edits(project: &mut ProjectConfig, body: &str) {
+    project.workflow.fix = Some(crate::workflow::WorkflowCommand {
+        program: "/bin/sh".into(), args: vec!["-c".into(), body.into()],
+        env: BTreeMap::new(), timeout_seconds: Some(20),
+    });
+}
+
+#[test]
+fn automatic_edits_create_a_retained_telete_child_checked_and_deployed_as_source() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    automatic_edits(&mut project, "printf 'corrected source\\n' > payload.txt; printf generated > build-output");
+    let observer = crate::workflow::WorkflowCommand {
+        program: "/usr/bin/python3".into(), args: vec!["-c".into(),
+            "import json,os,pathlib,subprocess; c=json.load(open(os.environ['TELETE_CONTEXT'])); assert c['source']['commit']==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(); assert c['source']['submitted_commit']!=c['source']['commit']; assert pathlib.Path(c['inputs']['fix']).is_dir(); pathlib.Path(os.environ['MARKER']).write_text(json.dumps(c))".into()],
+        env: BTreeMap::from([("MARKER".into(), project.state.join("source.json").display().to_string())]),
+        timeout_seconds: Some(20),
+    };
+    project.workflow.check = observer.clone();
+    project.workflow.deploy = Some(observer);
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    assert_eq!(worker_once(&paths)?["phase"], "fixing");
+    let fixed = worker_once(&paths)?;
+    assert_eq!(fixed["phase"], "checking");
+    let derived = fixed["resulting_commit"].as_str().context("resulting commit")?;
+    assert_ne!(derived, original.0);
+    let parents = git::value(&paths, &project.repo, &["rev-list", "--parents", "-n", "1", derived])?;
+    assert_eq!(parents, format!("{derived} {original}"));
+    let identity = git::value(&paths, &project.repo, &["show", "-s", "--format=%an <%ae>|%cn <%ce>", derived])?;
+    assert_eq!(identity, "Telete <telete@localhost>|Telete <telete@localhost>");
+    assert_eq!(git::value(&paths, &project.repo, &["diff", "--name-only", &original.0, derived])?, "payload.txt");
+    assert_eq!(fixed["stages"][0]["commit"], original.0);
+    assert_eq!(fixed["stages"][1]["commit"], derived);
+    let completion = finish_run(&paths, &id)?;
+    assert_eq!(completion["phase"], "succeeded");
+    assert_eq!(completion["commit"], original.0);
+    assert_eq!(completion["resulting_commit"], derived);
+    assert_eq!(completion["result_ref"], git::result_ref(&id)?);
+    assert!(!paths.job(&id).exists());
+    assert_eq!(git::commit(&paths, &project.repo, &git::result_ref(&id)?)?.0, derived);
+    assert_eq!(git::commit(&paths, &project.repo, "main")?, original);
+    let context: Value = serde_json::from_slice(&fs::read(paths.root.join("source.json"))?)?;
+    assert_eq!(context["stage"], "deploy");
+    assert_eq!(context["source"]["commit"], derived);
+    Ok(())
+}
+
+#[test]
+fn unchanged_automatic_edits_do_not_create_empty_commits() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    automatic_edits(&mut project, "printf generated > build-output");
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    let completion = finish_run(&paths, &id)?;
+    assert_eq!(completion["phase"], "succeeded");
+    assert_eq!(completion["resulting_commit"], original.0);
+    assert_eq!(git::commit(&paths, &project.repo, &git::result_ref(&id)?)?, original);
+    Ok(())
+}
+
+#[test]
+fn failed_or_cancelled_validation_preserves_automatic_edits_after_cleanup() -> Result<()> {
+    for fix_fails in [true, false] {
+        let (_temporary, mut project, original) = fixture()?;
+        automatic_edits(&mut project, if fix_fails {
+            "printf corrected > payload.txt; exit 7"
+        } else { "printf corrected > payload.txt" });
+        let (paths, id) = enqueue(&project, "HEAD")?;
+        worker_once(&paths)?;
+        let fixed = worker_once(&paths)?;
+        let derived = fixed["resulting_commit"].as_str().context("retained fix")?.to_owned();
+        assert_ne!(derived, original.0);
+        if fix_fails {
+            assert_eq!(fixed["phase"], "failed");
+            assert_eq!(fixed["runs"][0]["result"]["exit_code"], 7);
+        } else {
+            cancel(&paths, &id)?;
+            assert_eq!(finish_run(&paths, &id)?["phase"], "cancelled");
+        }
+        assert!(!paths.root.join("observed").exists());
+        project.workflow.fix = None;
+        let (_, replacement) = enqueue(&project, "HEAD")?;
+        assert_eq!(finish_run(&paths, &replacement)?["phase"], "succeeded");
+        assert!(!paths.job(&id).exists());
+        assert_eq!(status(&paths, Some(&id))?["resulting_commit"], derived);
+        assert_eq!(git::commit(&paths, &project.repo, &git::result_ref(&id)?)?.0, derived);
+    }
+    Ok(())
+}
+
+#[test]
+fn recovery_reuses_the_retained_fix_commit_without_repeating_automatic_edits() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    automatic_edits(&mut project, "printf 'corrected source\\n' > payload.txt; printf effect >> \"$EFFECTS\"");
+    project.workflow.fix.as_mut().context("fix command")?.env.insert("EFFECTS".into(),
+        project.state.join("effects").display().to_string());
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    worker_once(&paths)?;
+    worker_once(&paths)?;
+    let store = Store::open(&paths.root)?;
+    let mut job = store.job(&id)?;
+    let derived = job.resulting_commit.clone().context("fix commit")?;
+    let run = job.runs[0].clone();
+    job.phase = Phase::Blocked;
+    job.stopped_phase = Some(Phase::Fixing);
+    job.unresolved = true;
+    job.resulting_commit = None;
+    job.operation = Some(Operation { phase: Phase::Fixing, name: run.operation.clone(),
+        commit: original, result: paths.job(&id).join(format!("{}.json", run.operation)), started: run.stamp });
+    job.runs.clear();
+    store.save(&mut job)?;
+    assert_eq!(recover(&paths, &id)?["phase"], "checking");
+    assert_eq!(store.job(&id)?.resulting_commit, Some(derived.clone()));
+    assert_eq!(fs::read_to_string(paths.root.join("effects"))?, "effect");
+    assert_eq!(finish_run(&paths, &id)?["resulting_commit"], derived.0);
+    Ok(())
+}
+
+#[test]
+fn source_changes_after_automatic_edits_fail_without_claiming_an_uncertain_command() -> Result<()> {
+    let (_temporary, mut project, _) = fixture()?;
+    automatic_edits(&mut project, "printf corrected > payload.txt");
+    project.workflow.check.program = "/bin/sh".into();
+    project.workflow.check.args = vec!["-c".into(), "printf uncommitted > payload.txt".into()];
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    let failed = finish_run(&paths, &id)?;
+    assert_eq!(failed["phase"], "failed");
+    assert_eq!(failed["unresolved"], false);
+    assert!(failed["last_error"].as_str().context("failure")?.contains("tracked source"));
     Ok(())
 }

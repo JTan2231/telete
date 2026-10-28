@@ -81,6 +81,7 @@ pub(crate) struct Config {
 pub(crate) enum Phase {
     Queued,
     Starting,
+    Fixing,
     Checking,
     Preparing,
     Deploying,
@@ -98,6 +99,7 @@ impl Phase {
         match self {
             Self::Queued => "queued",
             Self::Starting => "starting",
+            Self::Fixing => "fixing",
             Self::Checking => "checking",
             Self::Preparing => "preparing",
             Self::Deploying => "deploying",
@@ -154,6 +156,8 @@ pub(crate) struct Job {
     pub created: u64,
     pub updated: u64,
     pub commit: CommitId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_commit: Option<CommitId>,
     pub workflow: Workflow,
     pub runs: Vec<StageRun>,
     pub operation: Option<Operation>,
@@ -166,11 +170,27 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    pub(crate) fn effective_commit(&self) -> &CommitId {
+        self.resulting_commit.as_ref().unwrap_or(&self.commit)
+    }
+
+    fn stage_commit(&self, stage: &str) -> &CommitId {
+        if stage == "fix" {
+            &self.commit
+        } else {
+            self.effective_commit()
+        }
+    }
+
     pub(crate) fn output(&self) -> Result<serde_json::Value> {
         let mut value = serde_json::to_value(self)?;
         let workflow = &self.workflow;
+        if self.resulting_commit.is_some() {
+            value["result_ref"] = serde_json::json!(crate::git::result_ref(&self.id.0)?);
+        }
         value["stages"] = serde_json::Value::Array(
             [
+                ("fix", workflow.fix.is_some(), Phase::Fixing),
                 ("check", true, Phase::Checking),
                 ("prepare", workflow.prepare.is_some(), Phase::Preparing),
                 ("deploy", workflow.deploy.is_some(), Phase::Deploying),
@@ -181,7 +201,7 @@ impl Job {
                     .runs
                     .iter()
                     .rev()
-                    .find(|run| run.stage == stage && self.commit == run.commit);
+                    .find(|run| run.stage == stage && *self.stage_commit(stage) == run.commit);
                 let active = self
                     .operation
                     .as_ref()
@@ -210,7 +230,7 @@ impl Job {
                 serde_json::json!({
                     "stage": stage,
                     "status": status,
-                    "commit": self.commit,
+                    "commit": self.stage_commit(stage),
                     "operation": run.map(|run| &run.operation),
                 })
             })
@@ -518,22 +538,43 @@ impl Store {
     }
 
     pub(crate) fn completion(&self, id: &str) -> Result<Option<serde_json::Value>> {
-        Ok(self
+        let mut value = self
             .db
             .query_row(
                 "SELECT * FROM completions WHERE id=?",
                 [id],
                 Self::decode_completion,
             )
-            .optional()?)
+            .optional()?;
+        if let Some(value) = &mut value {
+            self.completion_source(value)?;
+        }
+        Ok(value)
     }
 
     pub(crate) fn completion_list(&self) -> Result<Vec<serde_json::Value>> {
-        Ok(self
+        let mut values = self
             .db
             .prepare("SELECT * FROM completions ORDER BY sequence DESC")?
             .query_map([], Self::decode_completion)?
-            .collect::<rusqlite::Result<_>>()?)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for value in &mut values {
+            self.completion_source(value)?;
+        }
+        Ok(values)
+    }
+
+    fn completion_source(&self, value: &mut serde_json::Value) -> Result<()> {
+        let id = value["id"].as_str().context("completion has no identity")?;
+        if let Some(source) = self.get::<serde_json::Value>(&format!("result:{id}"))? {
+            for (key, field) in source
+                .as_object()
+                .context("completion source is not an object")?
+            {
+                value[key] = field.clone();
+            }
+        }
+        Ok(())
     }
 
     /// Replace settled run details with a bounded completion signal. The caller
@@ -549,8 +590,15 @@ impl Store {
                 "Telete job changed concurrently; reload before continuing");
             self.db.execute("INSERT INTO completions(id,phase,sequence,updated) VALUES(?,?,?,?)",
                 params![job.id.0, job.phase.name(), i64::try_from(job.sequence)?, i64::try_from(job.updated)?])?;
+            if let Some(commit) = &job.resulting_commit {
+                self.set(&format!("result:{}", job.id), &serde_json::json!({
+                    "commit": job.commit, "resulting_commit": commit,
+                    "result_ref": crate::git::result_ref(&job.id.0)?,
+                }))?;
+            }
             self.db.execute("DELETE FROM jobs WHERE id=? AND revision=?", params![job.id.0,i64::try_from(job.revision)?])?;
             self.db.execute("DELETE FROM completions WHERE id IN (SELECT id FROM completions ORDER BY sequence DESC LIMIT -1 OFFSET ?)", [i64::try_from(COMPLETION_LIMIT)?])?;
+            self.db.execute("DELETE FROM control WHERE key LIKE 'result:%' AND substr(key,8) NOT IN (SELECT id FROM completions)", [])?;
             Ok(())
         })
     }
@@ -648,6 +696,7 @@ mod tests {
             created: now(),
             updated: now(),
             commit: CommitId::new("a".repeat(40))?,
+            resulting_commit: None,
             workflow: serde_json::from_value(serde_json::json!({
                 "check": {"program": "/bin/true"},
                 "parameters": {"debug": "private-run-diagnostic-sentinel"},
