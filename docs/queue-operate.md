@@ -256,7 +256,8 @@ commit descended from the current job source. The command explicitly accepts tho
 repairs, retains them at the job's result ref, and queues the same job after
 analysis. It preserves the submitted and analyzed identities. It does not run
 analysis or automatic fixes again. An interrupted repair can be completed by
-repeating `repair` with the same revision. A different revision is rejected once
+repeating `repair` with the same revision. Complete an interrupted repair before
+cancelling its job. A different revision is rejected once
 an interrupted repair identity has been recorded.
 
 Analysis status becomes `accepted_after_repair`; its original nonzero result

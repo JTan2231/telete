@@ -196,6 +196,12 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
     let (store, _) = configured(paths)?;
     store.transaction(|| {
         let mut job = store.job(id)?;
+        ensure!(
+            job.phase != Phase::AwaitingRepair
+                || job.repaired_commit.is_none()
+                || job.resulting_commit == job.repaired_commit,
+            "complete the interrupted repair before cancelling this job"
+        );
         store.cancel(id)?;
         if matches!(job.phase, Phase::Queued | Phase::AwaitingRepair) {
             job.cancel_requested = true;
@@ -260,7 +266,12 @@ pub(crate) fn repair(paths: &Paths, repo: &Path, id: &str, revision: &str) -> Re
         head == previous || head == commit,
         "repair checkout HEAD changed unexpectedly"
     );
-    git::unchanged(paths, &checkout, &head)?;
+    let pending = job.repaired_commit.as_ref() == Some(&commit)
+        && job.resulting_commit.as_ref() != Some(&commit);
+    let retained = git::ref_value(paths, &config.common_git_dir, &git::result_ref(id)?)?;
+    if !pending || retained.as_ref() != Some(&commit) {
+        git::unchanged(paths, &checkout, &head)?;
+    }
     // Persist the accepted identity before changing its ref or checkout. A
     // repeated repair with the same revision completes an interrupted handoff.
     job.repaired_commit = Some(commit.clone());

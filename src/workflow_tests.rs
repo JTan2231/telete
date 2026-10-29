@@ -555,7 +555,10 @@ fn interrupted_repair_handoff_reuses_its_selected_commit() -> Result<()> {
     job.repaired_commit = Some(repaired.clone());
     store.save(&mut job)?;
     git::advance(&paths, &project.repo, &git::result_ref(&id)?, Some(&original), &repaired)?;
+    // A reset can stop after changing HEAD but before restoring every tracked file.
     git::value(&paths, &paths.job(&id).join("worktree"), &["reset", "--hard", &repaired.0])?;
+    fs::write(paths.job(&id).join("worktree/payload.txt"), "partial reset\n")?;
+    assert!(cancel(&paths, &id).is_err());
     assert_eq!(repair(&paths, &project.repo, &id, "HEAD")?["phase"], "queued");
     assert_eq!(finish_run(&paths, &id)?["phase"], "succeeded");
     Ok(())

@@ -241,7 +241,8 @@ and queue continuation after analysis. The revision defaults to HEAD in the
 configured repository. It must be a new descendant of the current job source.
 Telete preserves submitted and analyzed identities, updates the result ref, and
 uses repaired source for every later stage. Analysis and fixes are not repeated.
-An interrupted repair can be completed with the same revision. Selecting another
+Complete an interrupted repair with the same revision before cancelling its job.
+Selecting another
 revision during an interrupted handoff is an error.
 .TP
 .BI "maintenance hold \-\-owner " owner
