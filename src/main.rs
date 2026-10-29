@@ -63,6 +63,12 @@ enum Command {
     Recover {
         job: String,
     },
+    /// Accept committed agent repairs and continue after completed analysis.
+    Repair {
+        job: String,
+        #[arg(default_value = "HEAD")]
+        revision: String,
+    },
     Maintenance {
         #[command(subcommand)]
         command: Maintenance,
@@ -205,6 +211,9 @@ async fn execute(cli: Cli) -> Result<(serde_json::Value, i32)> {
         Command::Resume => manager::resume(&paths),
         Command::Cancel { job } => manager::cancel(&paths, &job),
         Command::Recover { job } => manager::recover(&paths, &job),
+        Command::Repair { job, revision } => {
+            manager::repair(&paths, &project.repo, &job, &revision)
+        }
         Command::Maintenance { command } => match command {
             Maintenance::Hold { owner } => manager::maintenance_hold(&paths, &owner),
             Maintenance::Status => manager::maintenance_status(&paths),

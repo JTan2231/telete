@@ -27,7 +27,10 @@ and execution behavior.
 and the manual header together; patch is the default. Deployment installs the
 version from the submitted commit without changing it.
 
-An optional project `fix` command runs before checks. Telete retains automatic
+An optional project `fix` command runs before analysis and checks. Optional
+analysis runs once and can wait for explicit committed agent repairs while other
+jobs use the queue. Repair continuation preserves original analysis evidence and
+continues with the accepted source. Telete retains automatic
 edits under a result ref and identifies both submitted and checked source.
 Configured commands own formatter, linter, and release-version policy.
 

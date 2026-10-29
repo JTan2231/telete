@@ -1,7 +1,7 @@
 # Operate Telete
 
 Telete runs a serial queue for committed repository source on macOS. The project
-config selects one required check command and optional fix, preparation, and
+config selects one required check command and optional fix, analysis, preparation, and
 deployment commands. Telete owns the queue and execution records. Configured commands own
 the meaning of their checks, outputs, and deployment effects.
 
@@ -142,7 +142,7 @@ scratch cleanup preserve the ref. The ref belongs to source history and remains
 until the project explicitly removes it. Telete does not merge or advance project
 branches; the project can integrate the returned commit.
 
-`commit` in job status remains the submitted SHA. After fixes, `resulting_commit`
+`commit` in job status remains the submitted SHA. After fixes or analysis, `resulting_commit`
 and `result_ref` identify the retained source. All subsequent commands run on
 that resulting commit. Commands after fixes must preserve HEAD and tracked
 source. A violation fails the job. Resuming the job consumes saved command
@@ -153,13 +153,14 @@ The supported workflow fields are:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `fix` | absent | Apply tracked source corrections before checks. |
-| `check` | required | Check the resulting commit. |
+| `analyze` | absent | Analyze source once; ordinary findings wait for agent repair. |
+| `check` | required | Build or check the resulting source, including accepted repairs. |
 | `prepare` | absent | Run after a successful check. |
 | `deploy` | absent | Run after successful preceding stages. |
 | `parameters` | `{}` | Pass the supplied object unchanged to commands. |
 
-The order is optional fixes, check, optional preparation, and optional deployment. Deployment can
-be selected without preparation. A stage that was not selected does not become
+The order is optional fixes, optional analysis, check, optional preparation, and
+optional deployment. Deployment can be selected without preparation. A stage that was not selected does not become
 a successful execution. Unknown config and command fields are rejected.
 
 Every command accepts `program`, optional literal `args`, optional `env`
@@ -191,8 +192,9 @@ file and are not expanded by Telete.
 
 Check success requires a successful command completion for the selected commit.
 Preparation and deployment success likewise require successful completion of
-their selected commands. A failed stage stops the job. Commands own output
-formats and any stronger claim about the systems they change.
+their selected commands. Ordinary analysis failures and ordinary check failures
+with analysis selected await agent repair. Other failures stop the job. Commands
+own output formats and any stronger claim about the systems they change.
 
 Before launching a command, Telete records its execution identity, selected
 executable, arguments, working directory, explicit environment overrides, timeout,
@@ -202,11 +204,11 @@ before launch. Retaining the exact command lets recovery reconcile the same
 execution instead of constructing another command from current settings.
 
 The context contains the job and operation identity, stage, checkout,
-`source.commit`, parameters, inputs, and outputs. For a workflow with fixes,
+`source.commit`, parameters, inputs, and outputs. For a workflow with fixes or analysis,
 `source.submitted_commit` preserves the submitted SHA and `source.result_ref`
 names the retained result. `source.commit` identifies the submitted source in
 the fix command and the resulting source in every later command. Workflows
-without a fix command keep their previous context shape.
+without fixes or analysis keep their previous context shape.
 
 `outputs.directory` names the private output directory for the command. With
 fixes selected, `inputs.fix` is null during fixes and names the completed fix
@@ -215,10 +217,61 @@ command's output directory in subsequent commands. When preparation was selected
 null. Telete
 defines no package or installation format.
 
+With analysis selected, `source.analyzed_commit` identifies the analyzed source
+from the analysis stage onward. After accepted repairs, `source.repaired_commit`
+identifies the accepted repair and `source.commit` selects that source for every
+later command. `inputs.analysis` is null during analysis and names its output
+directory in later stages. Analysis outputs remain available after agent repair.
+
 A missing command input closes standard input. A known terminal exit remains
 known if output collection fails; collection failure is a separate observation.
 A program that fails to start has a recorded start-error result. Neither failure
 authorizes another launch under the same execution identity.
+
+## Analyze once and accept agent repairs
+
+An optional `analyze` command runs after automatic fixes and before `check`.
+It must preserve the selected commit and tracked source. A successful analysis
+continues to `check`. A known nonzero exit without a signal, timeout, start error,
+or output collection error enters `awaiting_repair`. An ordinary `check` failure
+in a workflow with analysis also waits for repair; later repairs repeat the
+check while retaining the original analysis. The command owns the
+meaning of its findings. Process failures retain the usual failure and recovery
+behavior.
+
+A job awaiting repair releases the execution slot. Other queued jobs can run.
+The waiting job retains its checkout, source ref, findings, and command outputs
+until explicit repair or cancellation. Waiting alone does not keep a worker
+running. `status` lists these jobs under `awaiting_repair`; `wait` returns a
+terminal observation with exit 1 while the job remains pending.
+
+Commit repairs in a development checkout, then accept that exact revision:
+
+```sh
+telete --config telete.json repair JOB REVISION
+```
+
+The revision defaults to `HEAD` in the configured repository. It must be a new
+commit descended from the current job source. The command explicitly accepts those
+repairs, retains them at the job's result ref, and queues the same job after
+analysis. It preserves the submitted and analyzed identities. It does not run
+analysis or automatic fixes again. An interrupted repair can be completed by
+repeating `repair` with the same revision. A different revision is rejected once
+an interrupted repair identity has been recorded.
+
+Analysis status becomes `accepted_after_repair`; its original nonzero result
+remains recorded. Later commands receive the repaired source and analysis
+outputs. A successful repaired job means that the agent accepted the repairs and
+all remaining configured commands succeeded. It does not assert automated
+analysis of the repaired source. Project commands own their final build and
+artifact identity rules.
+
+Telete 0.4 reads existing 0.3 queue records. Let commands from an earlier worker
+settle before submitting workflows with analysis. Keep Telete 0.4 or later while
+analysis or repair records remain; earlier executables cannot read those records.
+
+Use `cancel JOB` to discard a waiting job at its safe boundary. Use `recover JOB`
+only for uncertain command execution; recovery does not accept source repairs.
 
 ## Operate and recover work
 
@@ -278,7 +331,8 @@ records; superseded failures do likewise.
 
 Telete retains at most 128 small settled-job markers containing job ID, phase,
 queue sequence, and update time. Jobs with completed fixes also retain the
-submitted commit, resulting commit, and result ref. Markers contain no command,
+submitted commit, resulting commit, and result ref. Jobs with analysis also retain
+the analyzed and accepted repair identities. Markers contain no command,
 parameters, environment, or output. Old markers are pruned, and `wait JOB` then
 reports that the job is unavailable. Archive any project outputs through the
 configured commands when they need a longer lifetime.

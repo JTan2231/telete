@@ -82,6 +82,8 @@ pub(crate) enum Phase {
     Queued,
     Starting,
     Fixing,
+    Analyzing,
+    AwaitingRepair,
     Checking,
     Preparing,
     Deploying,
@@ -100,6 +102,8 @@ impl Phase {
             Self::Queued => "queued",
             Self::Starting => "starting",
             Self::Fixing => "fixing",
+            Self::Analyzing => "analyzing",
+            Self::AwaitingRepair => "awaiting_repair",
             Self::Checking => "checking",
             Self::Preparing => "preparing",
             Self::Deploying => "deploying",
@@ -158,6 +162,10 @@ pub(crate) struct Job {
     pub commit: CommitId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resulting_commit: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_commit: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repaired_commit: Option<CommitId>,
     pub workflow: Workflow,
     pub runs: Vec<StageRun>,
     pub operation: Option<Operation>,
@@ -177,6 +185,10 @@ impl Job {
     fn stage_commit(&self, stage: &str) -> &CommitId {
         if stage == "fix" {
             &self.commit
+        } else if stage == "analyze" {
+            self.analyzed_commit
+                .as_ref()
+                .unwrap_or_else(|| self.effective_commit())
         } else {
             self.effective_commit()
         }
@@ -191,11 +203,13 @@ impl Job {
         value["stages"] = serde_json::Value::Array(
             [
                 ("fix", workflow.fix.is_some(), Phase::Fixing),
+                ("analyze", workflow.analyze.is_some(), Phase::Analyzing),
                 ("check", true, Phase::Checking),
                 ("prepare", workflow.prepare.is_some(), Phase::Preparing),
                 ("deploy", workflow.deploy.is_some(), Phase::Deploying),
             ]
             .into_iter()
+            .filter(|(stage, requested, _)| *stage != "analyze" || *requested)
             .map(|(stage, requested, phase)| {
                 let run = self
                     .runs
@@ -213,6 +227,11 @@ impl Job {
                 } else if let Some(run) = run {
                     if run.result.success() {
                         "succeeded"
+                    } else if stage == "analyze"
+                        && self.repaired_commit.is_some()
+                        && self.resulting_commit.as_ref() == self.repaired_commit.as_ref()
+                    {
+                        "accepted_after_repair"
                     } else {
                         "failed"
                     }
@@ -502,7 +521,9 @@ impl Store {
         let active = self
             .jobs()?
             .into_iter()
-            .filter(|job| !job.phase.terminal() && job.phase != Phase::Queued)
+            .filter(|job| {
+                !job.phase.terminal() && !matches!(job.phase, Phase::Queued | Phase::AwaitingRepair)
+            })
             .collect::<Vec<_>>();
         ensure!(
             active.len() <= 1,
@@ -594,6 +615,7 @@ impl Store {
                 self.set(&format!("result:{}", job.id), &serde_json::json!({
                     "commit": job.commit, "resulting_commit": commit,
                     "result_ref": crate::git::result_ref(&job.id.0)?,
+                    "analyzed_commit": job.analyzed_commit, "repaired_commit": job.repaired_commit,
                 }))?;
             }
             self.db.execute("DELETE FROM jobs WHERE id=? AND revision=?", params![job.id.0,i64::try_from(job.revision)?])?;
@@ -697,6 +719,8 @@ mod tests {
             updated: now(),
             commit: CommitId::new("a".repeat(40))?,
             resulting_commit: None,
+            analyzed_commit: None,
+            repaired_commit: None,
             workflow: serde_json::from_value(serde_json::json!({
                 "check": {"program": "/bin/true"},
                 "parameters": {"debug": "private-run-diagnostic-sentinel"},

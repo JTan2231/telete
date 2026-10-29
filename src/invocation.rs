@@ -34,9 +34,15 @@ pub(crate) fn bind(
         .env
         .insert("TELETE_CONTEXT".into(), context.display().to_string());
     let mut source = json!({"commit": job.effective_commit()});
-    if job.workflow.fix.is_some() {
+    if job.workflow.fix.is_some() || job.workflow.analyze.is_some() {
         source["submitted_commit"] = json!(job.commit);
         source["result_ref"] = json!(crate::git::result_ref(&job.id.0)?);
+    }
+    if let Some(commit) = &job.analyzed_commit {
+        source["analyzed_commit"] = json!(commit);
+    }
+    if let Some(commit) = &job.repaired_commit {
+        source["repaired_commit"] = json!(commit);
     }
     command.context = Some(CommandContext {
         path: context,

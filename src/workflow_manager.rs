@@ -18,7 +18,16 @@ impl Worker<'_> {
             .find(|run| run.stage == "fix")
             .and_then(|run| run.command.context.as_ref())
             .map(|context| context.value["outputs"]["directory"].clone());
+        let analysis = job
+            .runs
+            .iter()
+            .find(|run| run.stage == "analyze")
+            .and_then(|run| run.command.context.as_ref())
+            .map(|context| context.value["outputs"]["directory"].clone());
         let mut inputs = json!({"preparation":preparation});
+        if job.workflow.analyze.is_some() {
+            inputs["analysis"] = json!(analysis);
+        }
         if job.workflow.fix.is_some() {
             inputs["fix"] = json!(fix);
         }
@@ -53,6 +62,7 @@ impl Worker<'_> {
             .context("workflow has no retained intent")?;
         let stage = match operation.phase {
             Phase::Fixing => "fix",
+            Phase::Analyzing => "analyze",
             Phase::Checking => "check",
             Phase::Preparing => "prepare",
             Phase::Deploying => "deploy",
@@ -101,7 +111,20 @@ impl Worker<'_> {
     }
 
     pub(super) fn workflow_stage(&self, job: &mut Job, stage: &str) -> Result<()> {
-        if !matches!(stage, "fix" | "check") {
+        if stage == "analyze" && job.analyzed_commit.is_none() {
+            let commit = job.effective_commit().clone();
+            crate::git::advance(
+                self.paths,
+                &self.config.common_git_dir,
+                &crate::git::result_ref(&job.id.0)?,
+                None,
+                &commit,
+            )?;
+            job.resulting_commit = Some(commit.clone());
+            job.analyzed_commit = Some(commit);
+            self.store.save(job)?;
+        }
+        if !matches!(stage, "fix" | "analyze" | "check") {
             ensure!(
                 job.runs
                     .iter()
@@ -152,9 +175,19 @@ impl Worker<'_> {
         }
         self.reconcile_workflow(job)?;
         let run: StageRun = serde_json::from_slice(&fs::read(result_path)?)?;
+        self.complete_stage(job, stage, run)
+    }
+
+    fn complete_stage(&self, job: &mut Job, stage: &str, run: StageRun) -> Result<()> {
         let success = run.result.success();
+        let repairable = (stage == "analyze"
+            || (stage == "check" && job.workflow.analyze.is_some()))
+            && run
+                .result
+                .exit_code
+                .is_some_and(|code| code != 0 && run.result.exited_with(&[code]));
         store::atomic_bytes(
-            &self.directory(job)?.join(format!("{operation}.log")),
+            &self.directory(job)?.join(format!("{}.log", run.operation)),
             run.result.diagnostics().as_bytes(),
         )?;
         // Terminal process evidence is known before source finalization.
@@ -166,11 +199,19 @@ impl Worker<'_> {
                 &self.worktree(job),
                 job,
             )?);
-        } else if job.workflow.fix.is_some() {
+        } else if job.workflow.fix.is_some() || job.workflow.analyze.is_some() {
             crate::git::unchanged(self.paths, &self.worktree(job), job.effective_commit())?;
         }
         job.runs.push(run);
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
+        if !success && repairable && !job.cancel_requested {
+            job.stopped_phase = Some(job.phase);
+            job.outcome_message = Some(format!(
+                "Workflow {stage} awaits agent repair for {}",
+                job.effective_commit()
+            ));
+            return self.save(job, Phase::AwaitingRepair);
+        }
         if !success {
             return self.finish(
                 job,
@@ -188,6 +229,16 @@ impl Worker<'_> {
             );
         }
         if stage == "fix" {
+            return self.save(
+                job,
+                if job.workflow.analyze.is_some() {
+                    Phase::Analyzing
+                } else {
+                    Phase::Checking
+                },
+            );
+        }
+        if stage == "analyze" {
             return self.save(job, Phase::Checking);
         }
         if stage == "check" && job.workflow.prepare.is_some() {

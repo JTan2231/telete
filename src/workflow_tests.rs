@@ -24,7 +24,7 @@ fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
     script(&repo.join("check.sh"), "cat payload.txt >> \"$MARKER\"")?;
     let commit = record_commit(&paths, &repo)?;
     let project = ProjectConfig { repo, state:paths.root.clone(), workflow:Workflow {
-        fix:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
+        fix:None, analyze:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
             timeout_seconds:Some(10), env:BTreeMap::from([("MARKER".into(),
                 paths.root.join("observed").display().to_string())]) },
         prepare:None, deploy:None, parameters:json!({"suite":"fixture"}),
@@ -475,5 +475,143 @@ fn source_changes_after_automatic_edits_fail_without_claiming_an_uncertain_comma
     assert_eq!(failed["phase"], "failed");
     assert_eq!(failed["unresolved"], false);
     assert!(failed["last_error"].as_str().context("failure")?.contains("tracked source"));
+    Ok(())
+}
+
+#[test]
+fn analysis_findings_release_the_queue_and_repairs_skip_analysis() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    let marker = project.state.join("analysis-count");
+    project.workflow.analyze = Some(crate::workflow::WorkflowCommand {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "printf analyzed >> \"$ANALYSIS_MARKER\"; exit 1".into()],
+        env: BTreeMap::from([("ANALYSIS_MARKER".into(), marker.display().to_string())]),
+        timeout_seconds: Some(10),
+    });
+    let context_path = project.state.join("check-context.json");
+    project.workflow.check.args.clear();
+    project.workflow.check.program = "/bin/sh".into();
+    project.workflow.check.args = vec!["-c".into(), "cat payload.txt >> \"$MARKER\"; cat \"$TELETE_CONTEXT\" > \"$SAVED_CONTEXT\"".into()];
+    project.workflow.check.env.insert("SAVED_CONTEXT".into(), context_path.display().to_string());
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    worker_once(&paths)?;
+    worker_once(&paths)?;
+    let waiting = status(&paths, Some(&id))?;
+    assert_eq!(waiting["phase"], "awaiting_repair");
+    assert_eq!(waiting["analyzed_commit"], original.0);
+    assert_eq!(waiting["runs"][0]["result"]["exit_code"], 1);
+    assert_eq!(status(&paths, None)?["awaiting_repair"][0]["id"], id);
+    assert!(Store::open(&paths.root)?.active()?.is_none());
+    assert!(!needs_worker(&paths)?);
+    assert!(repair(&paths, &project.repo, &id, "HEAD").is_err());
+
+    let mut other = project.workflow.clone();
+    other.analyze = None;
+    other.check.program = "/usr/bin/true".into();
+    other.check.args.clear();
+    let submitted = submit(&paths, &project.repo, "HEAD", other)?;
+    let other_id = submitted["id"].as_str().context("other id")?;
+    assert_eq!(finish_run(&paths, other_id)?["phase"], "succeeded");
+    assert!(paths.job(&id).join("worktree").is_dir());
+
+    fs::write(project.repo.join("payload.txt"), "agent repair\n")?;
+    fs::write(project.repo.join("new-source.txt"), "new tracked file\n")?;
+    let repaired = record_commit(&paths, &project.repo)?;
+    let receipt = repair(&paths, &project.repo, &id, "HEAD")?;
+    assert_eq!(receipt["phase"], "queued");
+    assert_eq!(receipt["analyzed_commit"], original.0);
+    assert_eq!(receipt["repaired_commit"], repaired.0);
+    assert_eq!(receipt["stages"][1]["status"], "accepted_after_repair");
+    assert_eq!(fs::read_to_string(paths.job(&id).join("worktree/new-source.txt"))?, "new tracked file\n");
+    let finished = finish_run(&paths, &id)?;
+    assert_eq!(finished["phase"], "succeeded");
+    assert_eq!(finished["commit"], original.0);
+    assert_eq!(finished["analyzed_commit"], original.0);
+    assert_eq!(finished["repaired_commit"], repaired.0);
+    assert_eq!(finished["resulting_commit"], repaired.0);
+    assert_eq!(fs::read_to_string(marker)?, "analyzed");
+    assert_eq!(fs::read_to_string(paths.root.join("observed"))?, "agent repair\n");
+    let context: Value = serde_json::from_slice(&fs::read(context_path)?)?;
+    assert_eq!(context["source"]["commit"], repaired.0);
+    assert_eq!(context["source"]["analyzed_commit"], original.0);
+    assert_eq!(context["source"]["repaired_commit"], repaired.0);
+    assert!(context["inputs"]["analysis"].as_str().is_some());
+    Ok(())
+}
+
+#[test]
+fn interrupted_repair_handoff_reuses_its_selected_commit() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    project.workflow.analyze = Some(crate::workflow::WorkflowCommand {
+        program: "/usr/bin/false".into(), args: vec![], env: BTreeMap::new(), timeout_seconds: Some(10),
+    });
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    worker_once(&paths)?;
+    worker_once(&paths)?;
+    fs::write(project.repo.join("payload.txt"), "repaired\n")?;
+    let repaired = record_commit(&paths, &project.repo)?;
+    let store = Store::open(&paths.root)?;
+    let mut job = store.job(&id)?;
+    job.repaired_commit = Some(repaired.clone());
+    store.save(&mut job)?;
+    git::advance(&paths, &project.repo, &git::result_ref(&id)?, Some(&original), &repaired)?;
+    git::value(&paths, &paths.job(&id).join("worktree"), &["reset", "--hard", &repaired.0])?;
+    assert_eq!(repair(&paths, &project.repo, &id, "HEAD")?["phase"], "queued");
+    assert_eq!(finish_run(&paths, &id)?["phase"], "succeeded");
+    Ok(())
+}
+
+#[test]
+fn waiting_analysis_can_be_cancelled_and_analyzer_start_errors_still_fail() -> Result<()> {
+    let (_temporary, mut project, _) = fixture()?;
+    project.workflow.analyze = Some(crate::workflow::WorkflowCommand {
+        program: "/usr/bin/false".into(), args: vec![], env: BTreeMap::new(), timeout_seconds: Some(10),
+    });
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    worker_once(&paths)?;
+    worker_once(&paths)?;
+    assert_eq!(cancel(&paths, &id)?["phase"], "cancelled");
+    worker_once(&paths)?;
+    assert!(!paths.job(&id).exists());
+    project.workflow.analyze.as_mut().context("analysis")?.program = "/missing/telete-analyzer".into();
+    let (_, failed) = enqueue(&project, "HEAD")?;
+    assert_eq!(finish_run(&paths, &failed)?["phase"], "failed");
+    assert!(status(&paths, None)?["awaiting_repair"].as_array().context("waiting list")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn build_repairs_repeat_only_the_check_and_preserve_the_original_analysis() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    let marker = project.state.join("analysis-count");
+    project.workflow.analyze = Some(crate::workflow::WorkflowCommand {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "printf analyzed >> \"$ANALYSIS_MARKER\"".into()],
+        env: BTreeMap::from([("ANALYSIS_MARKER".into(), marker.display().to_string())]),
+        timeout_seconds: Some(10),
+    });
+    project.workflow.check.program = "/bin/sh".into();
+    project.workflow.check.args = vec!["-c".into(), "test \"$(cat payload.txt)\" = done".into()];
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    for _ in 0..3 { worker_once(&paths)?; }
+    assert_eq!(status(&paths, Some(&id))?["phase"], "awaiting_repair");
+    assert_eq!(status(&paths, Some(&id))?["stopped_phase"], "checking");
+    fs::write(project.repo.join("payload.txt"), "still broken\n")?;
+    let first = record_commit(&paths, &project.repo)?;
+    repair(&paths, &project.repo, &id, "HEAD")?;
+    worker_once(&paths)?;
+    worker_once(&paths)?;
+    let waiting = status(&paths, Some(&id))?;
+    assert_eq!(waiting["phase"], "awaiting_repair");
+    assert_eq!(waiting["resulting_commit"], first.0);
+    assert!(repair(&paths, &project.repo, &id, &original.0).is_err());
+    fs::write(project.repo.join("payload.txt"), "done\n")?;
+    let final_source = record_commit(&paths, &project.repo)?;
+    repair(&paths, &project.repo, &id, "HEAD")?;
+    let completion = finish_run(&paths, &id)?;
+    assert_eq!(completion["phase"], "succeeded");
+    assert_eq!(completion["analyzed_commit"], original.0);
+    assert_eq!(completion["repaired_commit"], final_source.0);
+    assert_eq!(fs::read_to_string(marker)?, "analyzed");
     Ok(())
 }

@@ -21,8 +21,10 @@ Resolve the submitted revision once, defaulting to HEAD. An optional fix command
 runs first and may edit tracked source. Telete commits those edits as a direct
 child with Telete as author and committer. Preserve the submitted identity and
 the resulting checked identity separately. Retain generated commits under normal
-Git refs after scratch cleanup. Run checks, preparation, and deployment on the
-resulting commit. Do not add general integration or project branch updates.
+Git refs after scratch cleanup. Run optional analysis, checks, preparation, and deployment on the
+resulting commit. A completed analysis can wait for explicit committed agent
+repairs. Waiting releases the queue slot and retains its source and diagnostics.
+Continue accepted repairs after analysis; preserve analyzed and repaired identities. Do not add general integration or project branch updates.
 Preserve stage order and exact command correlation.
 An interrupted command without terminal evidence remains unresolved; recovery
 must not replay uncertain effects.

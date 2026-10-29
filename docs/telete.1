@@ -1,4 +1,4 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.3.0" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.4.0" "General Commands Manual"
 .SH NAME
 telete \- run a serial queue of committed repository workflows
 .SH SYNOPSIS
@@ -17,7 +17,7 @@ telete \- run a serial queue of committed repository workflows
 .B telete
 runs committed source from a local Git repository on macOS.
 A project JSON configuration selects the repository, initial private runtime
-directory, required check command, optional fix, preparation, and deployment commands,
+directory, required check command, optional fix, analysis, preparation, and deployment commands,
 and parameters.
 Each submitted job starts from one exact commit in a private checkout.
 Jobs run serially, in queue order.
@@ -173,7 +173,7 @@ submitting it again.
 With
 .BR \-\-follow ,
 also observe the submitted job until it succeeds, fails, is cancelled, or
-becomes blocked.
+becomes blocked or awaits agent repair.
 A second JSON result reports that observation.
 Press Ctrl-C to stop following without cancelling the job.
 Closing the observing terminal does not stop the managed worker.
@@ -185,7 +185,7 @@ With a job ID, display only that job's retained result.
 An unavailable or pruned job is an operation error.
 .TP
 .BI "wait " "job " "\fR[\fB\-\-timeout \fIseconds\fR]"
-Observe a job until it succeeds, fails, is cancelled, becomes blocked, or the
+Observe a job until it succeeds, fails, is cancelled, becomes blocked, awaits agent repair, or the
 observation times out.
 The timeout is a positive integer number of seconds.
 By default, observation has no timeout.
@@ -233,6 +233,16 @@ worker.
 Recovery fails if matching terminal evidence is unavailable.
 It does not repeat an uncertain command.
 Remaining eligible work continues automatically after successful recovery.
+.TP
+.B repair \fIjob\fR [\fIrevision\fR]
+Accept committed agent repairs for a job in
+.B awaiting_repair
+and queue continuation after analysis. The revision defaults to HEAD in the
+configured repository. It must be a new descendant of the current job source.
+Telete preserves submitted and analyzed identities, updates the result ref, and
+uses repaired source for every later stage. Analysis and fixes are not repeated.
+An interrupted repair can be completed with the same revision. Selecting another
+revision during an interrupted handoff is an error.
 .TP
 .BI "maintenance hold \-\-owner " owner
 Add a maintenance hold preventing new claims.
@@ -292,6 +302,13 @@ as one direct child with Telete as both author and committer. No edits produce
 no new commit. The command must preserve detached HEAD. Untracked files and the
 command's index changes are excluded. A failed fix command retains edits before
 stopping the workflow.
+.TP
+.B analyze
+Optional command object run after fixes and before checks. It preserves tracked
+source. A known nonzero exit without process or collection errors enters
+.BR awaiting_repair .
+The job retains evidence and releases its queue slot until repair or cancellation.
+An ordinary check failure in a workflow with analysis also awaits agent repair.
 .TP
 .B check
 Required command object for checking the resulting commit.
@@ -401,11 +418,12 @@ If the binding survives but the runtime directory or queue database is missing,
 queue operations fail and require restoration of that operational state.
 Telete does not create an empty replacement queue behind an existing binding.
 .SH EXECUTION
-Stages run in this order: optional fixes, check, optional preparation, optional
+Stages run in this order: optional fixes, optional analysis, check, optional preparation, optional
 deployment.
 A stage succeeds only when its command exits with status 0 without a timeout,
 signal, start error, or output collection error.
-A failed stage stops the job.
+An ordinary nonzero analysis exit, or an ordinary check failure with analysis
+selected, awaits explicit agent repair. Other failed stages stop the job.
 An unselected stage is reported as
 .BR not_requested ,
 not as a successful execution.
@@ -450,9 +468,17 @@ The submitted commit during fixes, and the resulting checked commit in later
 commands. Without a fix command, this remains the submitted commit.
 .TP
 .B source.submitted_commit, source.result_ref
-Present when fixes are selected. Preserve the submitted SHA and name its durable
+Present when fixes or analysis are selected. Preserve the submitted SHA and name its durable
 result ref, refs/telete/results/JOB. The ref survives failure, cancellation, and
 scratch cleanup. A resumed job reuses its result instead of applying fixes again.
+.TP
+.B source.analyzed_commit, source.repaired_commit
+The analyzed source, from the analysis stage onward, and accepted repair source
+when present. After repair, source.commit selects the repaired source.
+.TP
+.B inputs.analysis
+Present when analysis is selected. Null during analysis; its retained output
+directory in later commands, including after agent repair.
 .TP
 .B inputs.fix
 Present when fixes are selected. Null during fixes; the completed fix command's
@@ -502,6 +528,8 @@ Job phases are
 .BR queued ,
 .BR starting ,
 .BR fixing ,
+.BR analyzing ,
+.BR awaiting_repair ,
 .BR checking ,
 .BR preparing ,
 .BR deploying ,
@@ -531,7 +559,7 @@ For
 .B wait
 and
 .BR "submit \-\-follow" ,
-a failed, cancelled, or blocked job, or observation timeout, also uses exit 1.
+a failed, cancelled, blocked, or awaiting-repair job, or observation timeout, also uses exit 1.
 With
 .BR \-\-json ,
 the error object has
@@ -624,12 +652,15 @@ Worker cleanup releases successful and cancelled jobs' scratch files and full
 execution records.
 The latest failed workflow retains its diagnostics and checkout until a newer
 workflow succeeds or fails; cancellation does not supersede that failure.
-Superseded failure details are also removed.
+Superseded failure details are also removed. Jobs awaiting agent repair retain
+their checkout and evidence until explicit repair or cancellation. Waiting alone
+does not keep a worker running.
 .PP
 At most 128 small settled-job markers are retained.
 They contain the job ID, phase, queue sequence, and update time, without commands,
 parameters, environment, or output. Jobs with completed fixes also retain commit,
-resulting_commit, and result_ref. The commit field preserves the submitted SHA;
+resulting_commit, and result_ref. Jobs with analysis also retain analyzed_commit
+and repaired_commit when present. The commit field preserves the submitted SHA;
 resulting_commit identifies checked and deployed source.
 After pruning,
 .B status job
@@ -654,6 +685,10 @@ Telete coordinates recovery with its worker and resumes eligible work afterward.
 Recovery uses the saved invocation, including its context, explicit environment
 overrides, and timeout, rather than current command settings.
 It does not authorize another launch under the same execution identity.
+.PP
+Telete 0.4 reads existing 0.3 queue records. Let earlier commands settle before
+submitting workflows with analysis. Keep Telete 0.4 or later while analysis or
+repair records remain; earlier executables cannot read those records.
 .PP
 Use the Telete version that owns existing runtime state.
 Incompatible runtime schemas are rejected; Telete does not automatically migrate

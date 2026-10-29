@@ -94,6 +94,8 @@ fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
         updated: store::now(),
         commit,
         resulting_commit: None,
+        analyzed_commit: None,
+        repaired_commit: None,
         workflow,
         runs: Vec::new(),
         operation: None,
@@ -117,7 +119,7 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
     if store::probe_config(&paths.root)?.is_none() {
         ensure!(id.is_none(), "no retained result for this job");
         return Ok(json!({"schema_version":3,"paused":false,"active":null,
-            "queue":[],"failure":null,"completions":[],"maintenance_owners":[]}));
+            "queue":[],"awaiting_repair":[],"failure":null,"completions":[],"maintenance_owners":[]}));
     }
     let (store, config) = configured(paths)?;
     if let Some(id) = id {
@@ -127,6 +129,11 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
     let queue = jobs
         .iter()
         .filter(|job| job.phase == Phase::Queued)
+        .map(Job::output)
+        .collect::<Result<Vec<_>>>()?;
+    let awaiting_repair = jobs
+        .iter()
+        .filter(|job| job.phase == Phase::AwaitingRepair)
         .map(Job::output)
         .collect::<Result<Vec<_>>>()?;
     let failure = jobs
@@ -139,7 +146,7 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
         json!({"schema_version":3,"version":env!("CARGO_PKG_VERSION"),
         "paused":store.paused()?,"config":config,
         "active":store.active()?.map(|job|job.output()).transpose()?,
-        "queue":queue,"failure":failure,"completions":store.completion_list()?,
+        "queue":queue,"awaiting_repair":awaiting_repair,"failure":failure,"completions":store.completion_list()?,
         "maintenance_owners":store.holds()?}),
     )
 }
@@ -150,7 +157,10 @@ pub(crate) async fn wait(paths: &Paths, id: &str, timeout_seconds: Option<u64>) 
     loop {
         let value = status(paths, Some(id))?;
         let phase = value["phase"].as_str().context("job has no phase")?;
-        if matches!(phase, "succeeded" | "failed" | "cancelled" | "blocked") {
+        if matches!(
+            phase,
+            "succeeded" | "failed" | "cancelled" | "blocked" | "awaiting_repair"
+        ) {
             return Ok(json!({"observation":"terminal","job":value}));
         }
         if timeout_seconds.is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
@@ -187,7 +197,7 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
     store.transaction(|| {
         let mut job = store.job(id)?;
         store.cancel(id)?;
-        if job.phase == Phase::Queued {
+        if matches!(job.phase, Phase::Queued | Phase::AwaitingRepair) {
             job.cancel_requested = true;
             job.phase = Phase::Cancelled;
             job.outcome = Some(Phase::Cancelled);
@@ -197,6 +207,80 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
         Ok(())
     })?;
     job_status(&store, id)
+}
+
+/// An explicit repair accepts a new source identity without repeating analysis.
+pub(crate) fn repair(paths: &Paths, repo: &Path, id: &str, revision: &str) -> Result<Value> {
+    let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
+    let (store, config) = configured(paths)?;
+    ensure!(
+        git::common(paths, repo)? == config.common_git_dir,
+        "repair must select a checkout of the configured Git repository"
+    );
+    let mut job = store.job(id)?;
+    ensure!(
+        job.phase == Phase::AwaitingRepair && job.operation.is_none() && !job.unresolved,
+        "only a job awaiting agent repair can accept repairs"
+    );
+    ensure!(!job.cancel_requested, "cancelled job cannot accept repairs");
+    ensure!(job.analyzed_commit.is_some(), "job has no analyzed source");
+    let commit = git::commit(paths, repo, revision)?;
+    let previous = job.effective_commit().clone();
+    let ancestor = git::run(
+        paths,
+        repo,
+        &[
+            "merge-base".into(),
+            "--is-ancestor".into(),
+            previous.0.clone(),
+            commit.0.clone(),
+        ],
+        None,
+        std::collections::BTreeMap::new(),
+    )?;
+    ensure!(
+        ancestor.success(),
+        "repair commit must descend from the current job source"
+    );
+    ensure!(
+        commit != previous,
+        "repair requires a new committed source revision"
+    );
+    if let Some(selected) = &job.repaired_commit
+        && job.resulting_commit.as_ref() != Some(selected)
+    {
+        ensure!(
+            *selected == commit,
+            "an interrupted repair already selected another commit"
+        );
+    }
+    let checkout = paths.job(id).join("worktree");
+    let head = git::commit(paths, &checkout, "HEAD")?;
+    ensure!(
+        head == previous || head == commit,
+        "repair checkout HEAD changed unexpectedly"
+    );
+    git::unchanged(paths, &checkout, &head)?;
+    // Persist the accepted identity before changing its ref or checkout. A
+    // repeated repair with the same revision completes an interrupted handoff.
+    job.repaired_commit = Some(commit.clone());
+    store.save(&mut job)?;
+    git::advance(
+        paths,
+        &config.common_git_dir,
+        &git::result_ref(id)?,
+        Some(&previous),
+        &commit,
+    )?;
+    git::value(paths, &checkout, &["reset", "--hard", &commit.0])?;
+    job.resulting_commit = Some(commit);
+    job.phase = Phase::Queued;
+    job.stopped_phase = None;
+    job.outcome = None;
+    job.outcome_message = None;
+    job.last_error = None;
+    store.save(&mut job)?;
+    job.output()
 }
 
 fn check_identity(value: &str) -> Result<()> {
@@ -254,7 +338,11 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
     ensure!(
         matches!(
             phase,
-            Phase::Fixing | Phase::Checking | Phase::Preparing | Phase::Deploying
+            Phase::Fixing
+                | Phase::Analyzing
+                | Phase::Checking
+                | Phase::Preparing
+                | Phase::Deploying
         ),
         "blocked job has no command to reconcile"
     );
@@ -314,10 +402,10 @@ pub(crate) async fn worker(paths: &Paths) -> Result<()> {
 pub(crate) fn needs_worker(paths: &Paths) -> Result<bool> {
     let (store, _) = configured(paths)?;
     let latest = store.get::<u64>("latest_finished_sequence")?;
-    Ok(store
-        .jobs()?
-        .iter()
-        .any(|job| job.phase != Phase::Failed || Some(job.sequence) != latest))
+    Ok(store.jobs()?.iter().any(|job| {
+        job.phase != Phase::AwaitingRepair
+            && (job.phase != Phase::Failed || Some(job.sequence) != latest)
+    }))
 }
 
 struct Worker<'a> {
@@ -399,18 +487,24 @@ impl Worker<'_> {
                     self.paths,
                     &self.config.common_git_dir,
                     &self.worktree(job),
-                    &job.commit,
+                    job.effective_commit(),
                 )?;
                 self.save(
                     job,
-                    if job.workflow.fix.is_some() {
+                    if job.workflow.fix.is_some() && !job.runs.iter().any(|run| run.stage == "fix")
+                    {
                         Phase::Fixing
+                    } else if job.workflow.analyze.is_some()
+                        && !job.runs.iter().any(|run| run.stage == "analyze")
+                    {
+                        Phase::Analyzing
                     } else {
                         Phase::Checking
                     },
                 )
             }
             Phase::Fixing => self.workflow_stage(job, "fix"),
+            Phase::Analyzing => self.workflow_stage(job, "analyze"),
             Phase::Checking => self.workflow_stage(job, "check"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
             Phase::Deploying => self.workflow_stage(job, "deploy"),
