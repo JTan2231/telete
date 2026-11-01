@@ -85,6 +85,8 @@ pub(crate) enum Phase {
     Analyzing,
     AwaitingRepair,
     Checking,
+    WaitingRelease,
+    Composing,
     Preparing,
     Deploying,
     Blocked,
@@ -105,6 +107,8 @@ impl Phase {
             Self::Analyzing => "analyzing",
             Self::AwaitingRepair => "awaiting_repair",
             Self::Checking => "checking",
+            Self::WaitingRelease => "waiting_release",
+            Self::Composing => "composing",
             Self::Preparing => "preparing",
             Self::Deploying => "deploying",
             Self::Blocked => "blocked",
@@ -149,6 +153,15 @@ impl Default for Cleanup {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseBatch {
+    pub members: Vec<JobId>,
+    pub base: CommitId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 // Persist orthogonal facts independently of the phase: cancellation
 // and uncertain operations can coexist and must survive recovery.
 pub(crate) struct Job {
@@ -166,6 +179,12 @@ pub(crate) struct Job {
     pub analyzed_commit: Option<CommitId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repaired_commit: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<JobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<ReleaseBatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_commit: Option<CommitId>,
     pub workflow: Workflow,
     pub runs: Vec<StageRun>,
     pub operation: Option<Operation>,
@@ -182,6 +201,20 @@ impl Job {
         self.resulting_commit.as_ref().unwrap_or(&self.commit)
     }
 
+    pub(crate) fn execution_commit(&self) -> &CommitId {
+        if self.phase == Phase::Composing
+            || (self.phase == Phase::Blocked && self.stopped_phase == Some(Phase::Composing))
+        {
+            return self
+                .batch
+                .as_ref()
+                .map_or_else(|| self.effective_commit(), |batch| &batch.base);
+        }
+        self.release_commit
+            .as_ref()
+            .unwrap_or_else(|| self.effective_commit())
+    }
+
     fn stage_commit(&self, stage: &str) -> &CommitId {
         if stage == "fix" {
             &self.commit
@@ -189,6 +222,12 @@ impl Job {
             self.analyzed_commit
                 .as_ref()
                 .unwrap_or_else(|| self.effective_commit())
+        } else if stage == "compose" {
+            self.batch
+                .as_ref()
+                .map_or_else(|| self.effective_commit(), |batch| &batch.base)
+        } else if matches!(stage, "prepare" | "deploy") {
+            self.execution_commit()
         } else {
             self.effective_commit()
         }
@@ -205,11 +244,12 @@ impl Job {
                 ("fix", workflow.fix.is_some(), Phase::Fixing),
                 ("analyze", workflow.analyze.is_some(), Phase::Analyzing),
                 ("check", true, Phase::Checking),
+                ("compose", self.batch.is_some(), Phase::Composing),
                 ("prepare", workflow.prepare.is_some(), Phase::Preparing),
                 ("deploy", workflow.deploy.is_some(), Phase::Deploying),
             ]
             .into_iter()
-            .filter(|(stage, requested, _)| *stage != "analyze" || *requested)
+            .filter(|(stage, requested, _)| !matches!(*stage, "analyze" | "compose") || *requested)
             .map(|(stage, requested, phase)| {
                 let run = self
                     .runs
@@ -522,7 +562,11 @@ impl Store {
             .jobs()?
             .into_iter()
             .filter(|job| {
-                !job.phase.terminal() && !matches!(job.phase, Phase::Queued | Phase::AwaitingRepair)
+                !job.phase.terminal()
+                    && !matches!(
+                        job.phase,
+                        Phase::Queued | Phase::AwaitingRepair | Phase::WaitingRelease
+                    )
             })
             .collect::<Vec<_>>();
         ensure!(
@@ -611,12 +655,21 @@ impl Store {
                 "Telete job changed concurrently; reload before continuing");
             self.db.execute("INSERT INTO completions(id,phase,sequence,updated) VALUES(?,?,?,?)",
                 params![job.id.0, job.phase.name(), i64::try_from(job.sequence)?, i64::try_from(job.updated)?])?;
-            if let Some(commit) = &job.resulting_commit {
-                self.set(&format!("result:{}", job.id), &serde_json::json!({
-                    "commit": job.commit, "resulting_commit": commit,
-                    "result_ref": crate::git::result_ref(&job.id.0)?,
-                    "analyzed_commit": job.analyzed_commit, "repaired_commit": job.repaired_commit,
-                }))?;
+            if job.resulting_commit.is_some() || job.release_id.is_some() || job.release_commit.is_some() {
+                let mut source = serde_json::json!({"commit": job.commit});
+                if let Some(commit) = &job.resulting_commit {
+                    source["resulting_commit"] = serde_json::json!(commit);
+                    source["result_ref"] = serde_json::json!(crate::git::result_ref(&job.id.0)?);
+                    source["analyzed_commit"] = serde_json::json!(job.analyzed_commit);
+                    source["repaired_commit"] = serde_json::json!(job.repaired_commit);
+                }
+                if let Some(id) = &job.release_id {
+                    source["release_id"] = serde_json::json!(id);
+                }
+                if let Some(commit) = &job.release_commit {
+                    source["release_commit"] = serde_json::json!(commit);
+                }
+                self.set(&format!("result:{}", job.id), &source)?;
             }
             self.db.execute("DELETE FROM jobs WHERE id=? AND revision=?", params![job.id.0,i64::try_from(job.revision)?])?;
             self.db.execute("DELETE FROM completions WHERE id IN (SELECT id FROM completions ORDER BY sequence DESC LIMIT -1 OFFSET ?)", [i64::try_from(COMPLETION_LIMIT)?])?;
@@ -721,6 +774,9 @@ mod tests {
             resulting_commit: None,
             analyzed_commit: None,
             repaired_commit: None,
+            release_id: None,
+            batch: None,
+            release_commit: None,
             workflow: serde_json::from_value(serde_json::json!({
                 "check": {"program": "/bin/true"},
                 "parameters": {"debug": "private-run-diagnostic-sentinel"},
@@ -750,6 +806,88 @@ mod tests {
         assert!(Store::create(&root, &different).is_err());
         assert_eq!(probe_config(&root)?, Some(config));
         assert!(Store::open(&root)?.paused()?);
+        Ok(())
+    }
+
+    #[test]
+    fn release_source_preserves_individual_stage_identities() -> Result<()> {
+        let mut job = fixture_job(0)?;
+        let individual = CommitId::new("b".repeat(40))?;
+        let release = CommitId::new("c".repeat(40))?;
+        let base = CommitId::new("d".repeat(40))?;
+        job.resulting_commit = Some(individual.clone());
+        job.release_id = Some(job.id.clone());
+        job.release_commit = Some(release.clone());
+        job.batch = Some(ReleaseBatch {
+            members: vec![job.id.clone()],
+            base: base.clone(),
+            commit: Some(release.clone()),
+        });
+        assert_eq!(job.effective_commit(), &individual);
+        assert_eq!(job.execution_commit(), &release);
+        assert_eq!(job.stage_commit("check"), &individual);
+        assert_eq!(job.stage_commit("compose"), &base);
+        assert_eq!(job.stage_commit("prepare"), &release);
+        assert_eq!(job.stage_commit("deploy"), &release);
+        job.phase = Phase::Composing;
+        assert_eq!(job.execution_commit(), &base);
+        job.phase = Phase::Blocked;
+        job.stopped_phase = Some(Phase::Composing);
+        assert_eq!(job.execution_commit(), &base);
+        job.phase = Phase::Succeeded;
+        job.stopped_phase = None;
+        let output = job.output()?;
+        let stages = output["stages"].as_array().context("stages")?;
+        assert!(stages.iter().any(|stage| stage["stage"] == "compose"));
+        job.batch = None;
+        let output = job.output()?;
+        assert!(
+            !output["stages"]
+                .as_array()
+                .context("stages")?
+                .iter()
+                .any(|stage| stage["stage"] == "compose")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_releases_release_the_slot_and_composition_claims_it() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("state");
+        let store = Store::create(&root, &fixture_config(&root))?;
+        let mut waiting = fixture_job(0)?;
+        waiting.phase = Phase::WaitingRelease;
+        let mut waiting = store.insert(&waiting)?;
+        let mut composing = fixture_job(1)?;
+        composing.phase = Phase::Composing;
+        let composing = store.insert(&composing)?;
+        assert_eq!(store.active()?.context("active composer")?.id, composing.id);
+        waiting.phase = Phase::Composing;
+        store.save(&mut waiting)?;
+        assert!(store.active().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retired_batch_members_retain_source_and_shared_release_without_diagnostics() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("state");
+        let store = Store::create(&root, &fixture_config(&root))?;
+        let mut job = fixture_job(0)?;
+        let release_id = JobId::new("job-leader")?;
+        let release = CommitId::new("b".repeat(40))?;
+        job.release_id = Some(release_id.clone());
+        job.release_commit = Some(release.clone());
+        let job = store.insert(&job)?;
+        store.retire(&job)?;
+        let completion = store.completion(&job.id.0)?.context("completion")?;
+        assert_eq!(completion["commit"], serde_json::to_value(&job.commit)?);
+        assert_eq!(completion["release_id"], serde_json::to_value(release_id)?);
+        assert_eq!(completion["release_commit"], serde_json::to_value(release)?);
+        assert!(completion.get("workflow").is_none());
+        assert!(completion.get("runs").is_none());
+        assert!(completion.get("batch").is_none());
         Ok(())
     }
 

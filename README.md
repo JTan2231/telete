@@ -28,6 +28,10 @@ telete --config /path/to/project/telete.json status
 Submission runs in the background. Ctrl-C stops following without cancelling
 the job.
 
+Optional [deployment batching](docs/queue-operate.md#batch-deployment-requests)
+runs each change's CI, freezes already queued compatible requests into a group,
+and combines their checked commits for one preparation and deployment.
+
 ## Further documentation
 
 - [telete(1) manual](docs/telete.1): installation, commands, and options.

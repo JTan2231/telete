@@ -31,6 +31,9 @@ impl Worker<'_> {
         if job.workflow.fix.is_some() {
             inputs["fix"] = json!(fix);
         }
+        if job.batch.is_some() {
+            inputs["batch"] = self.batch_input(job)?;
+        }
         let output = self.paths.job(&job.id.0).join("outputs").join(operation);
         crate::invocation::bind(
             self.paths,
@@ -64,6 +67,7 @@ impl Worker<'_> {
             Phase::Fixing => "fix",
             Phase::Analyzing => "analyze",
             Phase::Checking => "check",
+            Phase::Composing => "compose",
             Phase::Preparing => "prepare",
             Phase::Deploying => "deploy",
             _ => bail!("workflow operation has another phase"),
@@ -72,7 +76,7 @@ impl Worker<'_> {
         ensure!(
             operation.name == expected
                 && operation.result == self.paths.job(&job.id.0).join(format!("{expected}.json"))
-                && operation.commit == *job.effective_commit()
+                && operation.commit == *job.execution_commit()
                 && (job.phase == operation.phase
                     || (job.phase == Phase::Blocked && job.stopped_phase == Some(operation.phase))),
             "workflow intent does not match its stage and owned result"
@@ -92,7 +96,7 @@ impl Worker<'_> {
         )?;
         let run = StageRun {
             stage: stage.into(),
-            commit: job.effective_commit().clone(),
+            commit: job.execution_commit().clone(),
             operation: operation.name.clone(),
             command: saved,
             result,
@@ -199,8 +203,15 @@ impl Worker<'_> {
                 &self.worktree(job),
                 job,
             )?);
-        } else if job.workflow.fix.is_some() || job.workflow.analyze.is_some() {
-            crate::git::unchanged(self.paths, &self.worktree(job), job.effective_commit())?;
+        } else if stage == "compose" {
+            if success {
+                self.retain_composition(job, &run)?;
+            }
+        } else if job.workflow.fix.is_some()
+            || job.workflow.analyze.is_some()
+            || job.workflow.batch.is_some()
+        {
+            crate::git::unchanged(self.paths, &self.worktree(job), job.execution_commit())?;
         }
         job.runs.push(run);
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
@@ -219,6 +230,11 @@ impl Worker<'_> {
                 format!("Workflow {stage} failed for {}", job.effective_commit()),
                 false,
             );
+        }
+        // A successful deployment is the cumulative base even if cancellation
+        // was requested while that command was already running.
+        if stage == "deploy" && job.batch.is_some() {
+            self.record_release(job)?;
         }
         if job.cancel_requested {
             return self.finish(
@@ -241,7 +257,10 @@ impl Worker<'_> {
         if stage == "analyze" {
             return self.save(job, Phase::Checking);
         }
-        if stage == "check" && job.workflow.prepare.is_some() {
+        if stage == "check" && job.workflow.batch.is_some() {
+            return self.defer_release(job);
+        }
+        if matches!(stage, "check" | "compose") && job.workflow.prepare.is_some() {
             return self.save(job, Phase::Preparing);
         }
         if stage != "deploy" && job.workflow.deploy.is_some() {

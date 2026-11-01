@@ -34,4 +34,11 @@ continues with the accepted source. Telete retains automatic
 edits under a result ref and identifies both submitted and checked source.
 Configured commands own formatter, linter, and release-version policy.
 
+Optional deployment batching closes a group of admitted compatible requests at
+the first successful individual check. The manager waits for member checks,
+runs a configured composition command, then prepares and deploys the retained
+combined source once. No additional analysis or check is inserted. Git helpers
+retain release commits and the latest successful source for each target without
+advancing project branches.
+
 Read [Operate Telete](queue-operate.md) for the command and execution contract.

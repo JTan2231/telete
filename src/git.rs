@@ -108,8 +108,20 @@ pub(crate) fn result_ref(job: &str) -> Result<String> {
     Ok(format!("refs/telete/results/{job}"))
 }
 
+pub(crate) fn release_ref(job: &str) -> Result<String> {
+    crate::model::JobId::new(job)?;
+    Ok(format!("refs/telete/releases/{job}"))
+}
+
+pub(crate) fn release_target_ref(target: &str) -> Result<String> {
+    crate::model::JobId::new(target)?;
+    Ok(format!("refs/telete/releases/targets/{target}"))
+}
+
 fn managed_ref(reference: &str) -> bool {
-    reference.starts_with("refs/telete/jobs/") || reference.starts_with("refs/telete/results/")
+    reference.starts_with("refs/telete/jobs/")
+        || reference.starts_with("refs/telete/results/")
+        || reference.starts_with("refs/telete/releases/")
 }
 
 pub(crate) fn ref_value(paths: &Paths, repo: &Path, reference: &str) -> Result<Option<CommitId>> {
@@ -445,6 +457,49 @@ pub(crate) fn unchanged(paths: &Paths, checkout: &Path, revision: &CommitId) -> 
         "workflow changed tracked source after automatic edits"
     );
     Ok(())
+}
+
+/// Retain a project's composed release without changing any project branch.
+/// Every member and the preceding release must be present in its ancestry.
+pub(crate) fn retain_release(
+    paths: &Paths,
+    repo: &Path,
+    checkout: &Path,
+    job: &str,
+    base: &CommitId,
+    members: &[CommitId],
+    revision: &CommitId,
+) -> Result<()> {
+    ensure!(
+        common(paths, checkout)? == common(paths, repo)?,
+        "release checkout belongs to another repository"
+    );
+    let symbolic = run(
+        paths,
+        checkout,
+        &strings(&["symbolic-ref", "-q", "HEAD"]),
+        None,
+        BTreeMap::new(),
+    )?;
+    ensure!(
+        symbolic.exited_with(&[1]),
+        "release checkout must keep a detached HEAD"
+    );
+    unchanged(paths, checkout, revision)?;
+    for ancestor in std::iter::once(base).chain(members) {
+        let result = run(
+            paths,
+            repo,
+            &strings(&["merge-base", "--is-ancestor", &ancestor.0, &revision.0]),
+            None,
+            BTreeMap::new(),
+        )?;
+        ensure!(
+            result.success(),
+            "release commit {revision} must include source {ancestor}"
+        );
+    }
+    advance(paths, repo, &release_ref(job)?, None, revision)
 }
 
 fn automatic_commit(

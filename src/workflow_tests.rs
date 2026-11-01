@@ -27,7 +27,7 @@ fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
         fix:None, analyze:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
             timeout_seconds:Some(10), env:BTreeMap::from([("MARKER".into(),
                 paths.root.join("observed").display().to_string())]) },
-        prepare:None, deploy:None, parameters:json!({"suite":"fixture"}),
+        prepare:None, deploy:None, batch:None, parameters:json!({"suite":"fixture"}),
     }};
     Ok((temporary, project, commit))
 }

@@ -64,6 +64,14 @@ impl Drop for Project {
             .filter_map(|job| job["id"].as_str())
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        ids.extend(
+            status["waiting_release"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|job| job["id"].as_str())
+                .map(str::to_owned),
+        );
         if let Some(id) = status["active"]["id"].as_str() {
             ids.push(id.to_owned());
         }
@@ -402,6 +410,128 @@ fn concurrent_first_submissions_publish_one_complete_queue() -> TestResult {
         .trim()
         .is_empty()
     );
+    Ok(())
+}
+
+fn batch_release_workflow(project: &Project) -> TestResult {
+    let checked_sources = project.root.join("checked");
+    let compositions = project.root.join("compositions");
+    let deployments = project.root.join("deployments");
+    let compose = r"import json,os,pathlib,subprocess
+c=json.load(open(os.environ['TELETE_CONTEXT']))
+b=c['inputs']['batch']
+open(os.environ['COMPOSED'],'a').write(json.dumps(b)+'\n')
+env={k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
+env.update(GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL='/dev/null')
+for member in b['members']:
+    subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-c','commit.gpgSign=false','-c','user.name=Telete CLI Test','-c','user.email=telete-test@example.invalid','merge','--no-edit','--no-ff',member['commit']],env=env,check=True)
+commit=subprocess.check_output(['/usr/bin/git','rev-parse','HEAD'],env=env,text=True).strip()
+pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\n')
+";
+    fs::write(
+        project.root.join("telete.json"),
+        serde_json::to_vec(&json!({
+            "repo":"repo", "state":"state",
+            "check": {
+                "program":"/usr/bin/python3", "timeout_seconds":15,
+                "args":["-c", r"import json,os; c=json.load(open(os.environ['TELETE_CONTEXT'])); open(os.environ['CHECKED'],'a').write(c['source']['commit']+'\n')"],
+                "env":{"CHECKED":checked_sources}
+            },
+            "batch": {
+                "target":"production", "base":project.commit,
+                "compose": {
+                    "program":"/usr/bin/python3", "timeout_seconds":15,
+                    "args":["-c", compose], "env":{"COMPOSED":compositions}
+                }
+            },
+            "deploy": {
+                "program":"/usr/bin/python3", "timeout_seconds":15,
+                "args":["-c", r"import json,os,pathlib; c=json.load(open(os.environ['TELETE_CONTEXT'])); assert pathlib.Path('change-a.txt').read_text()=='change-a'; assert pathlib.Path('change-b.txt').read_text()=='change-b'; open(os.environ['DEPLOYED'],'a').write(c['source']['commit']+'\n')"],
+                "env":{"DEPLOYED":deployments}
+            }
+        }))?,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> TestResult {
+    let project = Project::new()?;
+    let checked_sources = project.root.join("checked");
+    let compositions = project.root.join("compositions");
+    let deployments = project.root.join("deployments");
+    batch_release_workflow(&project)?;
+    checked(project.command(&["pause"]))?;
+    let mut commits = Vec::new();
+    let mut ids = Vec::new();
+    for name in ["change-a", "change-b"] {
+        checked(git(
+            &project.repo,
+            &["checkout", "--quiet", "-b", name, &project.commit],
+        ))?;
+        let file = format!("{name}.txt");
+        fs::write(project.repo.join(&file), name)?;
+        checked(git(&project.repo, &["add", &file]))?;
+        checked(git(&project.repo, &["commit", "--quiet", "-m", name]))?;
+        let commit = checked(git(&project.repo, &["rev-parse", "HEAD"]))?
+            .trim()
+            .to_owned();
+        let submitted = checked_json(project.command(&["submit", &commit]))?;
+        commits.push(commit);
+        ids.push(submitted["id"].as_str().ok_or("missing job ID")?.to_owned());
+    }
+    let paused = checked_json(project.command(&["status"]))?;
+    assert_eq!(paused["queue"].as_array().ok_or("missing queue")?.len(), 2);
+    wait_for_worker_ownership(&project.state, true)?;
+    assert!(!checked_sources.exists());
+    checked(project.command(&["resume"]))?;
+    let first = checked_json(project.command(&["wait", &ids[0]]))?;
+    let second = checked_json(project.command(&["wait", &ids[1]]))?;
+    for result in [&first, &second] {
+        assert_eq!(result["observation"], "terminal");
+        assert_eq!(result["job"]["phase"], "succeeded");
+        assert_eq!(result["job"]["release_id"], ids[0]);
+    }
+    assert_eq!(first["job"]["resulting_commit"], commits[0]);
+    assert_eq!(second["job"]["resulting_commit"], commits[1]);
+    assert_eq!(
+        first["job"]["release_commit"],
+        second["job"]["release_commit"]
+    );
+    let release = first["job"]["release_commit"]
+        .as_str()
+        .ok_or("missing release source")?;
+    assert_eq!(
+        fs::read_to_string(checked_sources)?
+            .lines()
+            .collect::<Vec<_>>(),
+        commits
+    );
+    assert_eq!(fs::read_to_string(compositions)?.lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(deployments)?.lines().collect::<Vec<_>>(),
+        vec![release]
+    );
+    for commit in &commits {
+        checked(git(
+            &project.repo,
+            &["merge-base", "--is-ancestor", commit, release],
+        ))?;
+    }
+    assert_eq!(
+        checked(git(
+            &project.repo,
+            &["rev-parse", "refs/telete/releases/targets/production"]
+        ))?
+        .trim(),
+        release
+    );
+    wait_for_worker_ownership(&project.state, false)?;
+    assert_eq!(fs::read_dir(project.state.join("jobs"))?.count(), 0);
+    let settled = checked_json(project.command(&["status"]))?;
+    assert_eq!(settled["waiting_release"], json!([]));
+    assert_eq!(settled["queue"], json!([]));
+    assert!(settled["active"].is_null());
     Ok(())
 }
 

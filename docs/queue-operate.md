@@ -142,10 +142,13 @@ scratch cleanup preserve the ref. The ref belongs to source history and remains
 until the project explicitly removes it. Telete does not merge or advance project
 branches; the project can integrate the returned commit.
 
-`commit` in job status remains the submitted SHA. After fixes or analysis, `resulting_commit`
-and `result_ref` identify the retained source. All subsequent commands run on
-that resulting commit. Commands after fixes must preserve HEAD and tracked
-source. A violation fails the job. Resuming the job consumes saved command
+`commit` in job status remains the submitted SHA. After fixes, analysis, or a
+successful batched check, `resulting_commit`
+and `result_ref` identify the retained source. Subsequent commands run on
+that resulting commit unless a batched release selects combined source below.
+Commands after fixes must preserve HEAD and tracked
+source, except for the selected batch composition stage. A violation fails the
+job. Resuming the job consumes saved command
 evidence and reuses its result commit instead of applying corrections again.
 
 The supported workflow fields are:
@@ -157,6 +160,7 @@ The supported workflow fields are:
 | `check` | required | Build or check the resulting source, including accepted repairs. |
 | `prepare` | absent | Run after a successful check. |
 | `deploy` | absent | Run after successful preceding stages. |
+| `batch` | absent | Combine compatible deployment requests before preparation and deployment. |
 | `parameters` | `{}` | Pass the supplied object unchanged to commands. |
 
 The order is optional fixes, optional analysis, check, optional preparation, and
@@ -188,6 +192,101 @@ compiler target directory, or credential reference, select it in its commands
 and configuration. Environment values are not resolved relative to the config
 file and are not expanded by Telete.
 
+## Batch deployment requests
+
+Select `batch` to run each submitted change's individual fixes, analysis, and
+check, then combine compatible deployment requests into one release. A batch
+requires `deploy`. Preparation and deployment run once on the combined commit;
+Telete does not add another analysis or check.
+
+```json
+{
+  "repo": ".",
+  "state": ".telete",
+  "check": {"program": "ci/check.sh"},
+  "prepare": {"program": "ci/prepare.sh"},
+  "deploy": {"program": "ci/deploy.sh"},
+  "batch": {
+    "target": "production",
+    "base": "main",
+    "compose": {"program": "ci/compose.sh"}
+  }
+}
+```
+
+`target` names the shared deployment destination, using one to 128 ASCII
+letters, digits, underscores, or hyphens. `base` selects the initial release
+source and is resolved to a commit at submission. After a successful batched
+deployment, the next group uses that target's last successful release instead.
+Telete pins the submitted bootstrap base at `refs/telete/jobs/base-JOB` until
+request cleanup.
+Use the same target for commands that deploy to the same destination. Compatible
+requests have the same target, composition, preparation, deployment, and
+parameters; their individual fixes, analysis, and checks may differ.
+
+When the first member finishes its check, Telete closes the group over compatible
+requests already admitted to the queue. Those requests finish their individual
+CI before the shared release starts. An incompatible request for the same target
+closes that compatible segment; later compatible requests cannot jump ahead of
+it. Later submissions enter the next group,
+even if the first group has not deployed yet. A group waiting for members does
+not occupy the execution slot. A member awaiting repair keeps its group waiting
+while other CI can run. Telete does not silently omit failed members or let a
+later release for the same target overtake a pending one.
+
+Cancelling any frozen member cancels the group at a safe boundary. Complete an
+interrupted repair handoff on any member before cancelling. A group with a
+failed member and a member awaiting repair stays pending until explicit
+cancellation, preserving the repair evidence.
+
+The first ready job identifies the release. The configured `compose` command
+runs in its private checkout, starting at the group's release base. Its context
+contains `inputs.batch.base` and `inputs.batch.members` in queue order. Every
+member includes `job_id`, its final checked `commit`, `submitted_commit`,
+`analyzed_commit`, `repaired_commit`, and `parameters`. Project commands own the
+merge policy, conflicts, release identifiers, and package format.
+
+The compose command must leave a clean, detached HEAD at the combined commit
+and write that full commit ID to `outputs.directory/commit`. The commit must
+descend from the release base and every member's checked source. Telete retains
+it at `refs/telete/releases/RELEASE`, then runs the configured preparation and
+deployment on it. These ancestry checks establish which source was included;
+configured commands own the release's domain success claims. No project branch
+is advanced.
+
+For example, a project using `jq` can make this `ci/compose.sh` executable and
+commit it in its base source:
+
+```sh
+#!/bin/sh
+set -eu
+jq -r '.inputs.batch.members[].commit' "$TELETE_CONTEXT" |
+while IFS= read -r revision; do
+    git -c user.name=Telete -c user.email=telete@localhost \
+        -c core.hooksPath=/dev/null -c commit.gpgSign=false \
+        merge --no-edit "$revision"
+done
+git rev-parse HEAD > "$(jq -r '.outputs.directory' "$TELETE_CONTEXT")/commit"
+```
+
+Status distinguishes each member's checked source from `release_commit`, and
+`release_id` links members to their shared outcome. Members wait in
+`waiting_release`; the leader runs `composing`, then preparation and deployment.
+`wait` and `submit --follow` observe the requested deployment through that shared
+outcome. Individual submitted, analyzed, and repaired identities remain intact.
+
+Composition failure prevents deployment. The existing cancellation and command
+recovery rules apply to release work too: missing terminal evidence never
+authorizes replay. Release refs survive checkout cleanup, and
+`refs/telete/releases/targets/TARGET` retains the latest confirmed release source.
+Successful completion markers retain only individual source and shared release
+identities. A shared failure retains the leader and actual failed-member
+diagnostics until a newer workflow succeeds or fails. Preserve durable packages and
+release records in project outputs.
+
+Telete 0.5 reads earlier queue records. Let a 0.4 worker settle before submitting
+batched workflows, and keep 0.5 or later while batching records remain.
+
 ## Command results and context
 
 Check success requires a successful command completion for the selected commit.
@@ -204,11 +303,15 @@ before launch. Retaining the exact command lets recovery reconcile the same
 execution instead of constructing another command from current settings.
 
 The context contains the job and operation identity, stage, checkout,
-`source.commit`, parameters, inputs, and outputs. For a workflow with fixes or analysis,
+`source.commit`, parameters, inputs, and outputs. For a workflow with fixes,
+analysis, or batching,
 `source.submitted_commit` preserves the submitted SHA and `source.result_ref`
 names the retained result. `source.commit` identifies the submitted source in
-the fix command and the resulting source in every later command. Workflows
-without fixes or analysis keep their previous context shape.
+the fix command and the resulting source in later individual commands. Batched
+composition selects the release base; preparation and deployment select the
+combined release source. `source.checked_commit` preserves the individual
+source, and `source.release_id` identifies a frozen group. Workflows without
+fixes, analysis, or batching keep their previous context shape.
 
 `outputs.directory` names the private output directory for the command. With
 fixes selected, `inputs.fix` is null during fixes and names the completed fix
@@ -267,9 +370,10 @@ all remaining configured commands succeeded. It does not assert automated
 analysis of the repaired source. Project commands own their final build and
 artifact identity rules.
 
-Telete 0.4 reads existing 0.3 queue records. Let commands from an earlier worker
-settle before submitting workflows with analysis. Keep Telete 0.4 or later while
-analysis or repair records remain; earlier executables cannot read those records.
+Telete 0.5 reads existing 0.3 and 0.4 queue records. Let commands from an earlier
+worker settle before submitting newly supported workflows. Keep 0.4 or later
+while analysis or repair records remain, and 0.5 or later while batching records
+remain; earlier executables cannot read those records.
 
 Use `cancel JOB` to discard a waiting job at its safe boundary. Use `recover JOB`
 only for uncertain command execution; recovery does not accept source repairs.
@@ -327,13 +431,17 @@ resource slot. `gates` exposes current diagnostic records.
 Diagnostics are for current operation, not historical browsing. The latest failed
 workflow retains its details and private checkout until a newer workflow
 finishes successfully or fails. Cancellation does not supersede that failure.
+For a failed shared release, these details include its leader and the actual
+failed member's diagnostics.
 Successful and cancelled jobs release their scratch files and full execution
 records; superseded failures do likewise.
 
 Telete retains at most 128 small settled-job markers containing job ID, phase,
-queue sequence, and update time. Jobs with completed fixes also retain the
+queue sequence, and update time. Jobs with completed fixes or a successful
+batched check also retain the
 submitted commit, resulting commit, and result ref. Jobs with analysis also retain
-the analyzed and accepted repair identities. Markers contain no command,
+the analyzed and accepted repair identities. Batched members also retain
+`release_id` and `release_commit`. Markers contain no command,
 parameters, environment, or output. Old markers are pruned, and `wait JOB` then
 reports that the job is unavailable. Archive any project outputs through the
 configured commands when they need a longer lifetime.

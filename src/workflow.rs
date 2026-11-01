@@ -86,6 +86,34 @@ fn empty_parameters() -> serde_json::Value {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct BatchConfig {
+    pub target: String,
+    pub base: String,
+    pub compose: WorkflowCommand,
+}
+
+impl BatchConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.target.is_empty()
+                && self.target.len() <= 128
+                && self.target.as_bytes()[0].is_ascii_alphanumeric()
+                && self
+                    .target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "batch target must be a slug of 1 to 128 ASCII letters, digits, hyphens, or underscores, starting with a letter or digit"
+        );
+        ensure!(
+            !self.base.is_empty() && !self.base.contains('\0'),
+            "batch base must be a nonempty Git revision without NUL"
+        );
+        self.compose.validate("compose")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Workflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix: Option<WorkflowCommand>,
@@ -96,6 +124,8 @@ pub(crate) struct Workflow {
     pub prepare: Option<WorkflowCommand>,
     #[serde(default)]
     pub deploy: Option<WorkflowCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchConfig>,
     #[serde(default = "empty_parameters")]
     pub parameters: serde_json::Value,
 }
@@ -106,6 +136,11 @@ impl Workflow {
             "fix" => self.fix.as_ref().context("automatic fixes not selected"),
             "analyze" => self.analyze.as_ref().context("analysis not selected"),
             "check" => Ok(&self.check),
+            "compose" => self
+                .batch
+                .as_ref()
+                .map(|batch| &batch.compose)
+                .context("release batching not selected"),
             "prepare" => self.prepare.as_ref().context("preparation not selected"),
             "deploy" => self.deploy.as_ref().context("deployment not selected"),
             _ => bail!("unknown workflow stage"),
@@ -129,6 +164,10 @@ impl Workflow {
         }
         if let Some(command) = &self.deploy {
             command.validate("deploy")?;
+        }
+        if let Some(batch) = &self.batch {
+            ensure!(self.deploy.is_some(), "batch requires deployment");
+            batch.validate()?;
         }
         Ok(())
     }
@@ -155,6 +194,8 @@ struct ProjectFile {
     prepare: Option<WorkflowCommand>,
     #[serde(default)]
     deploy: Option<WorkflowCommand>,
+    #[serde(default)]
+    batch: Option<BatchConfig>,
     #[serde(default = "empty_parameters")]
     parameters: serde_json::Value,
 }
@@ -199,6 +240,7 @@ pub(crate) fn read(path: &Path) -> Result<ProjectConfig> {
         check: file.check,
         prepare: file.prepare,
         deploy: file.deploy,
+        batch: file.batch,
         parameters: file.parameters,
     };
     workflow.validate()?;
@@ -256,6 +298,78 @@ mod tests {
     #[test]
     fn deployment_does_not_require_preparation() -> Result<()> {
         workflow(json!({"check":{"program":"check"},"deploy":{"program":"deploy"}})).validate()
+    }
+
+    #[test]
+    fn batching_requires_deployment_and_validates_its_command_and_identity() -> Result<()> {
+        let value = json!({
+            "check": {"program": "check"},
+            "deploy": {"program": "deploy"},
+            "batch": {
+                "target": "production-mac_1",
+                "base": "refs/heads/main",
+                "compose": {"program": "ci/compose"},
+            },
+        });
+        let selected = workflow(value.clone());
+        selected.validate()?;
+        assert_eq!(
+            selected.command("compose")?.program,
+            Path::new("ci/compose")
+        );
+        for target in ["", "-release", "prod/release", "prod release", ".", "é"] {
+            let mut invalid = value.clone();
+            invalid["batch"]["target"] = json!(target);
+            assert!(workflow(invalid).validate().is_err(), "{target}");
+        }
+        let mut invalid = value.clone();
+        invalid["batch"]["target"] = json!("a".repeat(129));
+        assert!(workflow(invalid).validate().is_err());
+        for base in ["", "\0"] {
+            let mut invalid = value.clone();
+            invalid["batch"]["base"] = json!(base);
+            assert!(workflow(invalid).validate().is_err());
+        }
+        let mut invalid = value.clone();
+        invalid["deploy"] = serde_json::Value::Null;
+        assert!(workflow(invalid).validate().is_err());
+        for command in [
+            json!({"program": "../compose"}),
+            json!({"program": "compose", "env": {"TELETE_CONTEXT": "elsewhere"}}),
+            json!({"program": "compose", "timeout_seconds": 0}),
+        ] {
+            let mut invalid = value.clone();
+            invalid["batch"]["compose"] = command;
+            assert!(workflow(invalid).validate().is_err());
+        }
+        let mut invalid = value.clone();
+        invalid["batch"]["unknown"] = json!(true);
+        assert!(serde_json::from_value::<Workflow>(invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn project_config_reads_batch_selection() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("telete.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "repo": ".", "state": ".telete",
+                "check": {"program": "check"},
+                "deploy": {"program": "deploy"},
+                "batch": {
+                    "target": "production", "base": "main",
+                    "compose": {"program": "compose"},
+                },
+            }))?,
+        )?;
+        let project = read(&path)?;
+        let batch = project.workflow.batch.context("selected batch")?;
+        assert_eq!(batch.target, "production");
+        assert_eq!(batch.base, "main");
+        assert_eq!(batch.compose.program, Path::new("compose"));
+        Ok(())
     }
 
     #[test]

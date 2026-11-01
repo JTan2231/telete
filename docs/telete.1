@@ -1,4 +1,4 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.4.0" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.5.0" "General Commands Manual"
 .SH NAME
 telete \- run a serial queue of committed repository workflows
 .SH SYNOPSIS
@@ -323,6 +323,14 @@ Optional command object, run after all selected preceding stages succeed.
 Deployment may be selected without preparation.
 Omitted or null means no deployment stage.
 .TP
+.B batch
+Optional deployment batching object containing
+.BR target ,
+.BR base ,
+and a
+.B compose
+command. Requires deployment. See BATCHED DEPLOYMENTS.
+.TP
 .B parameters
 JSON object passed unchanged through the execution context.
 The default is an empty object.
@@ -418,9 +426,78 @@ is queued, active, or unresolved.
 If the binding survives but the runtime directory or queue database is missing,
 queue operations fail and require restoration of that operational state.
 Telete does not create an empty replacement queue behind an existing binding.
+.SH BATCHED DEPLOYMENTS
+An optional
+.B batch
+object groups compatible deployment requests. For example:
+.PP
+.nf
+  "batch": {
+    "target": "production",
+    "base": "main",
+    "compose": {"program": "ci/compose.sh"}
+  }
+.fi
+.PP
+The target identifies the deployment destination using one to 128 ASCII
+letters, digits, underscores, or hyphens. The base revision is resolved once at
+submission and seeds the first release. Subsequent releases start from the
+target's last successfully deployed release source.
+Telete retains the bootstrap base at refs/telete/jobs/base-JOB until cleanup.
+.PP
+Every member runs its own selected fixes, analysis, and check. When the first
+member finishes its check, Telete closes the group over compatible requests
+already admitted. Compatibility requires the same target, composition,
+preparation, deployment, and parameters. Individual check commands can differ.
+An incompatible request for the same target ends the compatible segment;
+later compatible requests cannot jump ahead of it.
+Later arrivals enter the next group, even if deployment has not started.
+Waiting for members releases the execution slot. A member awaiting repair holds
+its group while other CI can run; failed members are never silently omitted.
+Later releases for the same target cannot overtake a pending release.
+Cancelling any frozen member cancels the group at a safe boundary. Complete
+any member's interrupted repair handoff first. A failed member together with
+a member awaiting repair keeps the group pending until explicit cancellation.
+.PP
+The group's first ready job identifies its release. The compose command runs
+in that job's private checkout starting at the release base.
+.B inputs.batch
+in its context contains
+.B base
+and ordered
+.B members
+with job_id, final checked commit, submitted_commit, analyzed_commit,
+repaired_commit, and parameters. The command owns source integration, conflicts,
+and version policy. It must leave a clean detached HEAD at the combined source
+and write its full commit ID to
+.IR outputs.directory/commit .
+The commit must descend from the release base and every checked member source.
+.PP
+Telete retains that commit at
+.I refs/telete/releases/RELEASE
+and runs preparation and deployment once on it. It does not add combined CI or
+advance project branches. Composition failure prevents deployment. Existing
+cancellation and recovery rules apply; an uncertain command is never replayed.
+.PP
+Member status preserves individual checked source, names the shared
+.BR release_id ,
+and reports
+.BR release_commit .
+Members wait in
+.B waiting_release
+while the leader runs
+.BR composing ,
+preparation, and deployment. A requested deployment completes only with the
+shared release outcome. Successful deployment updates
+.IR refs/telete/releases/targets/TARGET .
+These refs survive runtime cleanup. Packages and durable release history belong
+to project commands.
 .SH EXECUTION
 Stages run in this order: optional fixes, optional analysis, check, optional preparation, optional
 deployment.
+With batching selected, each member runs its individual check, then the release
+runs composition, optional preparation, and deployment once. No additional
+analysis or check is inserted.
 A stage succeeds only when its command exits with status 0 without a timeout,
 signal, start error, or output collection error.
 An ordinary nonzero analysis exit, or an ordinary check failure with analysis
@@ -466,16 +543,23 @@ The absolute private checkout path.
 .TP
 .B source.commit
 The submitted commit during fixes, and the resulting checked commit in later
-commands. Without a fix command, this remains the submitted commit.
+individual commands. Batched preparation and deployment use the combined
+release commit; composition uses the release base. Without fixes or batching,
+this remains the submitted commit.
 .TP
 .B source.submitted_commit, source.result_ref
-Present when fixes or analysis are selected. Preserve the submitted SHA and name its durable
+Present when fixes, analysis, or batching are selected. Preserve the submitted SHA and name its durable
 result ref, refs/telete/results/JOB. The ref survives failure, cancellation, and
 scratch cleanup. A resumed job reuses its result instead of applying fixes again.
 .TP
 .B source.analyzed_commit, source.repaired_commit
 The analyzed source, from the analysis stage onward, and accepted repair source
 when present. After repair, source.commit selects the repaired source.
+.TP
+.B source.checked_commit, source.release_id
+For batching, preserve the individual checked source and identify its frozen
+release group. Composition, preparation, and deployment use their own selected
+source.commit.
 .TP
 .B inputs.analysis
 Present when analysis is selected. Null during analysis; its retained output
@@ -494,6 +578,10 @@ The private output directory for this command.
 .B inputs.preparation
 The absolute output directory of the successful preparation stage, when
 available; otherwise null.
+.TP
+.B inputs.batch
+The release base and ordered member identities for batched release commands.
+See BATCHED DEPLOYMENTS.
 .PP
 Telete defines no package or installation format for these outputs.
 Commands that need durable outputs must copy or publish them before runtime
@@ -532,6 +620,8 @@ Job phases are
 .BR analyzing ,
 .BR awaiting_repair ,
 .BR checking ,
+.BR waiting_release ,
+.BR composing ,
 .BR preparing ,
 .BR deploying ,
 .BR blocked ,
@@ -653,16 +743,20 @@ Worker cleanup releases successful and cancelled jobs' scratch files and full
 execution records.
 The latest failed workflow retains its diagnostics and checkout until a newer
 workflow succeeds or fails; cancellation does not supersede that failure.
+For a failed shared release, retained details include the leader and actual
+failed-member diagnostics.
 Superseded failure details are also removed. Jobs awaiting agent repair retain
 their checkout and evidence until explicit repair or cancellation. Waiting alone
 does not keep a worker running.
 .PP
 At most 128 small settled-job markers are retained.
 They contain the job ID, phase, queue sequence, and update time, without commands,
-parameters, environment, or output. Jobs with completed fixes also retain commit,
+parameters, environment, or output. Jobs with completed fixes or a successful
+batched check also retain commit,
 resulting_commit, and result_ref. Jobs with analysis also retain analyzed_commit
 and repaired_commit when present. The commit field preserves the submitted SHA;
-resulting_commit identifies checked and deployed source.
+resulting_commit identifies checked source. Batched members also retain their
+release_id and release_commit; the latter identifies deployed source.
 After pruning,
 .B status job
 and
@@ -687,9 +781,10 @@ Recovery uses the saved invocation, including its context, explicit environment
 overrides, and timeout, rather than current command settings.
 It does not authorize another launch under the same execution identity.
 .PP
-Telete 0.4 reads existing 0.3 queue records. Let earlier commands settle before
-submitting workflows with analysis. Keep Telete 0.4 or later while analysis or
-repair records remain; earlier executables cannot read those records.
+Telete 0.5 reads existing 0.3 and 0.4 queue records. Let an earlier worker settle
+before submitting newly supported workflows. Keep 0.4 or later while analysis
+or repair records remain, and 0.5 or later while batching records remain;
+earlier executables cannot read those records.
 .PP
 Use the Telete version that owns existing runtime state.
 Incompatible runtime schemas are rejected; Telete does not automatically migrate

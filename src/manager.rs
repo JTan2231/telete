@@ -13,6 +13,8 @@ use crate::paths::Paths;
 use crate::store::{self, Cleanup, Config, Job, Operation, Phase, Store};
 use crate::workflow::{ProjectConfig, StageRun, Workflow};
 
+#[path = "batch_manager.rs"]
+mod batch_manager;
 #[path = "workflow_manager.rs"]
 mod workflow_manager;
 
@@ -36,7 +38,7 @@ pub(crate) fn submit(
     paths: &Paths,
     repo: &Path,
     revision: &str,
-    workflow: Workflow,
+    mut workflow: Workflow,
 ) -> Result<Value> {
     workflow.validate()?;
     let (store, config) = configured(paths)?;
@@ -45,6 +47,9 @@ pub(crate) fn submit(
         "submit must select a checkout of the configured Git repository"
     );
     let commit = git::commit(paths, repo, revision)?;
+    if let Some(batch) = &mut workflow.batch {
+        batch.base = git::commit(paths, repo, &batch.base)?.0;
+    }
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
     let job = new_job(
         JobId::new(uuid::Uuid::now_v7().to_string())?,
@@ -63,6 +68,15 @@ pub(crate) fn submit(
             None,
             &job.commit,
         )?;
+        if let Some(batch) = &job.workflow.batch {
+            git::advance(
+                paths,
+                &config.common_git_dir,
+                &git::private_ref(&format!("base-{}", job.id))?,
+                None,
+                &CommitId::new(batch.base.clone())?,
+            )?;
+        }
         git::ensure_worktree(
             paths,
             &config.common_git_dir,
@@ -96,6 +110,9 @@ fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
         resulting_commit: None,
         analyzed_commit: None,
         repaired_commit: None,
+        release_id: None,
+        batch: None,
+        release_commit: None,
         workflow,
         runs: Vec::new(),
         operation: None,
@@ -119,7 +136,7 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
     if store::probe_config(&paths.root)?.is_none() {
         ensure!(id.is_none(), "no retained result for this job");
         return Ok(json!({"schema_version":3,"paused":false,"active":null,
-            "queue":[],"awaiting_repair":[],"failure":null,"completions":[],"maintenance_owners":[]}));
+            "queue":[],"awaiting_repair":[],"waiting_release":[],"failure":null,"completions":[],"maintenance_owners":[]}));
     }
     let (store, config) = configured(paths)?;
     if let Some(id) = id {
@@ -142,11 +159,17 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
         .find(|job| job.phase == Phase::Failed)
         .map(Job::output)
         .transpose()?;
+    let waiting_release = jobs
+        .iter()
+        .filter(|job| job.phase == Phase::WaitingRelease)
+        .map(Job::output)
+        .collect::<Result<Vec<_>>>()?;
     Ok(
         json!({"schema_version":3,"version":env!("CARGO_PKG_VERSION"),
         "paused":store.paused()?,"config":config,
         "active":store.active()?.map(|job|job.output()).transpose()?,
-        "queue":queue,"awaiting_repair":awaiting_repair,"failure":failure,"completions":store.completion_list()?,
+        "queue":queue,"awaiting_repair":awaiting_repair,"waiting_release":waiting_release,
+        "failure":failure,"completions":store.completion_list()?,
         "maintenance_owners":store.holds()?}),
     )
 }
@@ -196,6 +219,26 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
     let (store, _) = configured(paths)?;
     store.transaction(|| {
         let mut job = store.job(id)?;
+        if job.phase.terminal() {
+            return Ok(());
+        }
+        if let Some(release) = &job.release_id {
+            let leader = store.job(&release.0)?;
+            if let Some(batch) = &leader.batch {
+                for member in &batch.members {
+                    let member = store.job(&member.0)?;
+                    ensure!(
+                        member.phase != Phase::AwaitingRepair
+                            || member.repaired_commit.is_none()
+                            || member.resulting_commit == member.repaired_commit,
+                        "complete the interrupted repair before cancelling this release"
+                    );
+                }
+                for member in &batch.members {
+                    store.cancel(&member.0)?;
+                }
+            }
+        }
         ensure!(
             job.phase != Phase::AwaitingRepair
                 || job.repaired_commit.is_none()
@@ -203,7 +246,10 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
             "complete the interrupted repair before cancelling this job"
         );
         store.cancel(id)?;
-        if matches!(job.phase, Phase::Queued | Phase::AwaitingRepair) {
+        if matches!(
+            job.phase,
+            Phase::Queued | Phase::AwaitingRepair | Phase::WaitingRelease
+        ) {
             job.cancel_requested = true;
             job.phase = Phase::Cancelled;
             job.outcome = Some(Phase::Cancelled);
@@ -352,6 +398,7 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
             Phase::Fixing
                 | Phase::Analyzing
                 | Phase::Checking
+                | Phase::Composing
                 | Phase::Preparing
                 | Phase::Deploying
         ),
@@ -413,9 +460,18 @@ pub(crate) async fn worker(paths: &Paths) -> Result<()> {
 pub(crate) fn needs_worker(paths: &Paths) -> Result<bool> {
     let (store, _) = configured(paths)?;
     let latest = store.get::<u64>("latest_finished_sequence")?;
-    Ok(store.jobs()?.iter().any(|job| {
-        job.phase != Phase::AwaitingRepair
-            && (job.phase != Phase::Failed || Some(job.sequence) != latest)
+    let jobs = store.jobs()?;
+    Ok(jobs.iter().any(|job| {
+        let retained_failure = job.phase == Phase::Failed
+            && (Some(job.sequence) == latest
+                || job.release_id.as_ref().is_some_and(|id| {
+                    jobs.iter().any(|leader| {
+                        leader.id == *id
+                            && leader.phase == Phase::Failed
+                            && Some(leader.sequence) == latest
+                    })
+                }));
+        job.phase != Phase::AwaitingRepair && !retained_failure
     }))
 }
 
@@ -450,6 +506,9 @@ impl Worker<'_> {
             if self.store.paused()? || !self.store.holds()?.is_empty() {
                 return Ok(None);
             }
+            if let Some(job) = self.claim_release()? {
+                return Ok(Some(job));
+            }
             let Some(mut job) = self.store.queued()? else {
                 return Ok(None);
             };
@@ -459,6 +518,7 @@ impl Worker<'_> {
     }
 
     fn tick(&mut self) -> Result<Value> {
+        self.settle_releases()?;
         self.cleanup_settled()?;
         let Some(mut job) = self.claim()? else {
             return Ok(json!({"state":"idle","paused":self.store.paused()?}));
@@ -471,6 +531,7 @@ impl Worker<'_> {
             let unresolved = job.operation.is_some();
             self.finish(&mut job, Phase::Failed, message, unresolved)?;
         }
+        self.settle_releases()?;
         self.cleanup_settled()?;
         job_status(&self.store, &job.id.0)
     }
@@ -517,6 +578,7 @@ impl Worker<'_> {
             Phase::Fixing => self.workflow_stage(job, "fix"),
             Phase::Analyzing => self.workflow_stage(job, "analyze"),
             Phase::Checking => self.workflow_stage(job, "check"),
+            Phase::Composing => self.workflow_stage(job, "compose"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
             Phase::Deploying => self.workflow_stage(job, "deploy"),
             Phase::Blocked => Ok(()),
@@ -547,11 +609,15 @@ impl Worker<'_> {
         let latest = jobs
             .iter()
             .filter(|job| matches!(job.phase, Phase::Failed | Phase::Succeeded))
+            .filter(|job| job.release_id.as_ref().is_none_or(|id| *id == job.id))
             .map(|job| job.sequence)
             .chain(
                 completions
                     .iter()
                     .filter(|value| matches!(value["phase"].as_str(), Some("failed" | "succeeded")))
+                    .filter(|value| {
+                        value["release_id"].is_null() || value["release_id"] == value["id"]
+                    })
                     .filter_map(|value| value["sequence"].as_u64()),
             )
             .chain(previous)
@@ -565,6 +631,7 @@ impl Worker<'_> {
             if job.phase.terminal()
                 && !job.unresolved
                 && (job.phase != Phase::Failed || Some(job.sequence) != latest)
+                && !self.release_retains(&job)?
             {
                 self.cleanup(&mut job)?;
             }
@@ -594,6 +661,14 @@ impl Worker<'_> {
                 &job.id.0,
                 &job.commit,
             )?;
+            if let Some(batch) = &job.workflow.batch {
+                git::forget(
+                    self.paths,
+                    &self.config.common_git_dir,
+                    &format!("base-{}", job.id),
+                    &CommitId::new(batch.base.clone())?,
+                )?;
+            }
             let directory = self.paths.job(&job.id.0);
             if crate::paths::private_directory_exists(&directory)? {
                 fs::remove_dir_all(directory)?;
@@ -613,7 +688,7 @@ impl Worker<'_> {
         if let Some(operation) = &job.operation {
             ensure!(
                 operation.name == name
-                    && operation.commit == *job.effective_commit()
+                    && operation.commit == *job.execution_commit()
                     && operation.phase == job.phase
                     && operation.result == result,
                 "retained operation does not match current stage"
@@ -627,7 +702,7 @@ impl Worker<'_> {
         job.operation = Some(Operation {
             phase: job.phase,
             name,
-            commit: job.effective_commit().clone(),
+            commit: job.execution_commit().clone(),
             result,
             started: store::now(),
         });
@@ -643,4 +718,5 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     include!("workflow_tests.rs");
+    include!("batch_tests.rs");
 }
