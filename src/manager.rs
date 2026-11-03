@@ -275,12 +275,18 @@ pub(crate) fn repair(paths: &Paths, repo: &Path, id: &str, revision: &str) -> Re
         "only a job awaiting agent repair can accept repairs"
     );
     ensure!(!job.cancel_requested, "cancelled job cannot accept repairs");
-    ensure!(job.analyzed_commit.is_some(), "job has no analyzed source");
     let commit = git::commit(paths, repo, revision)?;
-    let previous = job.effective_commit().clone();
+    validate_repair(paths, &config, &job, &commit)?;
+    accept_repair(paths, &store, &config, &mut job, commit, None)?;
+    job.output()
+}
+
+fn validate_repair(paths: &Paths, config: &Config, job: &Job, commit: &CommitId) -> Result<()> {
+    let id = &job.id.0;
+    let previous = job.effective_commit();
     let ancestor = git::run(
         paths,
-        repo,
+        &config.common_git_dir,
         &[
             "merge-base".into(),
             "--is-ancestor".into(),
@@ -302,42 +308,64 @@ pub(crate) fn repair(paths: &Paths, repo: &Path, id: &str, revision: &str) -> Re
         && job.resulting_commit.as_ref() != Some(selected)
     {
         ensure!(
-            *selected == commit,
+            selected == commit,
             "an interrupted repair already selected another commit"
         );
     }
     let checkout = paths.job(id).join("worktree");
+    ensure!(
+        git::common(paths, &checkout)? == config.common_git_dir,
+        "repair checkout belongs to another repository"
+    );
+    git::ensure_detached(paths, &checkout)?;
     let head = git::commit(paths, &checkout, "HEAD")?;
     ensure!(
-        head == previous || head == commit,
+        &head == previous || &head == commit,
         "repair checkout HEAD changed unexpectedly"
     );
-    let pending = job.repaired_commit.as_ref() == Some(&commit)
-        && job.resulting_commit.as_ref() != Some(&commit);
+    let pending = job.repaired_commit.as_ref() == Some(commit)
+        && job.resulting_commit.as_ref() != Some(commit);
     let retained = git::ref_value(paths, &config.common_git_dir, &git::result_ref(id)?)?;
-    if !pending || retained.as_ref() != Some(&commit) {
+    if !pending || retained.as_ref() != Some(commit) {
         git::unchanged(paths, &checkout, &head)?;
     }
+    Ok(())
+}
+
+fn accept_repair(
+    paths: &Paths,
+    store: &Store,
+    config: &Config,
+    job: &mut Job,
+    commit: CommitId,
+    run: Option<StageRun>,
+) -> Result<()> {
+    let previous = job.effective_commit().clone();
+    let checkout = paths.job(&job.id.0).join("worktree");
     // Persist the accepted identity before changing its ref or checkout. A
     // repeated repair with the same revision completes an interrupted handoff.
     job.repaired_commit = Some(commit.clone());
-    store.save(&mut job)?;
+    store.save(job)?;
     git::advance(
         paths,
         &config.common_git_dir,
-        &git::result_ref(id)?,
+        &git::result_ref(&job.id.0)?,
         Some(&previous),
         &commit,
     )?;
     git::value(paths, &checkout, &["reset", "--hard", &commit.0])?;
-    job.resulting_commit = Some(commit);
-    job.phase = Phase::Queued;
-    job.stopped_phase = None;
-    job.outcome = None;
-    job.outcome_message = None;
-    job.last_error = None;
-    store.save(&mut job)?;
-    job.output()
+    let mut queued = job.clone();
+    queued.resulting_commit = Some(commit);
+    queued.runs.extend(run);
+    queued.operation = None;
+    queued.phase = Phase::Queued;
+    queued.stopped_phase = None;
+    queued.outcome = None;
+    queued.outcome_message = None;
+    queued.last_error = None;
+    store.save(&mut queued)?;
+    *job = queued;
+    Ok(())
 }
 
 fn check_identity(value: &str) -> Result<()> {
@@ -398,6 +426,7 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
             Phase::Fixing
                 | Phase::Analyzing
                 | Phase::Checking
+                | Phase::Repairing
                 | Phase::Composing
                 | Phase::Preparing
                 | Phase::Deploying
@@ -578,6 +607,7 @@ impl Worker<'_> {
             Phase::Fixing => self.workflow_stage(job, "fix"),
             Phase::Analyzing => self.workflow_stage(job, "analyze"),
             Phase::Checking => self.workflow_stage(job, "check"),
+            Phase::Repairing => self.workflow_stage(job, "repair"),
             Phase::Composing => self.workflow_stage(job, "compose"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
             Phase::Deploying => self.workflow_stage(job, "deploy"),

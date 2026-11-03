@@ -1,9 +1,10 @@
 # Operate Telete
 
 Telete runs a serial queue for committed repository source on macOS. The project
-config selects one required check command and optional fix, analysis, preparation, and
-deployment commands. Telete owns the queue and execution records. Configured commands own
-the meaning of their checks, outputs, and deployment effects.
+config selects one required check command and optional fix, analysis, repair,
+preparation, and deployment commands. Telete owns the queue and execution
+records. Configured commands own the meaning of their checks, outputs, and
+deployment effects.
 
 ## Select a project
 
@@ -142,30 +143,32 @@ scratch cleanup preserve the ref. The ref belongs to source history and remains
 until the project explicitly removes it. Telete does not merge or advance project
 branches; the project can integrate the returned commit.
 
-`commit` in job status remains the submitted SHA. After fixes, analysis, or a
-successful batched check, `resulting_commit`
-and `result_ref` identify the retained source. Subsequent commands run on
-that resulting commit unless a batched release selects combined source below.
-Commands after fixes must preserve HEAD and tracked
-source, except for the selected batch composition stage. A violation fails the
-job. Resuming the job consumes saved command
-evidence and reuses its result commit instead of applying corrections again.
+`commit` in job status remains the submitted SHA. When a workflow retains
+source for fixes, analysis, repair, or a batch, `resulting_commit` and
+`result_ref` identify that source. Subsequent commands run on the resulting
+commit unless a batched release selects combined source below.
+Commands after fixes must preserve HEAD and tracked source, except for automatic
+repair and the selected batch composition stage. A violation fails the job.
+Resuming the job consumes saved command evidence and reuses its result commit
+instead of applying corrections again.
 
 The supported workflow fields are:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `fix` | absent | Apply tracked source corrections before checks. |
-| `analyze` | absent | Analyze source once; ordinary findings wait for agent repair. |
+| `analyze` | absent | Analyze source once and trigger repair on ordinary findings. |
 | `check` | required | Build or check the resulting source, including accepted repairs. |
+| `repair` | absent | Run a script to create a committed repair from a failed command's output. |
 | `prepare` | absent | Run after a successful check. |
 | `deploy` | absent | Run after successful preceding stages. |
 | `batch` | absent | Combine compatible deployment requests before preparation and deployment. |
 | `parameters` | `{}` | Pass the supplied object unchanged to commands. |
 
-The order is optional fixes, optional analysis, check, optional preparation, and
-optional deployment. Deployment can be selected without preparation. A stage that was not selected does not become
-a successful execution. Unknown config and command fields are rejected.
+The normal order is optional fixes, optional analysis, check, optional
+preparation, and optional deployment. The repair command runs when eligible work
+needs repair. Deployment can be selected without preparation. Unknown config and
+command fields are rejected.
 
 Every command accepts `program`, optional literal `args`, optional `env`
 overrides, and optional `timeout_seconds`. Arguments default to an empty array
@@ -291,27 +294,28 @@ batched workflows, and keep 0.5 or later while batching records remain.
 
 Check success requires a successful command completion for the selected commit.
 Preparation and deployment success likewise require successful completion of
-their selected commands. Ordinary analysis failures and ordinary check failures
-with analysis selected await agent repair. Other failures stop the job. Commands
-own output formats and any stronger claim about the systems they change.
+their selected commands. An ordinary analysis failure or an ordinary check
+failure with analysis or repair configured enters the repair flow. Other
+failures stop the job. Commands own output formats and any stronger claim about
+the systems they change.
 
 Before launching a command, Telete records its execution identity, selected
-executable, arguments, working directory, explicit environment overrides, timeout,
-and context. The inherited environment is not frozen or retained.
+executable, arguments, working directory, explicit environment overrides,
+timeout, any standard input, and context. The inherited environment is not
+frozen or retained.
 `TELETE_CONTEXT` names the private JSON context file. Recorded context must match
 before launch. Retaining the exact command lets recovery reconcile the same
 execution instead of constructing another command from current settings.
 
 The context contains the job and operation identity, stage, checkout,
 `source.commit`, parameters, inputs, and outputs. For a workflow with fixes,
-analysis, or batching,
+analysis, repair, or batching,
 `source.submitted_commit` preserves the submitted SHA and `source.result_ref`
 names the retained result. `source.commit` identifies the submitted source in
 the fix command and the resulting source in later individual commands. Batched
 composition selects the release base; preparation and deployment select the
 combined release source. `source.checked_commit` preserves the individual
-source, and `source.release_id` identifies a frozen group. Workflows without
-fixes, analysis, or batching keep their previous context shape.
+source, and `source.release_id` identifies a frozen group.
 
 `outputs.directory` names the private output directory for the command. With
 fixes selected, `inputs.fix` is null during fixes and names the completed fix
@@ -326,23 +330,42 @@ identifies the accepted repair and `source.commit` selects that source for every
 later command. `inputs.analysis` is null during analysis and names its output
 directory in later stages. Analysis outputs remain available after agent repair.
 
-A missing command input closes standard input. A known terminal exit remains
-known if output collection fails; collection failure is a separate observation.
+Standard input is closed except during automatic repair. A known terminal exit
+remains known if output collection fails; collection failure is a separate
+observation.
 A program that fails to start has a recorded start-error result. Neither failure
 authorizes another launch under the same execution identity.
 
-## Analyze once and accept agent repairs
+## Repair a failed analysis or check
 
 An optional `analyze` command runs after automatic fixes and before `check`.
 It must preserve the selected commit and tracked source. A successful analysis
 continues to `check`. A known nonzero exit without a signal, timeout, start error,
-or output collection error enters `awaiting_repair`. An ordinary `check` failure
-in a workflow with analysis also waits for repair; later repairs repeat the
-check while retaining the original analysis. The command owns the
+or output collection error triggers repair. An ordinary `check` failure
+also triggers repair if `analyze` or `repair` is configured. The command owns the
 meaning of its findings. Process failures retain the usual failure and recovery
 behavior.
 
-A job awaiting repair releases the execution slot. Other queued jobs can run.
+### Automatic repair
+
+Set the optional `repair` command in the workflow, for example
+`"repair": {"program": "ci/repair.sh"}`. Telete runs it once per job when
+analysis or check first triggers repair. The job shows `repairing` while
+the command uses the execution slot. Standard input contains the failed
+command's captured stdout followed immediately by its captured stderr,
+with no added separator.
+
+The script runs in the job's private checkout. It must exit successfully
+with a clean tracked tree and a new descendant commit at detached HEAD.
+Telete accepts that commit through the same handoff as `repair JOB REVISION`
+and requeues the job at `check`. A known script failure or invalid repair
+commit fails the job and retains diagnostics. An interruption without
+terminal evidence blocks the job until the command can be reconciled.
+If the next check triggers repair, the job waits for manual repair.
+
+### Manual repair
+
+An `awaiting_repair` job releases the execution slot so other queued jobs can run.
 The waiting job retains its checkout, source ref, findings, and command outputs
 until explicit repair or cancellation. Waiting alone does not keep a worker
 running. `status` lists these jobs under `awaiting_repair`; `wait` returns a
@@ -363,20 +386,19 @@ repeating `repair` with the same revision. Complete an interrupted repair before
 cancelling its job. A different revision is rejected once
 an interrupted repair identity has been recorded.
 
-Analysis status becomes `accepted_after_repair`; its original nonzero result
-remains recorded. Later commands receive the repaired source and analysis
-outputs. A successful repaired job means that the agent accepted the repairs and
-all remaining configured commands succeeded. It does not assert automated
-analysis of the repaired source. Project commands own their final build and
-artifact identity rules.
+If analysis failed, its status becomes `accepted_after_repair` and the original
+result remains recorded. Later commands receive the repaired source and any
+original analysis outputs. Those outputs describe the originally analyzed
+commit. Project commands own their final build and artifact identity rules.
 
 Telete 0.5 reads existing 0.3 and 0.4 queue records. Let commands from an earlier
 worker settle before submitting newly supported workflows. Keep 0.4 or later
-while analysis or repair records remain, and 0.5 or later while batching records
-remain; earlier executables cannot read those records.
+while analysis or manual repair records remain, and 0.5 or later while batching
+records remain. Jobs configured for automatic repair require a build that
+supports it.
 
 Use `cancel JOB` to discard a waiting job at its safe boundary. Use `recover JOB`
-only for uncertain command execution; recovery does not accept source repairs.
+to reconcile an uncertain command using matching terminal evidence.
 
 ## Operate and recover work
 
@@ -396,12 +418,13 @@ command.
 Use `status` or `status JOB` to inspect work, and `wait JOB` to observe a job
 without submitting it again. Waiting has no timeout by default; supply
 `--timeout 60` to limit observation. Both `wait` and `submit --follow` stop
-observing when the job succeeds, fails, is cancelled, or becomes blocked.
+observing when the job succeeds, fails, is cancelled, becomes blocked, or
+waits for manual repair.
 Ctrl-C stops observation without cancelling the job. Add `--json` for compact
 JSON output and structured operation errors. `wait` and `submit --follow` exit 0
-only when the observed job succeeded; failure, cancellation, blockage, and an
-observation timeout use exit 1. Ctrl-C uses exit 130. Ordinary operation failures
-use exit 1; CLI syntax errors use exit 2.
+only when the observed job succeeded. Failure, cancellation, blockage, waiting
+for manual repair, and an observation timeout use exit 1. Ctrl-C uses exit 130.
+Ordinary operation failures use exit 1; CLI syntax errors use exit 2.
 
 For a bound repository, these operations act on the shared queue from every
 linked checkout. Only one worker can own it. Pause, maintenance holds,

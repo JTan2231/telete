@@ -1,4 +1,4 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.5.0" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.6.0" "General Commands Manual"
 .SH NAME
 telete \- run a serial queue of committed repository workflows
 .SH SYNOPSIS
@@ -17,8 +17,8 @@ telete \- run a serial queue of committed repository workflows
 .B telete
 runs committed source from a local Git repository on macOS.
 A project JSON configuration selects the repository, initial private runtime
-directory, required check command, optional fix, analysis, preparation, and deployment commands,
-and parameters.
+directory, required check command, optional fix, analysis, repair, preparation,
+and deployment commands, and parameters.
 Each submitted job starts from one exact commit in a private checkout.
 Jobs run serially, in queue order.
 .PP
@@ -173,7 +173,7 @@ submitting it again.
 With
 .BR \-\-follow ,
 also observe the submitted job until it succeeds, fails, is cancelled, or
-becomes blocked or awaits agent repair.
+becomes blocked or waits for manual repair.
 A second JSON result reports that observation.
 Press Ctrl-C to stop following without cancelling the job.
 Closing the observing terminal does not stop the managed worker.
@@ -185,8 +185,8 @@ With a job ID, display only that job's retained result.
 An unavailable or pruned job is an operation error.
 .TP
 .BI "wait " "job " "\fR[\fB\-\-timeout \fIseconds\fR]"
-Observe a job until it succeeds, fails, is cancelled, becomes blocked, awaits agent repair, or the
-observation times out.
+Observe a job until it succeeds, fails, is cancelled, becomes blocked, waits for
+manual repair, or the observation times out.
 The timeout is a positive integer number of seconds.
 By default, observation has no timeout.
 This timeout limits observation, not execution.
@@ -306,13 +306,23 @@ stopping the workflow.
 .TP
 .B analyze
 Optional command object run after fixes and before checks. It preserves tracked
-source. A known nonzero exit without process or collection errors enters
-.BR awaiting_repair .
-The job retains evidence and releases its queue slot until repair or cancellation.
-An ordinary check failure in a workflow with analysis also awaits agent repair.
+source. A known nonzero exit without process or collection errors triggers
+repair.
 .TP
 .B check
 Required command object for checking the resulting commit.
+.TP
+.B repair
+Optional command object run once per job after the first ordinary analysis or
+check failure. Its standard input contains the failed command's captured
+standard output immediately followed by its captured standard error.
+It runs in the job's private checkout and must exit successfully with a clean
+tracked tree and a new descendant commit at detached HEAD.
+While it runs the job is
+.BR repairing .
+Telete accepts the commit and requeues the job at check, preserving any
+original analysis. A later ordinary check failure waits for manual repair.
+A known repair command failure or invalid repair commit fails the job.
 .TP
 .B prepare
 Optional command object, run after a successful check.
@@ -493,15 +503,19 @@ shared release outcome. Successful deployment updates
 These refs survive runtime cleanup. Packages and durable release history belong
 to project commands.
 .SH EXECUTION
-Stages run in this order: optional fixes, optional analysis, check, optional preparation, optional
-deployment.
+The normal order is optional fixes, optional analysis, check, optional
+preparation, and optional deployment.
 With batching selected, each member runs its individual check, then the release
 runs composition, optional preparation, and deployment once. No additional
 analysis or check is inserted.
 A stage succeeds only when its command exits with status 0 without a timeout,
 signal, start error, or output collection error.
-An ordinary nonzero analysis exit, or an ordinary check failure with analysis
-selected, awaits explicit agent repair. Other failed stages stop the job.
+An ordinary nonzero analysis exit or an ordinary check failure with analysis
+or repair selected triggers repair.
+Without an available automatic repair, the job enters
+.BR awaiting_repair ,
+retains evidence, and releases its slot until manual repair or cancellation.
+Other failed stages stop the job.
 An unselected stage is reported as
 .BR not_requested ,
 not as a successful execution.
@@ -520,7 +534,7 @@ Configure any required toolchain, caches, credentials, or environment in the
 project's commands; Telete imposes no filesystem sandbox or reproducibility
 guarantee.
 .PP
-Standard input is closed.
+Standard input is closed except during automatic repair.
 Standard output and standard error are captured separately, up to 16 MiB each,
 and decoded as UTF-8 with replacement for invalid bytes.
 Excess output is drained but not retained, and an output collection error makes
@@ -542,15 +556,15 @@ The execution identity, job identity, and stage name.
 The absolute private checkout path.
 .TP
 .B source.commit
-The submitted commit during fixes, and the resulting checked commit in later
-individual commands. Batched preparation and deployment use the combined
-release commit; composition uses the release base. Without fixes or batching,
-this remains the submitted commit.
+The submitted commit during fixes, and the selected source in later individual
+commands. Batched preparation and deployment use the combined release commit.
+Composition uses the release base.
 .TP
 .B source.submitted_commit, source.result_ref
-Present when fixes, analysis, or batching are selected. Preserve the submitted SHA and name its durable
-result ref, refs/telete/results/JOB. The ref survives failure, cancellation, and
-scratch cleanup. A resumed job reuses its result instead of applying fixes again.
+Present when fixes, analysis, repair, or batching are selected. Preserve the
+submitted SHA and name its durable result ref, refs/telete/results/JOB. The ref
+survives failure, cancellation, and scratch cleanup. A resumed job reuses its
+result instead of applying fixes again.
 .TP
 .B source.analyzed_commit, source.repaired_commit
 The analyzed source, from the analysis stage onward, and accepted repair source
@@ -619,6 +633,7 @@ Job phases are
 .BR fixing ,
 .BR analyzing ,
 .BR awaiting_repair ,
+.BR repairing ,
 .BR checking ,
 .BR waiting_release ,
 .BR composing ,
@@ -778,13 +793,14 @@ and retained diagnostics before running
 .BR "recover job" .
 Telete coordinates recovery with its worker and resumes eligible work afterward.
 Recovery uses the saved invocation, including its context, explicit environment
-overrides, and timeout, rather than current command settings.
+overrides, timeout, and any standard input.
 It does not authorize another launch under the same execution identity.
 .PP
-Telete 0.5 reads existing 0.3 and 0.4 queue records. Let an earlier worker settle
-before submitting newly supported workflows. Keep 0.4 or later while analysis
-or repair records remain, and 0.5 or later while batching records remain;
-earlier executables cannot read those records.
+Telete 0.5 reads existing 0.3 and 0.4 queue records. Let an earlier worker
+settle before submitting newly supported workflows. Keep 0.4 or later while
+analysis or manual repair records remain, and 0.5 or later while batching
+records remain. Jobs configured for automatic repair require a build that
+supports it.
 .PP
 Use the Telete version that owns existing runtime state.
 Incompatible runtime schemas are rejected; Telete does not automatically migrate

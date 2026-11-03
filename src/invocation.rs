@@ -34,7 +34,10 @@ pub(crate) fn bind(
         .env
         .insert("TELETE_CONTEXT".into(), context.display().to_string());
     let mut source = json!({"commit": job.execution_commit()});
-    if job.workflow.fix.is_some() || job.workflow.analyze.is_some() || job.workflow.batch.is_some()
+    if job.workflow.fix.is_some()
+        || job.workflow.analyze.is_some()
+        || job.workflow.repair.is_some()
+        || job.workflow.batch.is_some()
     {
         source["submitted_commit"] = json!(job.commit);
         source["result_ref"] = json!(crate::git::result_ref(&job.id.0)?);
@@ -42,7 +45,10 @@ pub(crate) fn bind(
     if let Some(commit) = &job.analyzed_commit {
         source["analyzed_commit"] = json!(commit);
     }
-    if let Some(commit) = &job.repaired_commit {
+    // Reconstruct a repair invocation with its original source during handoff recovery.
+    if let Some(commit) = &job.repaired_commit
+        && (stage != "repair" || job.resulting_commit.as_ref() == Some(commit))
+    {
         source["repaired_commit"] = json!(commit);
     }
     if let Some(release) = &job.release_id {

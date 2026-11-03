@@ -24,7 +24,7 @@ fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
     script(&repo.join("check.sh"), "cat payload.txt >> \"$MARKER\"")?;
     let commit = record_commit(&paths, &repo)?;
     let project = ProjectConfig { repo, state:paths.root.clone(), workflow:Workflow {
-        fix:None, analyze:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
+        fix:None, analyze:None, repair:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
             timeout_seconds:Some(10), env:BTreeMap::from([("MARKER".into(),
                 paths.root.join("observed").display().to_string())]) },
         prepare:None, deploy:None, batch:None, parameters:json!({"suite":"fixture"}),
@@ -616,5 +616,120 @@ fn build_repairs_repeat_only_the_check_and_preserve_the_original_analysis() -> R
     assert_eq!(completion["analyzed_commit"], original.0);
     assert_eq!(completion["repaired_commit"], final_source.0);
     assert_eq!(fs::read_to_string(marker)?, "analyzed");
+    Ok(())
+}
+
+fn automatic_check_repair(project: &mut ProjectConfig, replacement: &str) {
+    project.workflow.check.program = "/bin/sh".into();
+    project.workflow.check.args = vec!["-c".into(),
+        "if [ \"$(cat payload.txt)\" = done ]; then cat payload.txt >> \"$MARKER\"; else printf stdout; printf stderr >&2; exit 7; fi".into()];
+    project.workflow.repair = Some(crate::workflow::WorkflowCommand {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), r#"
+            set -eu
+            if git symbolic-ref -q HEAD; then exit 9; fi
+            printf repair >> "$ATTEMPTS"
+            cat > "$DIAGNOSTICS"
+            printf stdoutstderr | cmp - "$DIAGNOSTICS"
+            printf '%s\n' "$1" > payload.txt
+            git add payload.txt
+            git -c user.name=Fixture -c user.email=fixture@localhost commit -m 'Repair source'
+        "#.into(), "repair".into(), replacement.into()],
+        env: BTreeMap::from([
+            ("ATTEMPTS".into(), project.state.join("repair-attempts").display().to_string()),
+            ("DIAGNOSTICS".into(), project.state.join("repair-input").display().to_string()),
+        ]),
+        timeout_seconds: Some(10),
+    });
+}
+
+#[test]
+fn automatic_repair_consumes_failed_check_output_and_rechecks_its_commit() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    automatic_check_repair(&mut project, "done");
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    let completion = finish_run(&paths, &id)?;
+    assert_eq!(completion["phase"], "succeeded");
+    assert_eq!(completion["commit"], original.0);
+    let repaired = git::commit(&paths, &project.repo, &git::result_ref(&id)?)?;
+    assert_eq!(completion["repaired_commit"], repaired.0);
+    assert_eq!(completion["resulting_commit"], repaired.0);
+    assert_eq!(git::commit(&paths, &project.repo, &format!("{repaired}^"))?, original);
+    assert_eq!(git::commit(&paths, &project.repo, "HEAD")?, original);
+    assert_eq!(fs::read(paths.root.join("repair-input"))?, b"stdoutstderr");
+    assert_eq!(fs::read_to_string(paths.root.join("observed"))?, "done\n");
+    Ok(())
+}
+
+#[test]
+fn automatic_repair_runs_once_before_a_failed_recheck_waits_for_manual_repair() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    automatic_check_repair(&mut project, "still broken");
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    for _ in 0..8 {
+        worker_once(&paths)?;
+        if status(&paths, Some(&id))?["phase"] == "awaiting_repair" {
+            break;
+        }
+    }
+    let waiting = status(&paths, Some(&id))?;
+    assert_eq!(waiting["phase"], "awaiting_repair", "{waiting:#}");
+    let runs = waiting["runs"].as_array().context("recorded commands")?;
+    assert_eq!(runs.len(), 3);
+    let repaired = git::commit(&paths, &project.repo, &git::result_ref(&id)?)?;
+    assert_eq!(runs[0]["stage"], "check");
+    assert_eq!(runs[0]["commit"], original.0);
+    assert_eq!(runs[1]["stage"], "repair");
+    assert_eq!(runs[1]["commit"], original.0);
+    assert_eq!(runs[2]["stage"], "check");
+    assert_eq!(runs[2]["commit"], repaired.0);
+    assert_eq!(waiting["repaired_commit"], repaired.0);
+    assert!(Store::open(&paths.root)?.active()?.is_none());
+
+    git::value(&paths, &project.repo, &["checkout", "--detach", &repaired.0])?;
+    fs::write(project.repo.join("payload.txt"), "done\n")?;
+    let manual = record_commit(&paths, &project.repo)?;
+    assert_eq!(repair(&paths, &project.repo, &id, &manual.0)?["phase"], "queued");
+    let completion = finish_run(&paths, &id)?;
+    assert_eq!(completion["phase"], "succeeded");
+    assert_eq!(completion["repaired_commit"], manual.0);
+    Ok(())
+}
+
+#[test]
+fn recovery_finishes_an_automatic_repair_handoff_without_rerunning_the_command() -> Result<()> {
+    let (_temporary, mut project, original) = fixture()?;
+    automatic_check_repair(&mut project, "done");
+    let (paths, id) = enqueue(&project, "HEAD")?;
+    worker_once(&paths)?;
+    assert_eq!(worker_once(&paths)?["phase"], "repairing");
+    assert_eq!(worker_once(&paths)?["phase"], "queued");
+    let store = Store::open(&paths.root)?;
+    let mut job = store.job(&id)?;
+    let repaired = job.repaired_commit.clone().context("selected repair commit")?;
+    let run = job.runs.pop().context("repair execution")?;
+    assert_eq!(run.stage, "repair");
+
+    // Recreate a stop after retaining the selected commit and before saving the handoff.
+    job.phase = Phase::Blocked;
+    job.stopped_phase = Some(Phase::Repairing);
+    job.unresolved = true;
+    job.resulting_commit = Some(original.clone());
+    job.operation = Some(Operation {
+        phase: Phase::Repairing,
+        name: run.operation.clone(),
+        commit: original,
+        result: paths.job(&id).join(format!("{}.json", run.operation)),
+        started: run.stamp,
+    });
+    store.save(&mut job)?;
+    fs::write(paths.job(&id).join("worktree/payload.txt"), "partial reset\n")?;
+
+    recover(&paths, &id)?;
+    let completion = finish_run(&paths, &id)?;
+    assert_eq!(completion["phase"], "succeeded");
+    assert_eq!(completion["repaired_commit"], repaired.0);
+    assert_eq!(fs::read_to_string(paths.root.join("repair-attempts"))?, "repair");
+    assert_eq!(fs::read_to_string(paths.root.join("observed"))?, "done\n");
     Ok(())
 }

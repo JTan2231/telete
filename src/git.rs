@@ -442,6 +442,21 @@ pub(crate) fn retain_fixes(
     Ok(result)
 }
 
+pub(crate) fn ensure_detached(paths: &Paths, checkout: &Path) -> Result<()> {
+    let symbolic = run(
+        paths,
+        checkout,
+        &strings(&["symbolic-ref", "-q", "HEAD"]),
+        None,
+        BTreeMap::new(),
+    )?;
+    ensure!(
+        symbolic.exited_with(&[1]),
+        "workflow checkout must keep a detached HEAD"
+    );
+    Ok(())
+}
+
 pub(crate) fn unchanged(paths: &Paths, checkout: &Path, revision: &CommitId) -> Result<()> {
     ensure!(
         commit(paths, checkout, "HEAD")? == *revision,

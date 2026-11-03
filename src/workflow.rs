@@ -120,6 +120,8 @@ pub(crate) struct Workflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyze: Option<WorkflowCommand>,
     pub check: WorkflowCommand,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<WorkflowCommand>,
     #[serde(default)]
     pub prepare: Option<WorkflowCommand>,
     #[serde(default)]
@@ -136,6 +138,10 @@ impl Workflow {
             "fix" => self.fix.as_ref().context("automatic fixes not selected"),
             "analyze" => self.analyze.as_ref().context("analysis not selected"),
             "check" => Ok(&self.check),
+            "repair" => self
+                .repair
+                .as_ref()
+                .context("automatic repair not selected"),
             "compose" => self
                 .batch
                 .as_ref()
@@ -159,6 +165,9 @@ impl Workflow {
             command.validate("analyze")?;
         }
         self.check.validate("check")?;
+        if let Some(command) = &self.repair {
+            command.validate("repair")?;
+        }
         if let Some(command) = &self.prepare {
             command.validate("prepare")?;
         }
@@ -190,6 +199,8 @@ struct ProjectFile {
     #[serde(default)]
     analyze: Option<WorkflowCommand>,
     check: WorkflowCommand,
+    #[serde(default)]
+    repair: Option<WorkflowCommand>,
     #[serde(default)]
     prepare: Option<WorkflowCommand>,
     #[serde(default)]
@@ -238,6 +249,7 @@ pub(crate) fn read(path: &Path) -> Result<ProjectConfig> {
         fix: file.fix,
         analyze: file.analyze,
         check: file.check,
+        repair: file.repair,
         prepare: file.prepare,
         deploy: file.deploy,
         batch: file.batch,
@@ -349,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn project_config_reads_batch_selection() -> Result<()> {
+    fn project_config_reads_repair_and_batch_selection() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("telete.json");
         std::fs::write(
@@ -357,6 +369,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "repo": ".", "state": ".telete",
                 "check": {"program": "check"},
+                "repair": {"program": "repair"},
                 "deploy": {"program": "deploy"},
                 "batch": {
                     "target": "production", "base": "main",
@@ -365,6 +378,10 @@ mod tests {
             }))?,
         )?;
         let project = read(&path)?;
+        assert_eq!(
+            project.workflow.command("repair")?.program,
+            Path::new("repair")
+        );
         let batch = project.workflow.batch.context("selected batch")?;
         assert_eq!(batch.target, "production");
         assert_eq!(batch.base, "main");

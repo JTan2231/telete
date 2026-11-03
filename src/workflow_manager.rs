@@ -34,6 +34,21 @@ impl Worker<'_> {
         if job.batch.is_some() {
             inputs["batch"] = self.batch_input(job)?;
         }
+        let stdin = if stage == "repair" {
+            let failed = job
+                .runs
+                .last()
+                .context("repair has no triggering failure")?;
+            ensure!(
+                matches!(failed.stage.as_str(), "analyze" | "check")
+                    && failed.commit == *job.effective_commit()
+                    && !failed.result.success(),
+                "repair does not match the failed stage"
+            );
+            Some(failed.result.diagnostics())
+        } else {
+            None
+        };
         let output = self.paths.job(&job.id.0).join("outputs").join(operation);
         crate::invocation::bind(
             self.paths,
@@ -48,7 +63,7 @@ impl Worker<'_> {
                 cwd: self.worktree(job),
                 env: selected.env.clone(),
                 timeout_seconds: selected.timeout_seconds,
-                stdin: None,
+                stdin,
                 context: None,
             },
         )
@@ -67,6 +82,7 @@ impl Worker<'_> {
             Phase::Fixing => "fix",
             Phase::Analyzing => "analyze",
             Phase::Checking => "check",
+            Phase::Repairing => "repair",
             Phase::Composing => "compose",
             Phase::Preparing => "prepare",
             Phase::Deploying => "deploy",
@@ -115,7 +131,9 @@ impl Worker<'_> {
     }
 
     pub(super) fn workflow_stage(&self, job: &mut Job, stage: &str) -> Result<()> {
-        if stage == "analyze" && job.analyzed_commit.is_none() {
+        if (stage == "analyze" && job.analyzed_commit.is_none())
+            || (stage == "check" && job.workflow.repair.is_some() && job.resulting_commit.is_none())
+        {
             let commit = job.effective_commit().clone();
             crate::git::advance(
                 self.paths,
@@ -125,10 +143,15 @@ impl Worker<'_> {
                 &commit,
             )?;
             job.resulting_commit = Some(commit.clone());
-            job.analyzed_commit = Some(commit);
+            if stage == "analyze" {
+                job.analyzed_commit = Some(commit);
+            }
             self.store.save(job)?;
         }
-        if !matches!(stage, "fix" | "analyze" | "check") {
+        if stage == "repair" && job.operation.is_none() {
+            crate::git::ensure_detached(self.paths, &self.worktree(job))?;
+        }
+        if !matches!(stage, "fix" | "analyze" | "check" | "repair") {
             ensure!(
                 job.runs
                     .iter()
@@ -185,7 +208,8 @@ impl Worker<'_> {
     fn complete_stage(&self, job: &mut Job, stage: &str, run: StageRun) -> Result<()> {
         let success = run.result.success();
         let repairable = (stage == "analyze"
-            || (stage == "check" && job.workflow.analyze.is_some()))
+            || (stage == "check"
+                && (job.workflow.analyze.is_some() || job.workflow.repair.is_some())))
             && run
                 .result
                 .exit_code
@@ -194,6 +218,9 @@ impl Worker<'_> {
             &self.directory(job)?.join(format!("{}.log", run.operation)),
             run.result.diagnostics().as_bytes(),
         )?;
+        if stage == "repair" {
+            return self.complete_repair(job, run);
+        }
         // Terminal process evidence is known before source finalization.
         job.operation = None;
         if stage == "fix" {
@@ -209,6 +236,7 @@ impl Worker<'_> {
             }
         } else if job.workflow.fix.is_some()
             || job.workflow.analyze.is_some()
+            || job.workflow.repair.is_some()
             || job.workflow.batch.is_some()
         {
             crate::git::unchanged(self.paths, &self.worktree(job), job.execution_commit())?;
@@ -216,6 +244,9 @@ impl Worker<'_> {
         job.runs.push(run);
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
         if !success && repairable && !job.cancel_requested {
+            if job.workflow.repair.is_some() && !job.runs.iter().any(|run| run.stage == "repair") {
+                return self.save(job, Phase::Repairing);
+            }
             job.stopped_phase = Some(job.phase);
             job.outcome_message = Some(format!(
                 "Workflow {stage} awaits agent repair for {}",
@@ -272,5 +303,48 @@ impl Worker<'_> {
             "Configured workflow succeeded".into(),
             false,
         )
+    }
+
+    fn complete_repair(&self, job: &mut Job, run: StageRun) -> Result<()> {
+        let _admission = store::lock(&self.paths.root.join("admission.lock"), true)?;
+        let pending = job.repaired_commit.as_ref() != job.resulting_commit.as_ref()
+            && job.repaired_commit.is_some();
+        if !pending && self.store.job(&job.id.0)?.cancel_requested {
+            job.operation = None;
+            job.runs.push(run);
+            return self.finish(
+                job,
+                Phase::Cancelled,
+                "Cancelled after repair settled".into(),
+                false,
+            );
+        }
+        let selected = (|| {
+            ensure!(
+                run.result.success(),
+                "Workflow repair failed for {}",
+                job.effective_commit()
+            );
+            let commit = crate::git::commit(self.paths, &self.worktree(job), "HEAD")?;
+            super::validate_repair(self.paths, &self.config, job, &commit)?;
+            Ok(commit)
+        })();
+        match selected {
+            Ok(commit) => super::accept_repair(
+                self.paths,
+                &self.store,
+                &self.config,
+                job,
+                commit,
+                Some(run),
+            ),
+            Err(error) => {
+                if !pending {
+                    job.operation = None;
+                    job.runs.push(run);
+                }
+                Err(error)
+            }
+        }
     }
 }

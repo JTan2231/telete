@@ -84,6 +84,7 @@ pub(crate) enum Phase {
     Fixing,
     Analyzing,
     AwaitingRepair,
+    Repairing,
     Checking,
     WaitingRelease,
     Composing,
@@ -106,6 +107,7 @@ impl Phase {
             Self::Fixing => "fixing",
             Self::Analyzing => "analyzing",
             Self::AwaitingRepair => "awaiting_repair",
+            Self::Repairing => "repairing",
             Self::Checking => "checking",
             Self::WaitingRelease => "waiting_release",
             Self::Composing => "composing",
@@ -244,18 +246,20 @@ impl Job {
                 ("fix", workflow.fix.is_some(), Phase::Fixing),
                 ("analyze", workflow.analyze.is_some(), Phase::Analyzing),
                 ("check", true, Phase::Checking),
+                ("repair", workflow.repair.is_some(), Phase::Repairing),
                 ("compose", self.batch.is_some(), Phase::Composing),
                 ("prepare", workflow.prepare.is_some(), Phase::Preparing),
                 ("deploy", workflow.deploy.is_some(), Phase::Deploying),
             ]
             .into_iter()
-            .filter(|(stage, requested, _)| !matches!(*stage, "analyze" | "compose") || *requested)
+            .filter(|(stage, requested, _)| {
+                !matches!(*stage, "analyze" | "repair" | "compose") || *requested
+            })
             .map(|(stage, requested, phase)| {
-                let run = self
-                    .runs
-                    .iter()
-                    .rev()
-                    .find(|run| run.stage == stage && *self.stage_commit(stage) == run.commit);
+                let run = self.runs.iter().rev().find(|run| {
+                    run.stage == stage
+                        && (stage == "repair" || *self.stage_commit(stage) == run.commit)
+                });
                 let active = self
                     .operation
                     .as_ref()
@@ -264,6 +268,8 @@ impl Job {
                 let stopped = self.stopped_phase == Some(phase);
                 let status = if !requested {
                     "not_requested"
+                } else if stage == "repair" && stopped && self.outcome == Some(Phase::Failed) {
+                    "failed"
                 } else if let Some(run) = run {
                     if run.result.success() {
                         "succeeded"
@@ -289,7 +295,7 @@ impl Job {
                 serde_json::json!({
                     "stage": stage,
                     "status": status,
-                    "commit": self.stage_commit(stage),
+                    "commit": run.map_or_else(|| self.stage_commit(stage), |run| &run.commit),
                     "operation": run.map(|run| &run.operation),
                 })
             })
