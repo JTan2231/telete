@@ -90,6 +90,8 @@ pub(crate) struct BatchConfig {
     pub target: String,
     pub base: String,
     pub compose: WorkflowCommand,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_repair: Option<WorkflowCommand>,
 }
 
 impl BatchConfig {
@@ -108,7 +110,11 @@ impl BatchConfig {
             !self.base.is_empty() && !self.base.contains('\0'),
             "batch base must be a nonempty Git revision without NUL"
         );
-        self.compose.validate("compose")
+        self.compose.validate("compose")?;
+        if let Some(command) = &self.merge_repair {
+            command.validate("merge_repair")?;
+        }
+        Ok(())
     }
 }
 
@@ -147,6 +153,11 @@ impl Workflow {
                 .as_ref()
                 .map(|batch| &batch.compose)
                 .context("release batching not selected"),
+            "merge_repair" => self
+                .batch
+                .as_ref()
+                .and_then(|batch| batch.merge_repair.as_ref())
+                .context("merge repair not selected"),
             "prepare" => self.prepare.as_ref().context("preparation not selected"),
             "deploy" => self.deploy.as_ref().context("deployment not selected"),
             _ => bail!("unknown workflow stage"),

@@ -88,6 +88,7 @@ pub(crate) enum Phase {
     Checking,
     WaitingRelease,
     Composing,
+    RepairingMerge,
     Preparing,
     Deploying,
     Blocked,
@@ -111,6 +112,7 @@ impl Phase {
             Self::Checking => "checking",
             Self::WaitingRelease => "waiting_release",
             Self::Composing => "composing",
+            Self::RepairingMerge => "repairing_merge",
             Self::Preparing => "preparing",
             Self::Deploying => "deploying",
             Self::Blocked => "blocked",
@@ -155,11 +157,22 @@ impl Default for Cleanup {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MergeConflict {
+    pub head: CommitId,
+    pub member: CommitId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReleaseBatch {
     pub members: Vec<JobId>,
     pub base: CommitId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition_head: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_conflict: Option<MergeConflict>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,13 +217,15 @@ impl Job {
     }
 
     pub(crate) fn execution_commit(&self) -> &CommitId {
-        if self.phase == Phase::Composing
-            || (self.phase == Phase::Blocked && self.stopped_phase == Some(Phase::Composing))
-        {
-            return self
-                .batch
-                .as_ref()
-                .map_or_else(|| self.effective_commit(), |batch| &batch.base);
+        let phase = if self.phase == Phase::Blocked {
+            self.stopped_phase.unwrap_or(self.phase)
+        } else {
+            self.phase
+        };
+        match phase {
+            Phase::Composing => return self.stage_commit("compose"),
+            Phase::RepairingMerge => return self.stage_commit("merge_repair"),
+            _ => {}
         }
         self.release_commit
             .as_ref()
@@ -224,10 +239,18 @@ impl Job {
             self.analyzed_commit
                 .as_ref()
                 .unwrap_or_else(|| self.effective_commit())
-        } else if stage == "compose" {
-            self.batch
-                .as_ref()
-                .map_or_else(|| self.effective_commit(), |batch| &batch.base)
+        } else if matches!(stage, "compose" | "merge_repair") {
+            self.batch.as_ref().map_or_else(
+                || self.effective_commit(),
+                |batch| {
+                    if stage == "merge_repair"
+                        && let Some(conflict) = &batch.merge_conflict
+                    {
+                        return &conflict.head;
+                    }
+                    batch.composition_head.as_ref().unwrap_or(&batch.base)
+                },
+            )
         } else if matches!(stage, "prepare" | "deploy") {
             self.execution_commit()
         } else {
@@ -248,27 +271,42 @@ impl Job {
                 ("check", true, Phase::Checking),
                 ("repair", workflow.repair.is_some(), Phase::Repairing),
                 ("compose", self.batch.is_some(), Phase::Composing),
+                (
+                    "merge_repair",
+                    self.batch.is_some() && workflow.command("merge_repair").is_ok(),
+                    Phase::RepairingMerge,
+                ),
                 ("prepare", workflow.prepare.is_some(), Phase::Preparing),
                 ("deploy", workflow.deploy.is_some(), Phase::Deploying),
             ]
             .into_iter()
             .filter(|(stage, requested, _)| {
-                !matches!(*stage, "analyze" | "repair" | "compose") || *requested
+                !matches!(*stage, "analyze" | "repair" | "compose" | "merge_repair") || *requested
             })
             .map(|(stage, requested, phase)| {
-                let run = self.runs.iter().rev().find(|run| {
-                    run.stage == stage
-                        && (stage == "repair" || *self.stage_commit(stage) == run.commit)
-                });
                 let active = self
                     .operation
                     .as_ref()
                     .is_some_and(|operation| operation.phase == phase)
                     || self.phase == phase;
                 let stopped = self.stopped_phase == Some(phase);
+                let composing = matches!(stage, "compose" | "merge_repair");
+                let run = self.runs.iter().rev().find(|run| {
+                    run.stage == stage
+                        && !(composing && active)
+                        && (matches!(stage, "repair" | "merge_repair")
+                            || *self.stage_commit(stage) == run.commit)
+                });
                 let status = if !requested {
                     "not_requested"
-                } else if stage == "repair" && stopped && self.outcome == Some(Phase::Failed) {
+                } else if (active || stopped) && self.unresolved {
+                    "unresolved"
+                } else if composing && active {
+                    "running"
+                } else if matches!(stage, "repair" | "merge_repair")
+                    && stopped
+                    && self.outcome == Some(Phase::Failed)
+                {
                     "failed"
                 } else if let Some(run) = run {
                     if run.result.success() {
@@ -281,8 +319,6 @@ impl Job {
                     } else {
                         "failed"
                     }
-                } else if (active || stopped) && self.unresolved {
-                    "unresolved"
                 } else if stopped && self.outcome == Some(Phase::Failed) {
                     "failed"
                 } else if active {
@@ -828,6 +864,8 @@ mod tests {
             members: vec![job.id.clone()],
             base: base.clone(),
             commit: Some(release.clone()),
+            composition_head: None,
+            merge_conflict: None,
         });
         assert_eq!(job.effective_commit(), &individual);
         assert_eq!(job.execution_commit(), &release);

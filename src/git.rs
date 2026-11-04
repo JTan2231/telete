@@ -474,6 +474,41 @@ pub(crate) fn unchanged(paths: &Paths, checkout: &Path, revision: &CommitId) -> 
     Ok(())
 }
 
+pub(crate) fn merge_head(paths: &Paths, checkout: &Path) -> Result<Option<CommitId>> {
+    let path = value(
+        paths,
+        checkout,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "MERGE_HEAD",
+        ],
+    )?;
+    match fs::read_to_string(path) {
+        Ok(head) => Ok(Some(CommitId::new(head.trim())?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn is_ancestor(
+    paths: &Paths,
+    repo: &Path,
+    ancestor: &CommitId,
+    revision: &CommitId,
+) -> Result<bool> {
+    let result = run(
+        paths,
+        repo,
+        &strings(&["merge-base", "--is-ancestor", &ancestor.0, &revision.0]),
+        None,
+        BTreeMap::new(),
+    )?;
+    ensure!(result.exited_with(&[0, 1]), "Git ancestry check failed");
+    Ok(result.success())
+}
+
 /// Retain a project's composed release without changing any project branch.
 /// Every member and the preceding release must be present in its ancestry.
 pub(crate) fn retain_release(
@@ -502,15 +537,8 @@ pub(crate) fn retain_release(
     );
     unchanged(paths, checkout, revision)?;
     for ancestor in std::iter::once(base).chain(members) {
-        let result = run(
-            paths,
-            repo,
-            &strings(&["merge-base", "--is-ancestor", &ancestor.0, &revision.0]),
-            None,
-            BTreeMap::new(),
-        )?;
         ensure!(
-            result.success(),
+            is_ancestor(paths, repo, ancestor, revision)?,
             "release commit {revision} must include source {ancestor}"
         );
     }

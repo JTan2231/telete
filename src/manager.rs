@@ -428,6 +428,7 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
                 | Phase::Checking
                 | Phase::Repairing
                 | Phase::Composing
+                | Phase::RepairingMerge
                 | Phase::Preparing
                 | Phase::Deploying
         ),
@@ -609,6 +610,7 @@ impl Worker<'_> {
             Phase::Checking => self.workflow_stage(job, "check"),
             Phase::Repairing => self.workflow_stage(job, "repair"),
             Phase::Composing => self.workflow_stage(job, "compose"),
+            Phase::RepairingMerge => self.workflow_stage(job, "merge_repair"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
             Phase::Deploying => self.workflow_stage(job, "deploy"),
             Phase::Blocked => Ok(()),

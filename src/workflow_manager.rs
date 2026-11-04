@@ -34,15 +34,27 @@ impl Worker<'_> {
         if job.batch.is_some() {
             inputs["batch"] = self.batch_input(job)?;
         }
-        let stdin = if stage == "repair" {
+        if stage == "merge_repair" {
+            let conflict = job
+                .batch
+                .as_ref()
+                .and_then(|batch| batch.merge_conflict.as_ref())
+                .context("merge repair has no conflict")?;
+            inputs["merge"] = json!(conflict);
+        }
+        let stdin = if matches!(stage, "repair" | "merge_repair") {
             let failed = job
                 .runs
                 .last()
                 .context("repair has no triggering failure")?;
-            ensure!(
+            let matches_stage = if stage == "merge_repair" {
+                failed.stage == "compose"
+            } else {
                 matches!(failed.stage.as_str(), "analyze" | "check")
                     && failed.commit == *job.effective_commit()
-                    && !failed.result.success(),
+            };
+            ensure!(
+                matches_stage && !failed.result.success(),
                 "repair does not match the failed stage"
             );
             Some(failed.result.diagnostics())
@@ -84,6 +96,7 @@ impl Worker<'_> {
             Phase::Checking => "check",
             Phase::Repairing => "repair",
             Phase::Composing => "compose",
+            Phase::RepairingMerge => "merge_repair",
             Phase::Preparing => "prepare",
             Phase::Deploying => "deploy",
             _ => bail!("workflow operation has another phase"),
@@ -207,13 +220,14 @@ impl Worker<'_> {
 
     fn complete_stage(&self, job: &mut Job, stage: &str, run: StageRun) -> Result<()> {
         let success = run.result.success();
+        let ordinary_failure = run
+            .result
+            .exit_code
+            .is_some_and(|code| code != 0 && run.result.exited_with(&[code]));
         let repairable = (stage == "analyze"
             || (stage == "check"
                 && (job.workflow.analyze.is_some() || job.workflow.repair.is_some())))
-            && run
-                .result
-                .exit_code
-                .is_some_and(|code| code != 0 && run.result.exited_with(&[code]));
+            && ordinary_failure;
         store::atomic_bytes(
             &self.directory(job)?.join(format!("{}.log", run.operation)),
             run.result.diagnostics().as_bytes(),
@@ -223,6 +237,9 @@ impl Worker<'_> {
         }
         // Terminal process evidence is known before source finalization.
         job.operation = None;
+        if stage == "merge_repair" {
+            return self.complete_merge_repair(job, run);
+        }
         if stage == "fix" {
             job.resulting_commit = Some(crate::git::retain_fixes(
                 self.paths,
@@ -243,6 +260,18 @@ impl Worker<'_> {
         }
         job.runs.push(run);
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
+        if stage == "compose"
+            && ordinary_failure
+            && !job.cancel_requested
+            && job.workflow.command("merge_repair").is_ok()
+            && let Some(conflict) = self.merge_conflict(job)?
+        {
+            job.batch
+                .as_mut()
+                .context("release has no membership")?
+                .merge_conflict = Some(conflict);
+            return self.save(job, Phase::RepairingMerge);
+        }
         if !success && repairable && !job.cancel_requested {
             if job.workflow.repair.is_some() && !job.runs.iter().any(|run| run.stage == "repair") {
                 return self.save(job, Phase::Repairing);
@@ -275,6 +304,10 @@ impl Worker<'_> {
                 false,
             );
         }
+        self.advance_workflow(job, stage)
+    }
+
+    fn advance_workflow(&self, job: &mut Job, stage: &str) -> Result<()> {
         if stage == "fix" {
             return self.save(
                 job,
@@ -303,6 +336,23 @@ impl Worker<'_> {
             "Configured workflow succeeded".into(),
             false,
         )
+    }
+
+    fn complete_merge_repair(&self, job: &mut Job, run: StageRun) -> Result<()> {
+        let success = run.result.success();
+        job.runs.push(run);
+        job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
+        if job.cancel_requested {
+            return self.finish(
+                job,
+                Phase::Cancelled,
+                "Cancelled after merge repair settled".into(),
+                false,
+            );
+        }
+        ensure!(success, "Workflow merge repair failed");
+        self.accept_merge_repair(job)?;
+        self.save(job, Phase::Composing)
     }
 
     fn complete_repair(&self, job: &mut Job, run: StageRun) -> Result<()> {

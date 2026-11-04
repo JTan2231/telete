@@ -212,7 +212,8 @@ Telete does not add another analysis or check.
   "batch": {
     "target": "production",
     "base": "main",
-    "compose": {"program": "ci/compose.sh"}
+    "compose": {"program": "ci/compose.sh"},
+    "merge_repair": {"program": "ci/merge-repair.sh"}
   }
 }
 ```
@@ -224,8 +225,8 @@ deployment, the next group uses that target's last successful release instead.
 Telete pins the submitted bootstrap base at `refs/telete/jobs/base-JOB` until
 request cleanup.
 Use the same target for commands that deploy to the same destination. Compatible
-requests have the same target, composition, preparation, deployment, and
-parameters; their individual fixes, analysis, and checks may differ.
+requests have the same target, composition, merge repair, preparation,
+deployment, and parameters. Individual fixes, analysis, and checks may differ.
 
 When the first member finishes its check, Telete closes the group over compatible
 requests already admitted to the queue. Those requests finish their individual
@@ -272,15 +273,35 @@ done
 git rev-parse HEAD > "$(jq -r '.outputs.directory' "$TELETE_CONTEXT")/commit"
 ```
 
+### Repair a composition conflict
+
+Set `batch.merge_repair` to run a command when an ordinary nonzero `compose`
+exit leaves an unresolved Git merge of one checked member. The
+command runs in the same checkout and reads the compose command's captured
+standard output followed by its standard error. Its context provides the
+pre-merge HEAD as `inputs.merge.head` and the checked member as
+`inputs.merge.member`.
+
+Resolve the conflict and commit the merge in that checkout. Leave a clean
+tracked tree at detached HEAD. The merge commit must have exactly two parents,
+in order: the pre-merge HEAD and the checked member. Telete runs `compose` again
+from the repaired HEAD with a new execution identity and preserves the completed
+member checks. Make the compose command continue from its current HEAD. Another
+member conflict can invoke the hook again. A known hook failure or an invalid
+merge commit fails the release.
+
+### Observe the release
+
 Status distinguishes each member's checked source from `release_commit`, and
 `release_id` links members to their shared outcome. Members wait in
-`waiting_release`; the leader runs `composing`, then preparation and deployment.
+`waiting_release`. The leader runs `composing`, optionally `repairing_merge`,
+then preparation and deployment.
 `wait` and `submit --follow` observe the requested deployment through that shared
 outcome. Individual submitted, analyzed, and repaired identities remain intact.
 
-Composition failure prevents deployment. The existing cancellation and command
-recovery rules apply to release work too: missing terminal evidence never
-authorizes replay. Release refs survive checkout cleanup, and
+A successful composition is required for deployment. The existing cancellation
+and command recovery rules apply to release work. Missing terminal evidence
+never authorizes replay. Release refs survive checkout cleanup, and
 `refs/telete/releases/targets/TARGET` retains the latest confirmed release source.
 Successful completion markers retain only individual source and shared release
 identities. A shared failure retains the leader and actual failed-member
@@ -295,9 +316,10 @@ batched workflows, and keep 0.5 or later while batching records remain.
 Check success requires a successful command completion for the selected commit.
 Preparation and deployment success likewise require successful completion of
 their selected commands. An ordinary analysis failure or an ordinary check
-failure with analysis or repair configured enters the repair flow. Other
-failures stop the job. Commands own output formats and any stronger claim about
-the systems they change.
+failure with analysis or repair configured enters the repair flow. An eligible
+composition conflict triggers a configured merge repair. Other failures stop
+the job. Commands own output formats and any stronger claim about the systems
+they change.
 
 Before launching a command, Telete records its execution identity, selected
 executable, arguments, working directory, explicit environment overrides,
@@ -312,10 +334,11 @@ The context contains the job and operation identity, stage, checkout,
 analysis, repair, or batching,
 `source.submitted_commit` preserves the submitted SHA and `source.result_ref`
 names the retained result. `source.commit` identifies the submitted source in
-the fix command and the resulting source in later individual commands. Batched
-composition selects the release base; preparation and deployment select the
-combined release source. `source.checked_commit` preserves the individual
-source, and `source.release_id` identifies a frozen group.
+the fix command and the resulting source in later individual commands.
+Composition selects the starting HEAD. Merge repair selects the pre-merge HEAD.
+Preparation and deployment select the combined release source.
+`source.checked_commit` preserves the individual source, and `source.release_id`
+identifies a frozen group.
 
 `outputs.directory` names the private output directory for the command. With
 fixes selected, `inputs.fix` is null during fixes and names the completed fix
@@ -330,9 +353,9 @@ identifies the accepted repair and `source.commit` selects that source for every
 later command. `inputs.analysis` is null during analysis and names its output
 directory in later stages. Analysis outputs remain available after agent repair.
 
-Standard input is closed except during automatic repair. A known terminal exit
-remains known if output collection fails; collection failure is a separate
-observation.
+Standard input is closed except during automatic repair and merge repair.
+A known terminal exit remains known if output collection fails. Collection
+failure is a separate observation.
 A program that fails to start has a recorded start-error result. Neither failure
 authorizes another launch under the same execution identity.
 
@@ -394,8 +417,8 @@ commit. Project commands own their final build and artifact identity rules.
 Telete 0.5 reads existing 0.3 and 0.4 queue records. Let commands from an earlier
 worker settle before submitting newly supported workflows. Keep 0.4 or later
 while analysis or manual repair records remain, and 0.5 or later while batching
-records remain. Jobs configured for automatic repair require a build that
-supports it.
+records remain. Jobs configured for automatic repair or merge repair require a
+build that supports the selected hook.
 
 Use `cancel JOB` to discard a waiting job at its safe boundary. Use `recover JOB`
 to reconcile an uncertain command using matching terminal evidence.

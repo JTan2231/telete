@@ -1,4 +1,4 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.6.0" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.7.0" "General Commands Manual"
 .SH NAME
 telete \- run a serial queue of committed repository workflows
 .SH SYNOPSIS
@@ -337,8 +337,10 @@ Omitted or null means no deployment stage.
 Optional deployment batching object containing
 .BR target ,
 .BR base ,
-and a
+a
 .B compose
+command, and an optional
+.B merge_repair
 command. Requires deployment. See BATCHED DEPLOYMENTS.
 .TP
 .B parameters
@@ -445,7 +447,8 @@ object groups compatible deployment requests. For example:
   "batch": {
     "target": "production",
     "base": "main",
-    "compose": {"program": "ci/compose.sh"}
+    "compose": {"program": "ci/compose.sh"},
+    "merge_repair": {"program": "ci/merge-repair.sh"}
   }
 .fi
 .PP
@@ -458,7 +461,8 @@ Telete retains the bootstrap base at refs/telete/jobs/base-JOB until cleanup.
 Every member runs its own selected fixes, analysis, and check. When the first
 member finishes its check, Telete closes the group over compatible requests
 already admitted. Compatibility requires the same target, composition,
-preparation, deployment, and parameters. Individual check commands can differ.
+merge repair, preparation, deployment, and parameters.
+Individual check commands can differ.
 An incompatible request for the same target ends the compatible segment;
 later compatible requests cannot jump ahead of it.
 Later arrivals enter the next group, even if deployment has not started.
@@ -483,11 +487,26 @@ and write its full commit ID to
 .IR outputs.directory/commit .
 The commit must descend from the release base and every checked member source.
 .PP
+An optional
+.B merge_repair
+command runs after an ordinary nonzero compose exit that leaves an unresolved
+Git merge of one checked batch member. The command runs in the same checkout.
+Its standard input contains the compose command's captured standard output
+followed by its standard error. Resolve the conflict and commit the merge.
+Leave a clean tracked tree at detached HEAD with the merge complete.
+The commit must have exactly two parents, in order: the pre-merge HEAD and the
+checked member. Telete then runs compose again from the repaired commit under a
+new execution identity. Individual checks stay complete. Compose must continue
+from its current HEAD.
+The hook can run again for a conflict with another member.
+A known merge repair failure or an invalid repair commit fails the release.
+.PP
 Telete retains that commit at
 .I refs/telete/releases/RELEASE
 and runs preparation and deployment once on it. It does not add combined CI or
-advance project branches. Composition failure prevents deployment. Existing
-cancellation and recovery rules apply; an uncertain command is never replayed.
+advance project branches. A successful composition is required for deployment.
+Existing cancellation and recovery rules apply; an uncertain command is never
+replayed.
 .PP
 Member status preserves individual checked source, names the shared
 .BR release_id ,
@@ -497,6 +516,8 @@ Members wait in
 .B waiting_release
 while the leader runs
 .BR composing ,
+optional
+.BR repairing_merge ,
 preparation, and deployment. A requested deployment completes only with the
 shared release outcome. Successful deployment updates
 .IR refs/telete/releases/targets/TARGET .
@@ -506,8 +527,8 @@ to project commands.
 The normal order is optional fixes, optional analysis, check, optional
 preparation, and optional deployment.
 With batching selected, each member runs its individual check, then the release
-runs composition, optional preparation, and deployment once. No additional
-analysis or check is inserted.
+runs composition with optional merge repair, followed by optional preparation
+and deployment once. No additional analysis or check is inserted.
 A stage succeeds only when its command exits with status 0 without a timeout,
 signal, start error, or output collection error.
 An ordinary nonzero analysis exit or an ordinary check failure with analysis
@@ -515,6 +536,7 @@ or repair selected triggers repair.
 Without an available automatic repair, the job enters
 .BR awaiting_repair ,
 retains evidence, and releases its slot until manual repair or cancellation.
+An eligible composition conflict triggers a configured merge repair.
 Other failed stages stop the job.
 An unselected stage is reported as
 .BR not_requested ,
@@ -534,7 +556,7 @@ Configure any required toolchain, caches, credentials, or environment in the
 project's commands; Telete imposes no filesystem sandbox or reproducibility
 guarantee.
 .PP
-Standard input is closed except during automatic repair.
+Standard input is closed except during automatic repair and merge repair.
 Standard output and standard error are captured separately, up to 16 MiB each,
 and decoded as UTF-8 with replacement for invalid bytes.
 Excess output is drained but not retained, and an output collection error makes
@@ -557,8 +579,8 @@ The absolute private checkout path.
 .TP
 .B source.commit
 The submitted commit during fixes, and the selected source in later individual
-commands. Batched preparation and deployment use the combined release commit.
-Composition uses the release base.
+commands. Composition uses the starting HEAD. Merge repair uses the pre-merge
+HEAD. Batched preparation and deployment use the combined release commit.
 .TP
 .B source.submitted_commit, source.result_ref
 Present when fixes, analysis, repair, or batching are selected. Preserve the
@@ -572,8 +594,7 @@ when present. After repair, source.commit selects the repaired source.
 .TP
 .B source.checked_commit, source.release_id
 For batching, preserve the individual checked source and identify its frozen
-release group. Composition, preparation, and deployment use their own selected
-source.commit.
+release group. Release commands use their own selected source.commit.
 .TP
 .B inputs.analysis
 Present when analysis is selected. Null during analysis; its retained output
@@ -596,6 +617,10 @@ available; otherwise null.
 .B inputs.batch
 The release base and ordered member identities for batched release commands.
 See BATCHED DEPLOYMENTS.
+.TP
+.B inputs.merge
+Present during merge repair. The head field contains the pre-merge HEAD commit
+and the member field contains the checked member commit being merged.
 .PP
 Telete defines no package or installation format for these outputs.
 Commands that need durable outputs must copy or publish them before runtime
@@ -637,6 +662,7 @@ Job phases are
 .BR checking ,
 .BR waiting_release ,
 .BR composing ,
+.BR repairing_merge ,
 .BR preparing ,
 .BR deploying ,
 .BR blocked ,
@@ -799,8 +825,8 @@ It does not authorize another launch under the same execution identity.
 Telete 0.5 reads existing 0.3 and 0.4 queue records. Let an earlier worker
 settle before submitting newly supported workflows. Keep 0.4 or later while
 analysis or manual repair records remain, and 0.5 or later while batching
-records remain. Jobs configured for automatic repair require a build that
-supports it.
+records remain. Jobs configured for automatic repair or merge repair require a
+build that supports the selected hook.
 .PP
 Use the Telete version that owns existing runtime state.
 Incompatible runtime schemas are rejected; Telete does not automatically migrate

@@ -32,6 +32,7 @@ pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\n')
 ",
             vec![("COMPOSED", project.state.join("composed.jsonl"))],
         ),
+        merge_repair: None,
     });
     project.workflow.prepare = Some(batch_python(
         "import json,os,pathlib; c=json.load(open(os.environ['TELETE_CONTEXT'])); open(os.environ['PREPARED'],'a').write(c['source']['commit']+'\\n'); pathlib.Path(c['outputs']['directory'],'artifact').write_text(c['source']['commit'])",
@@ -413,13 +414,12 @@ fn release_batch_retains_a_members_failed_check_until_a_newer_workflow_finishes(
 fn release_batch_composition_failure_never_prepares_or_deploys() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    project
-        .workflow
-        .batch
-        .as_mut()
-        .context("batch")?
-        .compose
-        .args = vec!["-c".into(), "raise SystemExit(7)".into()];
+    let batch = project.workflow.batch.as_mut().context("batch")?;
+    batch.compose.args = vec!["-c".into(), "raise SystemExit(7)".into()];
+    batch.merge_repair = Some(batch_python(
+        "import os,pathlib; pathlib.Path(os.environ['REPAIRED']).touch()",
+        vec![("REPAIRED", project.state.join("repaired"))],
+    ));
     let paths = Paths::selected(project.state.clone(), false)?;
     let a = batch_branch(&paths, &project, &base, "change-a")?;
     let b = batch_branch(&paths, &project, &base, "change-b")?;
@@ -428,6 +428,7 @@ fn release_batch_composition_failure_never_prepares_or_deploys() -> Result<()> {
     assert_eq!(batch_finish(&paths, &first)?["phase"], "failed");
     assert_eq!(batch_finish(&paths, &second)?["phase"], "failed");
     assert_eq!(batch_records(&paths.root.join("checked.jsonl"))?.len(), 2);
+    assert!(!paths.root.join("repaired").exists());
     assert!(!paths.root.join("prepared").exists());
     assert!(batch_records(&paths.root.join("deployed.jsonl"))?.is_empty());
     assert!(
@@ -446,6 +447,55 @@ fn release_batch_composition_failure_never_prepares_or_deploys() -> Result<()> {
     let submitted = submit(&paths, &project.repo, &base.0, unrelated)?;
     let unrelated_id = submitted["id"].as_str().context("unrelated CI")?;
     assert_eq!(batch_finish(&paths, unrelated_id)?["phase"], "succeeded");
+    Ok(())
+}
+
+#[test]
+fn release_batch_repairs_each_conflict_and_reuses_member_checks() -> Result<()> {
+    let (_temporary, mut project, base) = fixture()?;
+    batch_workflow(&mut project, &base);
+    project.workflow.batch.as_mut().context("batch")?.merge_repair = Some(batch_python(
+        r"import json,os,pathlib,subprocess,sys
+c=json.load(open(os.environ['TELETE_CONTEXT']))
+m=c['inputs']['merge']
+assert c['stage']=='merge_repair' and c['source']['commit']==m['head']
+assert subprocess.check_output(['git','rev-parse','HEAD','MERGE_HEAD'],text=True).splitlines()==[m['head'],m['member']]
+assert 'CONFLICT' in sys.stdin.read()
+open(os.environ['REPAIRED'],'a').write(json.dumps(m)+'\n')
+pathlib.Path('payload.txt').write_text('combined source\n')
+subprocess.run(['git','-c','user.name=Fixture','-c','user.email=fixture@localhost','commit','-am','Resolve merge'],check=True)
+",
+        vec![("REPAIRED", project.state.join("repaired.jsonl"))],
+    ));
+    let paths = Paths::selected(project.state.clone(), false)?;
+    let mut sources = Vec::new();
+    for name in ["first", "second", "third"] {
+        git::value(&paths, &project.repo, &["checkout", "-b", name, &base.0])?;
+        fs::write(project.repo.join("payload.txt"), format!("{name}\n"))?;
+        sources.push(record_commit(&paths, &project.repo)?);
+    }
+    let mut ids = Vec::new();
+    for commit in &sources {
+        ids.push(enqueue(&project, &commit.0)?.1);
+    }
+    let completed = batch_finish(&paths, &ids[0])?;
+    assert_eq!(completed["phase"], "succeeded", "{completed}");
+    let release = CommitId::new(completed["release_commit"].as_str().context("release source")?)?;
+    for (id, commit) in ids.iter().zip(&sources) {
+        let member = batch_finish(&paths, id)?;
+        assert_eq!(member["phase"], "succeeded");
+        assert_eq!(member["resulting_commit"], commit.0);
+        assert_eq!(member["release_commit"], release.0);
+        batch_contains(&paths, &project.repo, &release, commit)?;
+    }
+    let repairs = batch_records(&paths.root.join("repaired.jsonl"))?;
+    assert_eq!(repairs.len(), 2);
+    assert_eq!(repairs[0]["member"], sources[1].0);
+    assert_eq!(repairs[1]["member"], sources[2].0);
+    assert_eq!(batch_records(&paths.root.join("checked.jsonl"))?.len(), 3);
+    assert_eq!(batch_records(&paths.root.join("composed.jsonl"))?.len(), 3);
+    assert_eq!(fs::read_to_string(paths.root.join("prepared"))?.lines().count(), 1);
+    assert_eq!(batch_records(&paths.root.join("deployed.jsonl"))?.len(), 1);
     Ok(())
 }
 

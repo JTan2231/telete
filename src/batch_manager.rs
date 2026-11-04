@@ -1,13 +1,14 @@
 //! A closed group of checked sources shares preparation and deployment.
 
 use super::{CommitId, Context, Job, Phase, Result, Worker, ensure, git, json, store};
-use crate::store::ReleaseBatch;
+use crate::store::{MergeConflict, ReleaseBatch};
 
 fn compatible(left: &Job, right: &Job) -> bool {
     match (&left.workflow.batch, &right.workflow.batch) {
         (Some(left_batch), Some(right_batch)) => {
             left_batch.target == right_batch.target
                 && left_batch.compose == right_batch.compose
+                && left_batch.merge_repair == right_batch.merge_repair
                 && left.workflow.prepare == right.workflow.prepare
                 && left.workflow.deploy == right.workflow.deploy
                 && left.workflow.parameters == right.workflow.parameters
@@ -82,6 +83,8 @@ impl Worker<'_> {
                     members,
                     base,
                     commit: None,
+                    composition_head: None,
+                    merge_conflict: None,
                 });
             }
             self.save(job, Phase::WaitingRelease)
@@ -211,7 +214,7 @@ impl Worker<'_> {
             &self.config.common_git_dir,
             &self.worktree(job),
             &job.id.0,
-            &batch.base,
+            batch.composition_head.as_ref().unwrap_or(&batch.base),
             &members,
             &commit,
         )?;
@@ -220,6 +223,67 @@ impl Worker<'_> {
             .context("release has no membership")?
             .commit = Some(commit.clone());
         job.release_commit = Some(commit);
+        Ok(())
+    }
+
+    pub(super) fn merge_conflict(&self, job: &Job) -> Result<Option<MergeConflict>> {
+        let checkout = self.worktree(job);
+        let Some(member) = git::merge_head(self.paths, &checkout)? else {
+            return Ok(None);
+        };
+        if git::value(self.paths, &checkout, &["ls-files", "--unmerged"])?.is_empty() {
+            return Ok(None);
+        }
+        git::ensure_detached(self.paths, &checkout)?;
+        let head = git::commit(self.paths, &checkout, "HEAD")?;
+        let input = self.batch_input(job)?;
+        ensure!(
+            input["members"]
+                .as_array()
+                .context("release has no members")?
+                .iter()
+                .any(|entry| entry["commit"] == member.0),
+            "merge conflict is not with a checked release member: {member}"
+        );
+        ensure!(
+            git::is_ancestor(self.paths, &checkout, job.execution_commit(), &head)?
+                && !git::is_ancestor(self.paths, &checkout, &member, &head)?,
+            "merge conflict does not advance composition"
+        );
+        Ok(Some(MergeConflict { head, member }))
+    }
+
+    pub(super) fn accept_merge_repair(&self, job: &mut Job) -> Result<()> {
+        let checkout = self.worktree(job);
+        let batch = job.batch.as_mut().context("release has no membership")?;
+        let conflict = batch
+            .merge_conflict
+            .as_ref()
+            .context("merge repair has no conflict")?;
+        ensure!(
+            git::common(self.paths, &checkout)? == self.config.common_git_dir,
+            "merge repair checkout belongs to another repository"
+        );
+        git::ensure_detached(self.paths, &checkout)?;
+        let commit = git::commit(self.paths, &checkout, "HEAD")?;
+        let parents = git::value(
+            self.paths,
+            &checkout,
+            &["rev-list", "--parents", "-n", "1", &commit.0],
+        )?;
+        ensure!(
+            parents == format!("{commit} {} {}", conflict.head, conflict.member),
+            "merge repair must commit the merge of {} and {}",
+            conflict.head,
+            conflict.member
+        );
+        ensure!(
+            git::merge_head(self.paths, &checkout)?.is_none(),
+            "merge repair left a merge in progress"
+        );
+        git::unchanged(self.paths, &checkout, &commit)?;
+        batch.composition_head = Some(commit);
+        batch.merge_conflict = None;
         Ok(())
     }
 
