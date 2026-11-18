@@ -23,18 +23,18 @@ fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
     fs::write(repo.join("payload.txt"), "selected source\n")?;
     script(&repo.join("check.sh"), "cat payload.txt >> \"$MARKER\"")?;
     let commit = record_commit(&paths, &repo)?;
-    let project = ProjectConfig { repo, state:paths.root.clone(), workflow:Workflow {
+    let project = ProjectConfig { repo, state:paths.root.clone(), queue:QueueMode::Repository, workflow:Workflow {
         fix:None, analyze:None, repair:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
             timeout_seconds:Some(10), env:BTreeMap::from([("MARKER".into(),
                 paths.root.join("observed").display().to_string())]) },
-        prepare:None, deploy:None, batch:None, parameters:json!({"suite":"fixture"}),
+        prepare:None, deploy:None, batch:None, integration:None, parameters:json!({"suite":"fixture"}),
     }};
     Ok((temporary, project, commit))
 }
 
 fn enqueue(project: &ProjectConfig, revision: &str) -> Result<(Paths, String)> {
     let paths = select(project, true)?;
-    let value = submit(&paths, &project.repo, revision, project.workflow.clone())?;
+    let value = submit(&paths, &project.repo, revision, project.workflow.clone(), project.queue)?;
     Ok((paths, value["id"].as_str().context("submitted id")?.into()))
 }
 
@@ -105,7 +105,7 @@ fn linked_checkouts_submit_in_one_order_with_their_selected_workflows() -> Resul
     workflow.check.program = "/bin/sh".into();
     workflow.check.args = vec!["-c".into(), "printf '%s: ' \"$MODE\" >> \"$MARKER\"; cat payload.txt >> \"$MARKER\"".into()];
     workflow.check.env.insert("MODE".into(), "feature workflow".into());
-    let value = submit(&paths, &linked, "HEAD", workflow)?;
+    let value = submit(&paths, &linked, "HEAD", workflow, project.queue)?;
     let second = value["id"].as_str().context("second id")?;
     assert_eq!(value["commit"], selected.0);
     assert!(paths.job(second).join("worktree").is_dir());
@@ -509,7 +509,7 @@ fn analysis_findings_release_the_queue_and_repairs_skip_analysis() -> Result<()>
     other.analyze = None;
     other.check.program = "/usr/bin/true".into();
     other.check.args.clear();
-    let submitted = submit(&paths, &project.repo, "HEAD", other)?;
+    let submitted = submit(&paths, &project.repo, "HEAD", other, project.queue)?;
     let other_id = submitted["id"].as_str().context("other id")?;
     assert_eq!(finish_run(&paths, other_id)?["phase"], "succeeded");
     assert!(paths.job(&id).join("worktree").is_dir());

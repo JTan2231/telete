@@ -82,6 +82,40 @@ pub(crate) fn completed(paths: &Paths, key: &str, spec: &CommandSpec) -> Result<
     terminal(paths, &record, &mut execution)
 }
 
+/// The caller must own the inherited execution lock of the old slot holder.
+/// This checks physical execution only. Recovery still requires exact terminal
+/// evidence before continuing the repository's workflow.
+pub(crate) fn slot_stopped(paths: &Paths) -> Result<bool> {
+    ensure!(
+        crate::paths::private_directory_exists(&paths.root)?,
+        "cannot inspect the shared slot's repository state"
+    );
+    let directory = paths.root.join("broker");
+    if !crate::paths::private_directory_exists(&directory)? {
+        return Ok(true);
+    }
+    let Some(_slot) = crate::paths::try_lock(&directory.join("slot.lock"))? else {
+        return Ok(false);
+    };
+    let slot = directory.join("slot.json");
+    let record = match fs::read(&slot) {
+        Ok(bytes) => serde_json::from_slice::<PathBuf>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        record.parent() == Some(directory.as_path()) && record != slot,
+        "foreign broker slot record"
+    );
+    let execution: Execution = serde_json::from_slice(&fs::read(&record)?)?;
+    let name = basename(&execution.key)?;
+    ensure!(
+        execution.schema == 1 && record == directory.join(format!("{name}.json")),
+        "broker slot belongs to another execution"
+    );
+    crate::process::stopped(&directory.join(format!("{name}.process")))
+}
+
 fn terminal(
     paths: &Paths,
     record: &std::path::Path,

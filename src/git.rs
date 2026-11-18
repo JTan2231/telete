@@ -1,10 +1,13 @@
 //! Committed-source selection and temporary private worktrees.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 
 use crate::model::CommitId;
 use crate::paths::Paths;
@@ -96,6 +99,406 @@ pub(crate) fn common(paths: &Paths, repo: &Path) -> Result<PathBuf> {
 
 pub(crate) fn repository(paths: &Paths, repo: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(value(paths, repo, &["rev-parse", "--show-toplevel"])?).canonicalize()?)
+}
+
+fn local_branch(paths: &Paths, repo: &Path, branch: &str) -> Result<String> {
+    ensure!(
+        value(paths, repo, &["check-ref-format", "--branch", branch])? == branch,
+        "expected a literal local branch name: {branch}"
+    );
+    Ok(format!("refs/heads/{branch}"))
+}
+
+pub(crate) fn branch_tip(paths: &Paths, repo: &Path, branch: &str) -> Result<CommitId> {
+    let reference = local_branch(paths, repo, branch)?;
+    commit(paths, repo, &reference).with_context(|| format!("cannot resolve local branch {branch}"))
+}
+
+fn worktrees(paths: &Paths, repo: &Path) -> Result<String> {
+    value(paths, repo, &["worktree", "list", "--porcelain", "-z"])
+}
+
+fn branch_checkouts(inventory: &str, reference: &str) -> Vec<PathBuf> {
+    inventory
+        .split("\0\0")
+        .filter_map(|entry| {
+            let mut fields = entry.split('\0');
+            let path = fields.next()?.strip_prefix("worktree ")?;
+            fields
+                .any(|field| field.strip_prefix("branch ") == Some(reference))
+                .then(|| PathBuf::from(path))
+        })
+        .collect()
+}
+
+fn checkout_git_dir(paths: &Paths, checkout: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(value(
+        paths,
+        checkout,
+        &["rev-parse", "--absolute-git-dir"],
+    )?))
+}
+
+fn checkout_idle(paths: &Paths, checkout: &Path) -> Result<()> {
+    let git_dir = checkout_git_dir(paths, checkout)?;
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+        "BISECT_START",
+    ] {
+        ensure!(
+            !git_dir.join(marker).try_exists()?,
+            "Git operation in progress in {}",
+            checkout.display()
+        );
+    }
+    Ok(())
+}
+
+fn checkout_clean(paths: &Paths, checkout: &Path, include_ignored: bool) -> Result<()> {
+    let mut args = vec![
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+    ];
+    if include_ignored {
+        args.push("--ignored=matching");
+    }
+    ensure!(
+        value(paths, checkout, &args)?.is_empty(),
+        "worktree has local files or changes: {}",
+        checkout.display()
+    );
+    Ok(())
+}
+
+/// Advance a local branch without overwriting independent work.
+pub(crate) fn publish_branch(
+    paths: &Paths,
+    repo: &Path,
+    branch: &str,
+    expected: &CommitId,
+    candidate: &CommitId,
+) -> Result<()> {
+    let reference = local_branch(paths, repo, branch)?;
+    let observed = commit(paths, repo, &reference)?;
+    if is_ancestor(paths, repo, candidate, &observed)? {
+        return Ok(());
+    }
+    ensure!(
+        observed == *expected,
+        "local branch {branch} advanced from {expected} to {observed}"
+    );
+    ensure!(
+        is_ancestor(paths, repo, expected, candidate)?,
+        "candidate {candidate} cannot fast-forward local branch {branch}"
+    );
+    let inventory = worktrees(paths, repo)?;
+    match branch_checkouts(&inventory, &reference).as_slice() {
+        [] => {
+            // A rebase or bisect temporarily detaches HEAD while retaining
+            // ownership of the branch it will restore.
+            ensure_detached_branch_idle(paths, &inventory, &reference, branch)?;
+            value(
+                paths,
+                repo,
+                &[
+                    "update-ref",
+                    "--no-deref",
+                    "-m",
+                    "Telete: integrate prepared release",
+                    &reference,
+                    &candidate.0,
+                    &expected.0,
+                ],
+            )?;
+        }
+        [checkout] => {
+            ensure!(
+                common(paths, checkout)? == common(paths, repo)?,
+                "destination checkout belongs to another repository"
+            );
+            checkout_idle(paths, checkout)?;
+            checkout_clean(paths, checkout, false)?;
+            ensure!(
+                value(paths, checkout, &["symbolic-ref", "HEAD"])? == reference
+                    && commit(paths, checkout, "HEAD")? == *expected,
+                "destination checkout changed before integration"
+            );
+            value(
+                paths,
+                checkout,
+                &[
+                    "merge",
+                    "--ff-only",
+                    "--no-edit",
+                    "--no-autostash",
+                    "--no-overwrite-ignore",
+                    &candidate.0,
+                ],
+            )?;
+        }
+        _ => bail!("local branch {branch} is checked out more than once"),
+    }
+    ensure!(
+        is_ancestor(paths, repo, candidate, &commit(paths, repo, &reference)?)?,
+        "local branch {branch} does not contain integrated candidate {candidate}"
+    );
+    Ok(())
+}
+
+fn ensure_detached_branch_idle(
+    paths: &Paths,
+    inventory: &str,
+    reference: &str,
+    branch: &str,
+) -> Result<()> {
+    for entry in inventory.split("\0\0") {
+        let mut fields = entry.split('\0');
+        let Some(path) = fields
+            .next()
+            .and_then(|field| field.strip_prefix("worktree "))
+        else {
+            continue;
+        };
+        let checkout = Path::new(path);
+        if !fields.any(|field| field == "detached") || !checkout.exists() {
+            continue;
+        }
+        let git_dir = checkout_git_dir(paths, checkout)?;
+        for (marker, branch_name) in [
+            ("rebase-merge/head-name", reference),
+            ("rebase-apply/head-name", reference),
+            ("BISECT_START", branch),
+        ] {
+            match fs::read_to_string(git_dir.join(marker)) {
+                Ok(owner) => ensure!(
+                    owner.trim() != branch_name,
+                    "Git operation in progress on local branch {branch} in {path}"
+                ),
+                Err(error) if error.kind() == ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn merge_worktree_source(
+    paths: &Paths,
+    repo: &Path,
+    checkout: &Path,
+    source: &CommitId,
+) -> Result<()> {
+    private_worktree(paths, checkout)?;
+    ensure!(
+        common(paths, checkout)? == common(paths, repo)?,
+        "candidate belongs to another repository"
+    );
+    ensure_detached(paths, checkout)?;
+    let result = run(
+        paths,
+        checkout,
+        &strings(&[
+            "merge",
+            "--ff",
+            "--no-edit",
+            "--no-autostash",
+            "--no-overwrite-ignore",
+            &source.0,
+        ]),
+        None,
+        telete_author(),
+    )?;
+    ensure!(
+        result.success(),
+        "could not merge checked source {source}: {} {}",
+        result.stdout.trim(),
+        result.stderr.trim()
+    );
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WorktreeOwner {
+    id: String,
+    branch: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DevelopmentWorktree {
+    path: PathBuf,
+    owner: WorktreeOwner,
+    submitted: CommitId,
+}
+
+impl DevelopmentWorktree {
+    pub(crate) fn branch(&self) -> &str {
+        &self.owner.branch
+    }
+}
+
+fn worktree_owner_path(paths: &Paths, checkout: &Path) -> Result<Option<PathBuf>> {
+    let registration = checkout_git_dir(paths, checkout)?;
+    let linked = common(paths, checkout)?.join("worktrees");
+    Ok((registration.parent() == Some(linked.as_path()))
+        .then(|| registration.join("telete").join("worktree.json")))
+}
+
+pub(crate) fn record_development_worktree(
+    paths: &Paths,
+    checkout: &Path,
+    branch: &str,
+) -> Result<()> {
+    let marker =
+        worktree_owner_path(paths, checkout)?.context("worktree is not a linked checkout")?;
+    crate::paths::atomic_json(
+        &marker,
+        &WorktreeOwner {
+            id: uuid::Uuid::now_v7().to_string(),
+            branch: branch.to_owned(),
+        },
+    )
+}
+
+fn worktree_owner(paths: &Paths, checkout: &Path) -> Result<Option<WorktreeOwner>> {
+    let Some(marker) = worktree_owner_path(paths, checkout)? else {
+        return Ok(None);
+    };
+    let parent = marker
+        .parent()
+        .context("worktree identity has no directory")?;
+    if !crate::paths::private_directory_exists(parent)? {
+        return Ok(None);
+    }
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&marker)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read Telete worktree identity"),
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == rustix::process::getuid().as_raw()
+            && metadata.mode() & 0o777 == 0o600,
+        "Telete worktree identity must be a private user-owned regular file"
+    );
+    let owner = serde_json::from_reader(file).context("decode Telete worktree identity")?;
+    Ok(Some(owner))
+}
+
+pub(crate) fn development_worktree(
+    paths: &Paths,
+    repo: &Path,
+    commit: &CommitId,
+) -> Result<Option<DevelopmentWorktree>> {
+    let path = repository(paths, repo)?;
+    let Some(owner) = worktree_owner(paths, &path)? else {
+        return Ok(None);
+    };
+    let reference = format!("refs/heads/{}", owner.branch);
+    if value(paths, &path, &["rev-parse", "--symbolic-full-name", "HEAD"])? != reference
+        || self::commit(paths, &path, "HEAD")? != *commit
+    {
+        return Ok(None);
+    }
+    Ok(Some(DevelopmentWorktree {
+        path,
+        owner,
+        submitted: commit.clone(),
+    }))
+}
+
+pub(crate) fn cleanup_development_worktree(
+    paths: &Paths,
+    repo: &Path,
+    worktree: &DevelopmentWorktree,
+    checked: &CommitId,
+    integrated: &CommitId,
+) -> Result<()> {
+    let reference = local_branch(paths, repo, &worktree.owner.branch)?;
+    ensure!(
+        !paths.root.starts_with(&worktree.path),
+        "development worktree contains the active queue: {}",
+        worktree.path.display()
+    );
+    let branch_exists = run(
+        paths,
+        repo,
+        &strings(&["show-ref", "--verify", "--quiet", &reference]),
+        None,
+        BTreeMap::new(),
+    )?;
+    if branch_exists.exited_with(&[1]) && !worktree.path.try_exists()? {
+        return Ok(());
+    }
+    ensure!(
+        branch_exists.success(),
+        "development branch disappeared: {reference}"
+    );
+    let observed = commit(paths, repo, &reference)?;
+    ensure!(
+        observed == worktree.submitted || observed == *checked,
+        "development branch has advanced: {reference}"
+    );
+    ensure!(
+        is_ancestor(paths, repo, checked, integrated)?
+            && is_ancestor(paths, repo, &observed, integrated)?,
+        "integrated candidate does not include development branch {reference}"
+    );
+
+    let inventory = worktrees(paths, repo)?;
+    let checkouts = branch_checkouts(&inventory, &reference);
+    if worktree.path.try_exists()? {
+        ensure!(
+            checkouts.as_slice() == [worktree.path.as_path()]
+                && common(paths, &worktree.path)? == common(paths, repo)?
+                && worktree_owner(paths, &worktree.path)?.as_ref() == Some(&worktree.owner),
+            "development checkout changed: {}",
+            worktree.path.display()
+        );
+        checkout_idle(paths, &worktree.path)?;
+        checkout_clean(paths, &worktree.path, true)?;
+        ensure!(
+            value(paths, &worktree.path, &["symbolic-ref", "HEAD"])? == reference
+                && commit(paths, &worktree.path, "HEAD")? == observed,
+            "development checkout advanced before cleanup"
+        );
+        value(
+            paths,
+            repo,
+            &[
+                "worktree",
+                "remove",
+                "--",
+                &worktree.path.display().to_string(),
+            ],
+        )?;
+    } else {
+        ensure!(
+            checkouts.is_empty(),
+            "development branch is checked out at another path"
+        );
+    }
+    ensure!(
+        branch_checkouts(&worktrees(paths, repo)?, &reference).is_empty(),
+        "development branch is checked out"
+    );
+    value(
+        paths,
+        repo,
+        &["update-ref", "--no-deref", "-d", &reference, &observed.0],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn private_ref(job: &str) -> Result<String> {
@@ -511,13 +914,13 @@ pub(crate) fn is_ancestor(
 
 /// Retain a project's composed release without changing any project branch.
 /// Every member and the preceding release must be present in its ancestry.
-pub(crate) fn retain_release(
+pub(crate) fn retain_release<'a>(
     paths: &Paths,
     repo: &Path,
     checkout: &Path,
     job: &str,
-    base: &CommitId,
-    members: &[CommitId],
+    ancestors: impl IntoIterator<Item = &'a CommitId>,
+    previous: Option<&CommitId>,
     revision: &CommitId,
 ) -> Result<()> {
     ensure!(
@@ -536,13 +939,22 @@ pub(crate) fn retain_release(
         "release checkout must keep a detached HEAD"
     );
     unchanged(paths, checkout, revision)?;
-    for ancestor in std::iter::once(base).chain(members) {
+    for ancestor in ancestors {
         ensure!(
             is_ancestor(paths, repo, ancestor, revision)?,
             "release commit {revision} must include source {ancestor}"
         );
     }
-    advance(paths, repo, &release_ref(job)?, None, revision)
+    advance(paths, repo, &release_ref(job)?, previous, revision)
+}
+
+fn telete_author() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("GIT_AUTHOR_NAME".into(), "Telete".into()),
+        ("GIT_COMMITTER_NAME".into(), "Telete".into()),
+        ("GIT_AUTHOR_EMAIL".into(), "telete@localhost".into()),
+        ("GIT_COMMITTER_EMAIL".into(), "telete@localhost".into()),
+    ])
 }
 
 fn automatic_commit(
@@ -551,13 +963,7 @@ fn automatic_commit(
     tree: &str,
     job: &crate::store::Job,
 ) -> Result<CommitId> {
-    let mut environment = BTreeMap::new();
-    for name in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
-        environment.insert(name.into(), "Telete".into());
-    }
-    for name in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
-        environment.insert(name.into(), "telete@localhost".into());
-    }
+    let mut environment = telete_author();
     for name in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
         environment.insert(name.into(), format!("@{} +0000", job.created));
     }
@@ -577,4 +983,54 @@ fn automatic_commit(
         generated.stderr.trim()
     );
     CommitId::new(generated.stdout.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_preserves_ignored_worktree_files() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let paths = Paths::discovery(root.join("queue"));
+        let repo = root.join("repo");
+        let checkout = root.join("topic");
+        let repo_path = repo.to_str().context("invalid test repository path")?;
+        let checkout_path = checkout.to_str().context("invalid test worktree path")?;
+        value(&paths, &root, &["init", "-b", "main", repo_path])?;
+        fs::write(repo.join(".gitignore"), "local-data\n")?;
+        value(&paths, &repo, &["add", ".gitignore"])?;
+        let result = run(
+            &paths,
+            &repo,
+            &strings(&["commit", "-m", "Initial commit"]),
+            None,
+            telete_author(),
+        )?;
+        ensure!(result.success(), "initial commit failed: {}", result.stderr);
+        let head = commit(&paths, &repo, "HEAD")?;
+        value(
+            &paths,
+            &repo,
+            &["worktree", "add", "-b", "topic", checkout_path],
+        )?;
+        assert!(development_worktree(&paths, &checkout, &head)?.is_none());
+        record_development_worktree(&paths, &checkout, "topic")?;
+        let worktree = development_worktree(&paths, &checkout, &head)?
+            .context("Telete-owned worktree was not recorded")?;
+
+        let ignored = checkout.join("local-data");
+        fs::write(&ignored, "keep")?;
+        assert!(cleanup_development_worktree(&paths, &repo, &worktree, &head, &head).is_err());
+        assert_eq!(fs::read_to_string(&ignored)?, "keep");
+        assert_eq!(branch_tip(&paths, &repo, "topic")?, head);
+
+        fs::remove_file(ignored)?;
+        cleanup_development_worktree(&paths, &repo, &worktree, &head, &head)?;
+        cleanup_development_worktree(&paths, &repo, &worktree, &head, &head)?;
+        assert!(!checkout.exists());
+        assert!(branch_tip(&paths, &repo, "topic").is_err());
+        Ok(())
+    }
 }

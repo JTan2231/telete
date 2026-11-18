@@ -6,9 +6,10 @@ Telete runs a serial queue for committed repository workflows on macOS. Every
 public command selects a project config. The config owns the source repository,
 commands, parameters, and initial runtime path. The first queue mutation binds
 the Git common directory to one runtime path; all linked worktrees and configs
-then use that shared queue. Worktree creation only creates a Git branch and
-worktree; it does not inspect or change queue state. Create private runtime state
-on demand; no init command or pre-existing state is required.
+then use that shared queue. Worktree creation creates a Git branch and
+worktree and records its ownership in Git metadata. It does not inspect or
+change queue state. Create private runtime state on demand. No init command or
+pre-existing state is required.
 
 Telete manages worker startup and shutdown. Submission runs in the background;
 following only observes work, and interrupting observation does not cancel it.
@@ -21,10 +22,14 @@ Resolve the submitted revision once, defaulting to HEAD. An optional fix command
 runs first and may edit tracked source. Telete commits those edits as a direct
 child with Telete as author and committer. Preserve the submitted identity and
 the resulting checked identity separately. Retain generated commits under normal
-Git refs after scratch cleanup. Run optional analysis, checks, preparation, and deployment on the
-resulting commit. A completed analysis can wait for explicit committed agent
+Git refs after scratch cleanup. Use the resulting commit for checks and release
+composition. A completed analysis can wait for explicit committed agent
 repairs. Waiting releases the queue slot and retains its source and diagnostics.
-Continue accepted repairs after analysis; preserve analyzed and repaired identities. Do not add general integration or project branch updates.
+Continue accepted repairs after analysis and preserve analyzed and repaired identities.
+By default, integrate the prepared release source into the configured local
+branch before deployment. Support manual integration and disabled integration.
+Clean up only Telete-created development worktrees that still safely match
+their submitted work. Preserve a separate successful-deployment identity.
 Preserve stage order and exact command correlation.
 An interrupted command without terminal evidence remains unresolved; recovery
 must not replay uncertain effects.

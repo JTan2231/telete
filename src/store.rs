@@ -90,6 +90,8 @@ pub(crate) enum Phase {
     Composing,
     RepairingMerge,
     Preparing,
+    WaitingMerge,
+    Merging,
     Deploying,
     Blocked,
     Succeeded,
@@ -114,6 +116,8 @@ impl Phase {
             Self::Composing => "composing",
             Self::RepairingMerge => "repairing_merge",
             Self::Preparing => "preparing",
+            Self::WaitingMerge => "waiting_merge",
+            Self::Merging => "merging",
             Self::Deploying => "deploying",
             Self::Blocked => "blocked",
             Self::Succeeded => "succeeded",
@@ -182,6 +186,8 @@ pub(crate) struct ReleaseBatch {
 pub(crate) struct Job {
     pub id: JobId,
     pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_order: Option<u64>,
     pub revision: u64,
     pub phase: Phase,
     pub cancel_requested: bool,
@@ -200,6 +206,16 @@ pub(crate) struct Job {
     pub batch: Option<ReleaseBatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_commit: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_base: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_commit: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge_requested: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_cleanup: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub development_worktree: Option<crate::git::DevelopmentWorktree>,
     pub workflow: Workflow,
     pub runs: Vec<StageRun>,
     pub operation: Option<Operation>,
@@ -251,7 +267,7 @@ impl Job {
                     batch.composition_head.as_ref().unwrap_or(&batch.base)
                 },
             )
-        } else if matches!(stage, "prepare" | "deploy") {
+        } else if matches!(stage, "prepare" | "merge" | "deploy") {
             self.execution_commit()
         } else {
             self.effective_commit()
@@ -277,11 +293,15 @@ impl Job {
                     Phase::RepairingMerge,
                 ),
                 ("prepare", workflow.prepare.is_some(), Phase::Preparing),
+                ("merge", workflow.integration().is_some(), Phase::Merging),
                 ("deploy", workflow.deploy.is_some(), Phase::Deploying),
             ]
             .into_iter()
             .filter(|(stage, requested, _)| {
-                !matches!(*stage, "analyze" | "repair" | "compose" | "merge_repair") || *requested
+                !matches!(
+                    *stage,
+                    "analyze" | "repair" | "compose" | "merge_repair" | "merge"
+                ) || *requested
             })
             .map(|(stage, requested, phase)| {
                 let active = self
@@ -303,6 +323,10 @@ impl Job {
                     "unresolved"
                 } else if composing && active {
                     "running"
+                } else if stage == "merge" && self.merged_commit.is_some() {
+                    "succeeded"
+                } else if stage == "merge" && self.phase == Phase::WaitingMerge {
+                    "waiting"
                 } else if matches!(stage, "repair" | "merge_repair")
                     && stopped
                     && self.outcome == Some(Phase::Failed)
@@ -467,6 +491,23 @@ impl Store {
     }
 
     pub(crate) fn open(root: &Path) -> Result<Self> {
+        let db = Self::connect(
+            root,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+            Duration::from_secs(30),
+        )?;
+        db.execute_batch(
+            "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",
+        )?;
+        Ok(Self { db })
+    }
+
+    pub(crate) fn open_for_scheduler(root: &Path) -> Result<Self> {
+        let db = Self::connect(root, OpenFlags::SQLITE_OPEN_READ_ONLY, Duration::ZERO)?;
+        Ok(Self { db })
+    }
+
+    fn connect(root: &Path, access: OpenFlags, timeout: Duration) -> Result<Connection> {
         ensure!(
             crate::paths::private_directory_exists(root)?,
             "no Telete queue exists"
@@ -482,16 +523,11 @@ impl Store {
         );
         let db = Connection::open_with_flags(
             &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        db.busy_timeout(Duration::from_secs(30))?;
+        db.busy_timeout(timeout)?;
         validate_schema(&db)?;
-        db.execute_batch(
-            "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",
-        )?;
-        Ok(Self { db })
+        Ok(db)
     }
 
     pub(crate) fn transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -599,30 +635,35 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub(crate) fn active(&self) -> Result<Option<Job>> {
-        let active = self
-            .jobs()?
-            .into_iter()
-            .filter(|job| {
-                !job.phase.terminal()
-                    && !matches!(
-                        job.phase,
-                        Phase::Queued | Phase::AwaitingRepair | Phase::WaitingRelease
-                    )
-            })
-            .collect::<Vec<_>>();
-        ensure!(
-            active.len() <= 1,
-            "multiple active Telete jobs; admission is stopped"
-        );
-        Ok(active.into_iter().next())
+    pub(crate) fn has_unfinished_jobs(&self) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE phase NOT IN ('succeeded','failed','cancelled'))",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
-    pub(crate) fn queued(&self) -> Result<Option<Job>> {
-        Ok(self
-            .jobs()?
-            .into_iter()
-            .find(|job| job.phase == Phase::Queued))
+    pub(crate) fn active(&self) -> Result<Option<Job>> {
+        Ok(Self::active_job(&self.jobs()?)?.cloned())
+    }
+
+    pub(crate) fn active_job(jobs: &[Job]) -> Result<Option<&Job>> {
+        let mut active = jobs.iter().filter(|job| {
+            !job.phase.terminal()
+                && !matches!(
+                    job.phase,
+                    Phase::Queued
+                        | Phase::AwaitingRepair
+                        | Phase::WaitingRelease
+                        | Phase::WaitingMerge
+                )
+        });
+        let first = active.next();
+        ensure!(
+            active.next().is_none(),
+            "multiple active Telete jobs; admission is stopped"
+        );
+        Ok(first)
     }
 
     pub(crate) fn cancel(&self, id: &str) -> Result<()> {
@@ -710,6 +751,12 @@ impl Store {
                 }
                 if let Some(commit) = &job.release_commit {
                     source["release_commit"] = serde_json::json!(commit);
+                }
+                if let Some(commit) = &job.merged_commit {
+                    source["merged_commit"] = serde_json::json!(commit);
+                }
+                if !job.merge_cleanup.is_empty() {
+                    source["merge_cleanup"] = serde_json::json!(job.merge_cleanup);
                 }
                 self.set(&format!("result:{}", job.id), &source)?;
             }
@@ -807,6 +854,7 @@ mod tests {
         Ok(Job {
             id: JobId::new(format!("job-{index}"))?,
             sequence: 0,
+            shared_order: None,
             revision: 0,
             phase: Phase::Succeeded,
             cancel_requested: false,
@@ -819,6 +867,11 @@ mod tests {
             release_id: None,
             batch: None,
             release_commit: None,
+            integration_base: None,
+            merged_commit: None,
+            merge_requested: false,
+            merge_cleanup: Vec::new(),
+            development_worktree: None,
             workflow: serde_json::from_value(serde_json::json!({
                 "check": {"program": "/bin/true"},
                 "parameters": {"debug": "private-run-diagnostic-sentinel"},

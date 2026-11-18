@@ -29,7 +29,7 @@ impl Project {
         let state = root.join("state");
         fs::write(
             root.join("telete.json"),
-            r#"{"repo":"repo","state":"state","check":{"program":"/usr/bin/true"}}"#,
+            r#"{"repo":"repo","state":"state","queue":"repository","check":{"program":"/usr/bin/true"}}"#,
         )?;
         Ok(Self {
             _temporary: temporary,
@@ -66,6 +66,14 @@ impl Drop for Project {
             .collect::<Vec<_>>();
         ids.extend(
             status["waiting_release"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|job| job["id"].as_str())
+                .map(str::to_owned),
+        );
+        ids.extend(
+            status["waiting_merge"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -123,7 +131,7 @@ fn git(repo: &Path, args: &[&str]) -> Command {
 
 fn repository(path: &Path, content: &str) -> TestResult<String> {
     fs::create_dir(path)?;
-    checked(git(path, &["init", "--quiet"]))?;
+    checked(git(path, &["init", "--quiet", "--initial-branch=main"]))?;
     fs::write(path.join("source.txt"), content)?;
     checked(git(path, &["add", "source.txt"]))?;
     checked(git(path, &["commit", "--quiet", "-m", "source"]))?;
@@ -202,15 +210,20 @@ fn write_worktree_config(worktree: &Path) -> TestResult<PathBuf> {
     fs::write(
         &config,
         serde_json::to_vec(&json!({
-            "repo": ".", "state": ".telete", "check": {"program": "/usr/bin/true"}
+            "repo": ".", "state": ".telete", "queue": "repository",
+            "check": {"program": "/usr/bin/true"}
         }))?,
     )?;
     Ok(config)
 }
 
 fn commit_source(worktree: &Path, source: &str) -> TestResult<String> {
-    fs::write(worktree.join("source.txt"), source)?;
-    checked(git(worktree, &["add", "source.txt"]))?;
+    commit_file(worktree, "source.txt", source)
+}
+
+fn commit_file(worktree: &Path, file: &str, source: &str) -> TestResult<String> {
+    fs::write(worktree.join(file), source)?;
+    checked(git(worktree, &["add", file]))?;
     checked(git(worktree, &["commit", "--quiet", "-m", source]))?;
     Ok(checked(git(worktree, &["rev-parse", "HEAD"]))?
         .trim()
@@ -287,7 +300,7 @@ fn gated_workflow(project: &Project) -> TestResult {
     fs::write(
         project.root.join("telete.json"),
         serde_json::to_vec(&json!({
-            "repo": "repo", "state": "state", "check": {
+            "repo": "repo", "state": "state", "queue": "repository", "check": {
                 "program": "/bin/sh",
                 "args": ["-c", "set -eu; printf 'started\\n' >> \"$STARTED\"; while [ ! -e \"$RELEASE\" ]; do sleep 0.05; done; printf finished > \"$FINISHED\""],
                 "env": {
@@ -299,6 +312,24 @@ fn gated_workflow(project: &Project) -> TestResult {
             }
         }))?,
     )?;
+    Ok(())
+}
+
+#[test]
+fn status_reports_queue_mode_without_initializing_repository_state() -> TestResult {
+    let project = Project::new()?;
+    let repository_status = checked_json(project.command(&["status"]))?;
+    assert_eq!(repository_status["queue_mode"], "repository");
+
+    let config = project.root.join("default.json");
+    fs::write(
+        &config,
+        r#"{"repo":"repo","state":"state","check":{"program":"/usr/bin/true"}}"#,
+    )?;
+    let global_status = checked_json(configured_command(&project.root, &config, &["status"]))?;
+    assert_eq!(global_status["queue_mode"], "global");
+    assert!(!project.state.exists());
+    assert!(!project.repo.join(".git/telete").exists());
     Ok(())
 }
 
@@ -416,6 +447,7 @@ fn concurrent_first_submissions_publish_one_complete_queue() -> TestResult {
 fn batch_release_workflow(project: &Project) -> TestResult {
     let checked_sources = project.root.join("checked");
     let compositions = project.root.join("compositions");
+    let prepared = project.root.join("prepared");
     let deployments = project.root.join("deployments");
     let compose = r"import json,os,pathlib,subprocess
 c=json.load(open(os.environ['TELETE_CONTEXT']))
@@ -428,10 +460,23 @@ for member in b['members']:
 commit=subprocess.check_output(['/usr/bin/git','rev-parse','HEAD'],env=env,text=True).strip()
 pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\n')
 ";
+    let deploy = r"import json,os,pathlib,subprocess
+c=json.load(open(os.environ['TELETE_CONTEXT']))
+commit=c['source']['commit']
+main=subprocess.check_output(['/usr/bin/git','-C',os.environ['REPO'],'rev-parse','HEAD'],text=True).strip()
+assert main==commit==pathlib.Path(os.environ['PREPARED']).read_text(), (main,commit)
+assert pathlib.Path('previous.txt').read_text()=='previous release'
+for name in ['change-a','change-b']:
+    assert pathlib.Path(name+'.txt').read_text()==name
+    assert not (pathlib.Path(os.environ['DEVELOPMENT'])/name).exists()
+refs=subprocess.check_output(['/usr/bin/git','for-each-ref','--format=%(refname)','refs/heads'],text=True).splitlines()
+assert refs==['refs/heads/main'], refs
+open(os.environ['DEPLOYED'],'a').write(commit+'\n')
+";
     fs::write(
         project.root.join("telete.json"),
         serde_json::to_vec(&json!({
-            "repo":"repo", "state":"state",
+            "repo":"repo", "state":"state", "queue":"repository",
             "check": {
                 "program":"/usr/bin/python3", "timeout_seconds":15,
                 "args":["-c", r"import json,os; c=json.load(open(os.environ['TELETE_CONTEXT'])); open(os.environ['CHECKED'],'a').write(c['source']['commit']+'\n')"],
@@ -444,10 +489,15 @@ pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\n')
                     "args":["-c", compose], "env":{"COMPOSED":compositions}
                 }
             },
+            "prepare": {
+                "program":"/usr/bin/python3", "timeout_seconds":15,
+                "args":["-c", r"import json,os,pathlib; c=json.load(open(os.environ['TELETE_CONTEXT'])); pathlib.Path(os.environ['PREPARED']).write_text(c['source']['commit'])"],
+                "env":{"PREPARED":prepared}
+            },
             "deploy": {
                 "program":"/usr/bin/python3", "timeout_seconds":15,
-                "args":["-c", r"import json,os,pathlib; c=json.load(open(os.environ['TELETE_CONTEXT'])); assert pathlib.Path('change-a.txt').read_text()=='change-a'; assert pathlib.Path('change-b.txt').read_text()=='change-b'; open(os.environ['DEPLOYED'],'a').write(c['source']['commit']+'\n')"],
-                "env":{"DEPLOYED":deployments}
+                "args":["-c", deploy],
+                "env":{"DEPLOYED":deployments,"PREPARED":prepared,"DEVELOPMENT":project.root,"REPO":project.repo}
             }
         }))?,
     )?;
@@ -461,22 +511,31 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
     let compositions = project.root.join("compositions");
     let deployments = project.root.join("deployments");
     batch_release_workflow(&project)?;
+    checked(git(&project.repo, &["switch", "-c", "previous-release"]))?;
+    let previous = commit_file(&project.repo, "previous.txt", "previous release")?;
+    checked(git(
+        &project.repo,
+        &[
+            "update-ref",
+            "refs/telete/releases/targets/production",
+            &previous,
+        ],
+    ))?;
+    checked(git(&project.repo, &["switch", "main"]))?;
+    checked(git(&project.repo, &["branch", "-D", "previous-release"]))?;
     checked(project.command(&["pause"]))?;
     let mut commits = Vec::new();
     let mut ids = Vec::new();
+    let mut workflow: Value = serde_json::from_slice(&fs::read(project.root.join("telete.json"))?)?;
     for name in ["change-a", "change-b"] {
-        checked(git(
-            &project.repo,
-            &["checkout", "--quiet", "-b", name, &project.commit],
-        ))?;
+        checked(project.command(&["worktree", name]))?;
+        let worktree = project.root.join(name);
         let file = format!("{name}.txt");
-        fs::write(project.repo.join(&file), name)?;
-        checked(git(&project.repo, &["add", &file]))?;
-        checked(git(&project.repo, &["commit", "--quiet", "-m", name]))?;
-        let commit = checked(git(&project.repo, &["rev-parse", "HEAD"]))?
-            .trim()
-            .to_owned();
-        let submitted = checked_json(project.command(&["submit", &commit]))?;
+        let commit = commit_file(&worktree, &file, name)?;
+        let config = project.root.join(format!("{name}.json"));
+        workflow["repo"] = json!(name);
+        fs::write(&config, serde_json::to_vec(&workflow)?)?;
+        let submitted = checked_json(configured_command(&worktree, &config, &["submit"]))?;
         commits.push(commit);
         ids.push(submitted["id"].as_str().ok_or("missing job ID")?.to_owned());
     }
@@ -501,6 +560,8 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
     let release = first["job"]["release_commit"]
         .as_str()
         .ok_or("missing release source")?;
+    assert_eq!(first["job"]["merged_commit"], release);
+    assert_eq!(second["job"]["merged_commit"], release);
     assert_eq!(
         fs::read_to_string(checked_sources)?
             .lines()
@@ -512,7 +573,7 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
         fs::read_to_string(deployments)?.lines().collect::<Vec<_>>(),
         vec![release]
     );
-    for commit in &commits {
+    for commit in commits.iter().chain([&previous]) {
         checked(git(
             &project.repo,
             &["merge-base", "--is-ancestor", commit, release],
@@ -532,6 +593,163 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
     assert_eq!(settled["waiting_release"], json!([]));
     assert_eq!(settled["queue"], json!([]));
     assert!(settled["active"].is_null());
+    Ok(())
+}
+
+fn wait_for_prepared_merge(
+    project: &Project,
+    id: &str,
+    previous: Option<&str>,
+) -> TestResult<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = checked_json(project.command(&["status", id]))?;
+        if status["phase"] == "waiting_merge"
+            && let Some(candidate) = status["release_commit"].as_str()
+            && Some(candidate) != previous
+        {
+            return Ok(candidate.to_owned());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not wait for merge: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn automatic_merge_can_retry_after_the_destination_is_clean() -> TestResult {
+    let project = Project::new()?;
+    checked(git(&project.repo, &["switch", "-c", "feature"]))?;
+    let checked_commit = commit_source(&project.repo, "checked source")?;
+    checked(git(&project.repo, &["switch", "main"]))?;
+    fs::write(project.repo.join("source.txt"), "uncommitted main edits")?;
+    let deployed = project.root.join("deployed");
+    fs::write(
+        project.root.join("telete.json"),
+        serde_json::to_vec(&json!({
+            "repo": "repo", "state": "state", "queue": "repository",
+            "check": {"program": "/usr/bin/true"},
+            "deploy": {"program": "/usr/bin/touch", "args": [deployed]}
+        }))?,
+    )?;
+    let receipt = checked_json(project.command(&["submit", &checked_commit]))?;
+    let id = receipt["id"].as_str().ok_or("missing job ID")?;
+    let waiting = bounded_output(spawn(project.command(&["wait", id, "--timeout", "15"]))?)?;
+    assert!(!waiting.status.success());
+    let waiting: Value = serde_json::from_slice(&waiting.stdout)?;
+    assert_eq!(waiting["job"]["phase"], "waiting_merge");
+    assert!(waiting["job"]["last_error"].is_string());
+    assert!(!deployed.exists());
+    assert_eq!(
+        checked(git(&project.repo, &["rev-parse", "HEAD"]))?.trim(),
+        project.commit
+    );
+    assert_eq!(
+        fs::read_to_string(project.repo.join("source.txt"))?,
+        "uncommitted main edits"
+    );
+
+    checked(git(&project.repo, &["restore", "--", "source.txt"]))?;
+    checked(project.command(&["merge", id]))?;
+    let result = checked_json(project.command(&["wait", id]))?;
+    assert!(deployed.exists());
+    assert_eq!(
+        result["job"]["merged_commit"],
+        waiting["job"]["release_commit"]
+    );
+    assert_eq!(
+        checked(git(&project.repo, &["rev-parse", "HEAD"]))?.trim(),
+        checked_commit
+    );
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
+fn manual_merge_waits_for_the_current_candidate_and_preserves_new_work() -> TestResult {
+    let project = Project::new()?;
+    checked(project.command(&["worktree", "manual-change"]))?;
+    let worktree = project.root.join("manual-change");
+    let commit = commit_source(&worktree, "checked source")?;
+    let config = project.root.join("manual.json");
+    let prepared = project.root.join("prepared");
+    let deployment = project.root.join("attempted-deployment");
+    fs::write(
+        &config,
+        serde_json::to_vec(&json!({
+            "repo": "manual-change", "state": "state", "queue": "repository",
+            "check": {"program": "/usr/bin/true"},
+            "integration": {"mode": "manual", "branch": "main"},
+            "prepare": {
+                "program": "/bin/sh",
+                "args": ["-c", "/usr/bin/git rev-parse HEAD >> \"$PREPARED\""],
+                "env": {"PREPARED": prepared}
+            },
+            "deploy": {
+                "program": "/bin/sh",
+                "args": ["-c", "set -eu; /usr/bin/git -C \"$REPO\" rev-parse HEAD > \"$DEPLOYMENT\"; exit 23"],
+                "env": {"REPO": project.repo, "DEPLOYMENT": deployment}
+            }
+        }))?,
+    )?;
+    let receipt = checked_json(configured_command(&worktree, &config, &["submit"]))?;
+    let id = receipt["id"].as_str().ok_or("missing job ID")?;
+    let first = wait_for_prepared_merge(&project, id, None)?;
+    assert!(!deployment.exists());
+    assert_eq!(
+        checked(git(&project.repo, &["rev-parse", "HEAD"]))?.trim(),
+        project.commit
+    );
+    fs::write(worktree.join("source.txt"), "new uncommitted work")?;
+    fs::write(project.repo.join("other.txt"), "another change to main")?;
+    checked(git(&project.repo, &["add", "other.txt"]))?;
+    checked(git(
+        &project.repo,
+        &["commit", "--quiet", "-m", "advance main"],
+    ))?;
+    let moved_main = checked(git(&project.repo, &["rev-parse", "HEAD"]))?;
+
+    checked(project.command(&["merge", id]))?;
+    let second = wait_for_prepared_merge(&project, id, Some(&first))?;
+    assert_eq!(
+        fs::read_to_string(prepared)?,
+        format!("{first}\n{second}\n")
+    );
+    checked(git(
+        &project.repo,
+        &["merge-base", "--is-ancestor", moved_main.trim(), &second],
+    ))?;
+    assert!(!deployment.exists());
+
+    checked(project.command(&["merge", id]))?;
+    let result = bounded_output(spawn(project.command(&["wait", id]))?)?;
+    assert!(!result.status.success());
+    let result: Value = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(result["job"]["phase"], "failed");
+    assert_eq!(result["job"]["stopped_phase"], "deploying");
+    assert_eq!(result["job"]["merged_commit"], second);
+    let main = checked(git(&project.repo, &["rev-parse", "HEAD"]))?;
+    assert_eq!(fs::read_to_string(&deployment)?, main);
+    assert_eq!(main.trim(), second);
+    checked(git(
+        &project.repo,
+        &["merge-base", "--is-ancestor", &commit, main.trim()],
+    ))?;
+    assert_eq!(
+        fs::read_to_string(project.repo.join("source.txt"))?,
+        "checked source"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("source.txt"))?,
+        "new uncommitted work"
+    );
+    assert_eq!(
+        checked(git(&worktree, &["rev-parse", "HEAD"]))?.trim(),
+        commit
+    );
+    wait_for_worker_ownership(&project.state, false)?;
     Ok(())
 }
 
@@ -610,7 +828,8 @@ fn worktrees_share_order_controls_and_frozen_workflows() -> TestResult {
         let commit = commit_source(&worktree, name)?;
         let config = write_worktree_config(&worktree)?;
         let mut workflow = json!({
-            "repo": ".", "state": ".telete", "parameters": {"feature": name}
+            "repo": ".", "state": ".telete", "queue": "repository",
+            "parameters": {"feature": name}, "integration": {"mode": "off"}
         });
         for stage in ["check", "prepare", "deploy"] {
             let output = project.root.join(format!("{name}-{stage}-context.json"));
@@ -633,7 +852,8 @@ fn worktrees_share_order_controls_and_frozen_workflows() -> TestResult {
         fs::write(
             &config,
             serde_json::to_vec(&json!({
-                "repo": ".", "state": ".telete", "check": {"program": "/usr/bin/false"},
+                "repo": ".", "state": ".telete", "queue": "repository",
+                "check": {"program": "/usr/bin/false"},
                 "parameters": {"feature": "changed"}
             }))?,
         )?;
@@ -944,7 +1164,7 @@ fn failed_and_cancelled_jobs_make_wait_unsuccessful() -> TestResult {
     let project = Project::new()?;
     fs::write(
         project.root.join("telete.json"),
-        r#"{"repo":"repo","state":"state","check":{"program":"/usr/bin/false"}}"#,
+        r#"{"repo":"repo","state":"state","queue":"repository","check":{"program":"/usr/bin/false"}}"#,
     )?;
     let receipt = checked(project.command(&["submit"]))?;
     let failed = bounded_output(spawn(project.command(&["wait", job_id(&receipt)?]))?)?;

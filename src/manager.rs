@@ -10,11 +10,15 @@ use serde_json::{Value, json};
 use crate::git;
 use crate::model::{CommitId, JobId};
 use crate::paths::Paths;
+use crate::shared_queue::{Candidate, Queue, Slot};
 use crate::store::{self, Cleanup, Config, Job, Operation, Phase, Store};
-use crate::workflow::{ProjectConfig, StageRun, Workflow};
+use crate::workflow::{ProjectConfig, QueueMode, StageRun, Workflow};
 
 #[path = "batch_manager.rs"]
 mod batch_manager;
+#[path = "integration_manager.rs"]
+mod integration_manager;
+pub(crate) use integration_manager::request_merge as merge;
 #[path = "workflow_manager.rs"]
 mod workflow_manager;
 
@@ -38,7 +42,20 @@ pub(crate) fn submit(
     paths: &Paths,
     repo: &Path,
     revision: &str,
+    workflow: Workflow,
+    mode: QueueMode,
+) -> Result<Value> {
+    let shared = shared_queue(mode, true)?;
+    submit_in(paths, repo, revision, workflow, mode, shared.as_ref())
+}
+
+fn submit_in(
+    paths: &Paths,
+    repo: &Path,
+    revision: &str,
     mut workflow: Workflow,
+    mode: QueueMode,
+    shared: Option<&Queue>,
 ) -> Result<Value> {
     workflow.validate()?;
     let (store, config) = configured(paths)?;
@@ -47,16 +64,41 @@ pub(crate) fn submit(
         "submit must select a checkout of the configured Git repository"
     );
     let commit = git::commit(paths, repo, revision)?;
+    if let Some(integration) = workflow.integration() {
+        git::branch_tip(paths, repo, &integration.branch)?;
+    }
     if let Some(batch) = &mut workflow.batch {
         batch.base = git::commit(paths, repo, &batch.base)?.0;
     }
     let _admission = store::lock(&paths.root.join("admission.lock"), true)?;
-    let job = new_job(
+    ensure!(
+        !store.has_unfinished_jobs()? || queue_mode(&store)? == mode,
+        "repository queue mode cannot change while it has unfinished work"
+    );
+    let mut job = new_job(
         JobId::new(uuid::Uuid::now_v7().to_string())?,
         commit,
         workflow,
     );
-    let mut admitted = store.transaction(|| store.insert(&job))?;
+    if job.workflow.integration().is_some() {
+        job.development_worktree = git::development_worktree(paths, repo, &job.commit)?;
+    }
+    let insert = |job: &Job| {
+        store.transaction(|| {
+            store.set("queue_mode", &mode)?;
+            store.insert(job)
+        })
+    };
+    let mut admitted = if mode == QueueMode::Global {
+        shared
+            .context("shared queue state is missing")?
+            .enqueue(paths, |order| {
+                job.shared_order = Some(order);
+                insert(&job)
+            })?
+    } else {
+        insert(&job)?
+    };
     // A queued record makes interrupted admission visible. Retain its commit
     // and private checkout before acknowledging admission, so removing the
     // submitting development worktree does not affect accepted work.
@@ -101,6 +143,7 @@ fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
     Job {
         id,
         sequence: 0,
+        shared_order: None,
         revision: 0,
         phase: Phase::Queued,
         cancel_requested: false,
@@ -113,6 +156,11 @@ fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
         release_id: None,
         batch: None,
         release_commit: None,
+        integration_base: None,
+        merged_commit: None,
+        merge_requested: false,
+        merge_cleanup: Vec::new(),
+        development_worktree: None,
         workflow,
         runs: Vec::new(),
         operation: None,
@@ -125,18 +173,90 @@ fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
     }
 }
 
+fn queue_mode(store: &Store) -> Result<QueueMode> {
+    // Jobs admitted by older versions have no shared order and drain in
+    // repository mode before this repository can use the shared queue.
+    Ok(store.get("queue_mode")?.unwrap_or(QueueMode::Repository))
+}
+
+fn shared_queue(mode: QueueMode, create: bool) -> Result<Option<Queue>> {
+    if mode == QueueMode::Global {
+        return Queue::open(create);
+    }
+    Ok(None)
+}
+
+pub(crate) fn project_status(
+    paths: &Paths,
+    id: Option<&str>,
+    selected: QueueMode,
+) -> Result<Value> {
+    let mut value = status(paths, id)?;
+    if id.is_some() {
+        return Ok(value);
+    }
+    let store = store::probe_config(&paths.root)?
+        .map(|_| Store::open(&paths.root))
+        .transpose()?;
+    let mode = if let Some(store) = &store {
+        store
+            .get("queue_mode")?
+            .unwrap_or(if store.has_unfinished_jobs()? {
+                QueueMode::Repository
+            } else {
+                selected
+            })
+    } else {
+        selected
+    };
+    value["queue_mode"] = json!(mode);
+    if mode == QueueMode::Global {
+        let holder = match shared_queue(mode, false)? {
+            Some(queue) => queue.holder()?,
+            None => None,
+        };
+        let waiting = if let Some(store) = &store {
+            holder
+                .as_ref()
+                .is_some_and(|holder| holder.root != paths.root)
+                && next_job(store, mode)?.is_some()
+        } else {
+            false
+        };
+        value["shared_slot"] =
+            json!(holder.map(|holder| json!({"state_root":holder.root,"job":holder.job})));
+        value["waiting_for_shared_slot"] = json!(waiting);
+    }
+    Ok(value)
+}
+
 fn job_status(store: &Store, id: &str) -> Result<Value> {
     if let Some(completion) = store.completion(id)? {
         return Ok(completion);
     }
-    store.job(id)?.output()
+    let job = store.job(id)?;
+    let mut output = job.output()?;
+    if job.phase == Phase::WaitingRelease
+        && let Some(release) = &job.release_id
+        && *release != job.id
+    {
+        let leader = store.job(&release.0)?;
+        output["release_phase"] = json!(leader.phase);
+        if let Some(commit) = leader.merged_commit {
+            output["merged_commit"] = json!(commit);
+        }
+        if leader.phase == Phase::WaitingMerge {
+            output["merge_requested"] = json!(leader.merge_requested);
+        }
+    }
+    Ok(output)
 }
 
 pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
     if store::probe_config(&paths.root)?.is_none() {
         ensure!(id.is_none(), "no retained result for this job");
         return Ok(json!({"schema_version":3,"paused":false,"active":null,
-            "queue":[],"awaiting_repair":[],"waiting_release":[],"failure":null,"completions":[],"maintenance_owners":[]}));
+            "queue":[],"awaiting_repair":[],"waiting_release":[],"waiting_merge":[],"failure":null,"completions":[],"maintenance_owners":[]}));
     }
     let (store, config) = configured(paths)?;
     if let Some(id) = id {
@@ -164,11 +284,17 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
         .filter(|job| job.phase == Phase::WaitingRelease)
         .map(Job::output)
         .collect::<Result<Vec<_>>>()?;
+    let waiting_merge = jobs
+        .iter()
+        .filter(|job| job.phase == Phase::WaitingMerge)
+        .map(Job::output)
+        .collect::<Result<Vec<_>>>()?;
     Ok(
         json!({"schema_version":3,"version":env!("CARGO_PKG_VERSION"),
         "paused":store.paused()?,"config":config,
         "active":store.active()?.map(|job|job.output()).transpose()?,
         "queue":queue,"awaiting_repair":awaiting_repair,"waiting_release":waiting_release,
+        "waiting_merge":waiting_merge,
         "failure":failure,"completions":store.completion_list()?,
         "maintenance_owners":store.holds()?}),
     )
@@ -183,7 +309,9 @@ pub(crate) async fn wait(paths: &Paths, id: &str, timeout_seconds: Option<u64>) 
         if matches!(
             phase,
             "succeeded" | "failed" | "cancelled" | "blocked" | "awaiting_repair"
-        ) {
+        ) || ((phase == "waiting_merge" || value["release_phase"] == "waiting_merge")
+            && value["merge_requested"] != true)
+        {
             return Ok(json!({"observation":"terminal","job":value}));
         }
         if timeout_seconds.is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
@@ -248,7 +376,7 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
         store.cancel(id)?;
         if matches!(
             job.phase,
-            Phase::Queued | Phase::AwaitingRepair | Phase::WaitingRelease
+            Phase::Queued | Phase::AwaitingRepair | Phase::WaitingRelease | Phase::WaitingMerge
         ) {
             job.cancel_requested = true;
             job.phase = Phase::Cancelled;
@@ -363,7 +491,15 @@ fn accept_repair(
     queued.outcome = None;
     queued.outcome_message = None;
     queued.last_error = None;
-    store.save(&mut queued)?;
+    if job.phase == Phase::AwaitingRepair && queue_mode(store)? == QueueMode::Global {
+        let shared = Queue::open(false)?.context("shared queue state is missing")?;
+        shared.enqueue(paths, |order| {
+            queued.shared_order = Some(order);
+            store.save(&mut queued)
+        })?;
+    } else {
+        store.save(&mut queued)?;
+    }
     *job = queued;
     Ok(())
 }
@@ -434,11 +570,7 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
         ),
         "blocked job has no command to reconcile"
     );
-    let mut worker = Worker {
-        paths,
-        store,
-        config,
-    };
+    let mut worker = Worker::new(paths, store, config);
     worker.reconcile_workflow(&job)?;
     job.phase = phase;
     job.outcome = None;
@@ -446,7 +578,9 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
     job.unresolved = false;
     job.last_error = None;
     worker.store.save(&mut job)?;
-    worker.tick()?;
+    if queue_mode(&worker.store)? == QueueMode::Repository {
+        worker.tick()?;
+    }
     job_status(&worker.store, id)
 }
 
@@ -454,30 +588,21 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
 pub(crate) fn worker_once(paths: &Paths) -> Result<Value> {
     let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
     let (store, config) = configured(paths)?;
-    Worker {
-        paths,
-        store,
-        config,
-    }
-    .tick()
+    Worker::new(paths, store, config).tick()
 }
 
 pub(crate) async fn worker(paths: &Paths) -> Result<()> {
     let owner = store::lock(&paths.root.join("runner.lock"), true)?;
     owner.close_on_exec()?;
     let (store, config) = configured(paths)?;
-    let mut worker = Worker {
-        paths,
-        store,
-        config,
-    };
+    let mut worker = Worker::new(paths, store, config);
     loop {
         {
             // Keep this lock inheritable: after a worker crash, an admitted
             // command must settle before replacement or recovery takes over.
             let _execution = store::lock(&paths.root.join("worker.lock"), true)?;
             worker.tick()?;
-            if !needs_worker(paths)? {
+            if !needs_worker_in(&worker.store)? {
                 return Ok(());
             }
         }
@@ -489,6 +614,10 @@ pub(crate) async fn worker(paths: &Paths) -> Result<()> {
 /// records still need cleanup before the runtime may stop.
 pub(crate) fn needs_worker(paths: &Paths) -> Result<bool> {
     let (store, _) = configured(paths)?;
+    needs_worker_in(&store)
+}
+
+fn needs_worker_in(store: &Store) -> Result<bool> {
     let latest = store.get::<u64>("latest_finished_sequence")?;
     let jobs = store.jobs()?;
     Ok(jobs.iter().any(|job| {
@@ -505,13 +634,83 @@ pub(crate) fn needs_worker(paths: &Paths) -> Result<bool> {
     }))
 }
 
+fn next_job(store: &Store, mode: QueueMode) -> Result<Option<Job>> {
+    let jobs = store.jobs()?;
+    if let Some(job) = Store::active_job(&jobs)? {
+        return Ok(
+            (mode == QueueMode::Repository || job.phase != Phase::Blocked).then(|| job.clone()),
+        );
+    }
+    if store.paused()? || !store.holds()?.is_empty() {
+        return Ok(None);
+    }
+    let releases = Worker::ready_releases(&jobs)?;
+    let merges = jobs
+        .iter()
+        .filter(|job| job.phase == Phase::WaitingMerge && job.merge_requested)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut queued = jobs.into_iter().filter(|job| job.phase == Phase::Queued);
+    if mode == QueueMode::Repository {
+        return Ok(merges
+            .into_iter()
+            .chain(releases)
+            .next()
+            .or_else(|| queued.next()));
+    }
+    Ok(releases
+        .into_iter()
+        .chain(merges)
+        .chain(queued)
+        .min_by_key(|job| job.shared_order))
+}
+
+fn ready_candidate(job: &Job) -> Result<Candidate> {
+    Ok(Candidate::Ready {
+        job: job.id.clone(),
+        order: job.shared_order.context("global job has no shared order")?,
+    })
+}
+
+fn shared_candidate(paths: &Paths) -> Result<Candidate> {
+    if !crate::paths::private_directory_exists(&paths.root)? {
+        return Ok(Candidate::Idle);
+    }
+    let store = Store::open_for_scheduler(&paths.root)?;
+    if queue_mode(&store)? != QueueMode::Global || !store.has_unfinished_jobs()? {
+        return Ok(Candidate::Idle);
+    }
+    // A worker can outlive its supervisor. A repository with neither owner
+    // remains registered, but cannot take the next turn until restarted.
+    if let Some(_runner) = crate::paths::try_lock(&paths.root.join("runner.lock"))?
+        && let Some(_supervisor) = crate::paths::try_lock(&paths.root.join("supervisor.lock"))?
+    {
+        return Ok(Candidate::Pending);
+    }
+    next_job(&store, QueueMode::Global)?
+        .as_ref()
+        .map_or(Ok(Candidate::Pending), ready_candidate)
+}
+
 struct Worker<'a> {
     paths: &'a Paths,
     store: Store,
     config: Config,
+    shared: Option<Queue>,
+    slot: Option<Slot>,
 }
 
 impl Worker<'_> {
+    fn new(paths: &Paths, store: Store, config: Config) -> Worker<'_> {
+        Worker {
+            paths,
+            store,
+            config,
+            shared: None,
+            slot: None,
+        }
+    }
+
     fn directory(&self, job: &Job) -> Result<PathBuf> {
         let directory = self.paths.job(&job.id.0);
         store::private_directory(&directory)?;
@@ -527,33 +726,67 @@ impl Worker<'_> {
         self.store.save(job)
     }
 
-    fn claim(&self) -> Result<Option<Job>> {
+    fn claim(&mut self) -> Result<Option<Job>> {
         let _admission = store::lock(&self.paths.root.join("admission.lock"), true)?;
-        self.store.transaction(|| {
-            if let Some(job) = self.store.active()? {
-                return Ok(Some(job));
+        let mode = queue_mode(&self.store)?;
+        let next = next_job(&self.store, mode)?;
+        if self.slot.as_ref().is_some_and(|slot| {
+            mode != QueueMode::Global || next.as_ref().is_none_or(|job| slot.job() != &job.id)
+        }) {
+            self.release_slot()?;
+        }
+        let Some(mut job) = next else {
+            return Ok(None);
+        };
+        if mode == QueueMode::Global && self.slot.is_none() {
+            if self.shared.is_none() {
+                self.shared = Queue::open(false)?;
             }
-            if self.store.paused()? || !self.store.holds()?.is_empty() {
+            let shared = self
+                .shared
+                .as_ref()
+                .context("shared queue state is missing")?;
+            self.slot = shared.try_claim(self.paths, &job.id, |paths| {
+                if paths.root == self.paths.root {
+                    return ready_candidate(&job);
+                }
+                // This repository will report its own state errors. It cannot
+                // take a turn while its readiness cannot be read.
+                Ok(shared_candidate(paths).unwrap_or(Candidate::Pending))
+            })?;
+            if self.slot.is_none() {
                 return Ok(None);
             }
-            if let Some(job) = self.claim_release()? {
-                return Ok(Some(job));
-            }
-            let Some(mut job) = self.store.queued()? else {
-                return Ok(None);
-            };
+        }
+        if job.phase == Phase::Queued {
             self.save(&mut job, Phase::Starting)?;
-            Ok(Some(job))
-        })
+        } else if job.phase == Phase::WaitingMerge {
+            self.save(&mut job, Phase::Merging)?;
+        } else if job.phase == Phase::WaitingRelease
+            && let Err(error) = self.claim_release(&mut job)
+        {
+            let message = format!("Could not start shared release: {error:#}");
+            job.last_error = Some(message.clone());
+            self.finish(&mut job, Phase::Failed, message, false)?;
+        }
+        Ok(Some(job))
+    }
+
+    fn release_slot(&mut self) -> Result<()> {
+        if let Some(slot) = self.slot.take() {
+            slot.release()?;
+        }
+        Ok(())
     }
 
     fn tick(&mut self) -> Result<Value> {
         self.settle_releases()?;
         self.cleanup_settled()?;
         let Some(mut job) = self.claim()? else {
+            self.forget_idle()?;
             return Ok(json!({"state":"idle","paused":self.store.paused()?}));
         };
-        if job.phase != Phase::Blocked
+        if !job.phase.terminal()
             && let Err(error) = self.step(&mut job)
         {
             let message = format!("{error:#}");
@@ -561,9 +794,32 @@ impl Worker<'_> {
             let unresolved = job.operation.is_some();
             self.finish(&mut job, Phase::Failed, message, unresolved)?;
         }
+        if job.phase.terminal()
+            || matches!(
+                job.phase,
+                Phase::Blocked
+                    | Phase::AwaitingRepair
+                    | Phase::WaitingRelease
+                    | Phase::WaitingMerge
+            )
+        {
+            self.release_slot()?;
+        }
         self.settle_releases()?;
         self.cleanup_settled()?;
+        if job.phase.terminal() {
+            self.forget_idle()?;
+        }
         job_status(&self.store, &job.id.0)
+    }
+
+    fn forget_idle(&self) -> Result<()> {
+        if let Some(shared) = &self.shared
+            && !self.store.has_unfinished_jobs()?
+        {
+            shared.forget_idle(self.paths, || Ok(!self.store.has_unfinished_jobs()?))?;
+        }
+        Ok(())
     }
 
     fn step(&self, job: &mut Job) -> Result<()> {
@@ -612,6 +868,7 @@ impl Worker<'_> {
             Phase::Composing => self.workflow_stage(job, "compose"),
             Phase::RepairingMerge => self.workflow_stage(job, "merge_repair"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
+            Phase::Merging => self.integrate(job),
             Phase::Deploying => self.workflow_stage(job, "deploy"),
             Phase::Blocked => Ok(()),
             _ => bail!("unexpected active phase: {:?}", job.phase),
@@ -751,4 +1008,82 @@ mod tests {
 
     include!("workflow_tests.rs");
     include!("batch_tests.rs");
+
+    #[test]
+    fn default_repositories_share_one_slot_across_workflow_stages() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let shared = Queue::at(root.join("shared"), true)?.context("test shared queue")?;
+        let (_a, mut first, base) = fixture()?;
+        batch_workflow(&mut first, &base);
+        let (_b, second, _) = fixture()?;
+        let (_c, independent, _) = fixture()?;
+        let a = select(&first, true)?;
+        let b = select(&second, true)?;
+        for (paths, project) in [(&a, &first), (&b, &second)] {
+            submit_in(
+                paths,
+                &project.repo,
+                "HEAD",
+                project.workflow.clone(),
+                QueueMode::Global,
+                Some(&shared),
+            )?;
+        }
+        let (c, independent_job) = enqueue(&independent, "HEAD")?;
+        let _runner_a = store::lock(&a.root.join("runner.lock"), false)?;
+        let _runner_b = store::lock(&b.root.join("runner.lock"), false)?;
+        let _worker_a = store::lock(&a.root.join("worker.lock"), false)?;
+        let _worker_b = store::lock(&b.root.join("worker.lock"), false)?;
+        let (store_a, config_a) = configured(&a)?;
+        let (store_b, config_b) = configured(&b)?;
+        let mut worker_a = Worker::new(&a, store_a, config_a);
+        let mut worker_b = Worker::new(&b, store_b, config_b);
+        worker_a.shared = Queue::at(root.join("shared"), false)?;
+        worker_b.shared = Queue::at(root.join("shared"), false)?;
+
+        assert_eq!(worker_b.tick()?["state"], "idle");
+        assert_eq!(worker_a.tick()?["phase"], "checking");
+        assert_eq!(worker_b.tick()?["state"], "idle");
+        assert_eq!(finish_run(&c, &independent_job)?["phase"], "succeeded");
+        for phase in ["composing", "preparing", "deploying"] {
+            assert_eq!(worker_a.tick()?["phase"], phase);
+            assert_eq!(worker_b.tick()?["state"], "idle");
+        }
+        assert_eq!(worker_a.tick()?["phase"], "succeeded");
+        assert_eq!(worker_b.tick()?["phase"], "checking");
+        assert_eq!(worker_b.tick()?["phase"], "succeeded");
+        assert!(shared.holder()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_repository_can_change_queue_mode_after_its_work_settles() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let shared = Queue::at(root.join("shared"), true)?.context("test shared queue")?;
+        let (_repository, project, _) = fixture()?;
+        let (paths, repository_job) = enqueue(&project, "HEAD")?;
+        let submit_global = || {
+            submit_in(
+                &paths,
+                &project.repo,
+                "HEAD",
+                project.workflow.clone(),
+                QueueMode::Global,
+                Some(&shared),
+            )
+        };
+        let error = submit_global().expect_err("unfinished jobs keep their queue mode");
+        assert!(error.to_string().contains("cannot change"));
+        assert_eq!(finish_run(&paths, &repository_job)?["phase"], "succeeded");
+        assert_eq!(submit_global()?["phase"], "queued");
+        let (store, config) = configured(&paths)?;
+        let _worker = store::lock(&paths.root.join("worker.lock"), false)?;
+        let mut worker = Worker::new(&paths, store, config);
+        worker.shared = Some(shared);
+        assert_eq!(worker.tick()?["phase"], "checking");
+        assert_eq!(worker.tick()?["phase"], "succeeded");
+        Ok(())
+    }
 }

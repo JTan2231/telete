@@ -11,6 +11,7 @@ fn compatible(left: &Job, right: &Job) -> bool {
                 && left_batch.merge_repair == right_batch.merge_repair
                 && left.workflow.prepare == right.workflow.prepare
                 && left.workflow.deploy == right.workflow.deploy
+                && left.workflow.integration() == right.workflow.integration()
                 && left.workflow.parameters == right.workflow.parameters
         }
         _ => false,
@@ -19,82 +20,96 @@ fn compatible(left: &Job, right: &Job) -> bool {
 
 impl Worker<'_> {
     pub(super) fn defer_release(&self, job: &mut Job) -> Result<()> {
-        if job.resulting_commit.is_none() {
-            let checked = job.effective_commit().clone();
-            git::advance(
-                self.paths,
-                &self.config.common_git_dir,
-                &git::result_ref(&job.id.0)?,
-                None,
-                &checked,
-            )?;
-            job.resulting_commit = Some(checked);
-        }
+        self.retain_checked(job)?;
         let _admission = store::lock(&self.paths.root.join("admission.lock"), true)?;
-        self.store.transaction(|| {
-            if self.store.job(&job.id.0)?.cancel_requested {
-                job.cancel_requested = true;
-                return self.finish(
-                    job,
-                    Phase::Cancelled,
-                    "Cancelled before release grouping".into(),
-                    false,
-                );
-            }
-            if job.release_id.is_none() {
-                let selected = job.workflow.batch.as_ref().context("batch not selected")?;
-                let base = CommitId::new(selected.base.clone())?;
-                let jobs = self.store.jobs()?;
-                // An incompatible request for this target is an ordering
-                // boundary. Other targets and CI-only jobs remain independent.
-                let mut candidates = Vec::new();
-                for member in jobs {
-                    if member.phase.terminal()
-                        || member.cancel_requested
-                        || member
-                            .workflow
-                            .batch
-                            .as_ref()
-                            .is_none_or(|batch| batch.target != selected.target)
-                    {
-                        continue;
-                    }
-                    if member.release_id.is_some() || !compatible(job, &member) {
-                        if candidates.iter().any(|member: &Job| member.id == job.id) {
-                            break;
+        let global = job.shared_order.is_some();
+        let mut defer = |order| {
+            self.store.transaction(|| {
+                if self.store.job(&job.id.0)?.cancel_requested {
+                    job.cancel_requested = true;
+                    return self.finish(
+                        job,
+                        Phase::Cancelled,
+                        "Cancelled before release grouping".into(),
+                        false,
+                    );
+                }
+                if job.release_id.is_none() {
+                    let selected = job.workflow.batch.as_ref().context("batch not selected")?;
+                    let base = CommitId::new(selected.base.clone())?;
+                    let jobs = self.store.jobs()?;
+                    // An incompatible request for this target is an ordering
+                    // boundary. Other targets and CI-only jobs remain independent.
+                    let mut candidates = Vec::new();
+                    for member in jobs {
+                        if member.phase.terminal()
+                            || member.cancel_requested
+                            || member
+                                .workflow
+                                .batch
+                                .as_ref()
+                                .is_none_or(|batch| batch.target != selected.target)
+                        {
+                            continue;
                         }
-                        candidates.clear();
-                    } else {
-                        candidates.push(member);
+                        if member.release_id.is_some() || !compatible(job, &member) {
+                            if candidates.iter().any(|member: &Job| member.id == job.id) {
+                                break;
+                            }
+                            candidates.clear();
+                        } else {
+                            candidates.push(member);
+                        }
                     }
-                }
-                let mut members = Vec::new();
-                for mut member in candidates {
-                    if member.id == job.id {
-                        members.push(job.id.clone());
-                    } else {
-                        members.push(member.id.clone());
-                        member.release_id = Some(job.id.clone());
-                        self.store.save(&mut member)?;
+                    let mut members = Vec::new();
+                    for mut member in candidates {
+                        if member.id == job.id {
+                            members.push(job.id.clone());
+                        } else {
+                            members.push(member.id.clone());
+                            member.release_id = Some(job.id.clone());
+                            self.store.save(&mut member)?;
+                        }
                     }
+                    job.release_id = Some(job.id.clone());
+                    job.batch = Some(ReleaseBatch {
+                        members,
+                        base,
+                        commit: None,
+                        composition_head: None,
+                        merge_conflict: None,
+                    });
                 }
-                job.release_id = Some(job.id.clone());
-                job.batch = Some(ReleaseBatch {
-                    members,
-                    base,
-                    commit: None,
-                    composition_head: None,
-                    merge_conflict: None,
-                });
+                job.shared_order = order;
+                self.save(job, Phase::WaitingRelease)
+            })
+        };
+        if global {
+            let shared = self
+                .shared
+                .as_ref()
+                .context("shared queue state is missing")?;
+            shared.enqueue(self.paths, |order| defer(Some(order)))?;
+            if job.phase == Phase::WaitingRelease
+                && job
+                    .batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.members.len() == 1)
+                && Self::ready_releases(&self.store.jobs()?)?
+                    .iter()
+                    .any(|ready| ready.id == job.id)
+            {
+                self.claim_release(job)?;
             }
-            self.save(job, Phase::WaitingRelease)
-        })
+            Ok(())
+        } else {
+            defer(None)
+        }
     }
 
-    /// Called under the admission lock and transaction. Closed membership never
-    /// grows while the selected jobs finish their own CI.
-    pub(super) fn claim_release(&self) -> Result<Option<Job>> {
-        let jobs = self.store.jobs()?;
+    /// Closed membership never grows while the selected jobs finish their CI.
+    pub(super) fn ready_releases(jobs: &[Job]) -> Result<Vec<Job>> {
+        let mut releases = Vec::new();
         for mut leader in jobs.iter().filter(|job| job.batch.is_some()).cloned() {
             if leader.phase != Phase::WaitingRelease {
                 continue;
@@ -133,35 +148,58 @@ impl Worker<'_> {
             if !ready {
                 continue;
             }
-            // The previous group may have deployed after this group closed.
-            // Fix the cumulative base before creating any command identity.
-            if let Some(base) = git::ref_value(
-                self.paths,
-                &self.config.common_git_dir,
-                &git::release_target_ref(&selected.target)?,
-            )? {
-                leader
-                    .batch
-                    .as_mut()
-                    .context("release has no membership")?
-                    .base = base;
-            }
-            let base = leader
-                .batch
-                .as_ref()
-                .context("release has no membership")?
-                .base
-                .clone();
-            git::ensure_worktree(
-                self.paths,
-                &self.config.common_git_dir,
-                &self.worktree(&leader),
-                &base,
-            )?;
-            self.save(&mut leader, Phase::Composing)?;
-            return Ok(Some(leader));
+            // The last member to finish makes composition ready at its turn.
+            leader.shared_order = jobs
+                .iter()
+                .filter(|member| batch.members.contains(&member.id))
+                .filter_map(|member| member.shared_order)
+                .max();
+            releases.push(leader);
         }
-        Ok(None)
+        Ok(releases)
+    }
+
+    /// Select the cumulative base before creating any command identity.
+    pub(super) fn claim_release(&self, leader: &mut Job) -> Result<()> {
+        let selected = leader
+            .workflow
+            .batch
+            .as_ref()
+            .context("batch not selected")?;
+        let batch = leader.batch.as_mut().context("release has no membership")?;
+        if let Some(base) = git::ref_value(
+            self.paths,
+            &self.config.common_git_dir,
+            &git::release_target_ref(&selected.target)?,
+        )? {
+            batch.base = base;
+        }
+        let base = batch.base.clone();
+        let repo = &self.config.common_git_dir;
+        let branch_tip = leader
+            .workflow
+            .integration()
+            .map(|integration| git::branch_tip(self.paths, repo, &integration.branch))
+            .transpose()?;
+        let checkout = self.worktree(leader);
+        git::ensure_worktree(
+            self.paths,
+            repo,
+            &checkout,
+            branch_tip.as_ref().unwrap_or(&base),
+        )?;
+        let batch = leader.batch.as_mut().context("release has no membership")?;
+        batch.composition_head = if branch_tip.is_some() {
+            git::merge_worktree_source(self.paths, repo, &checkout, &base)
+                .context("could not combine the integration branch with the preceding release")?;
+            Some(git::commit(self.paths, &checkout, "HEAD")?)
+        } else {
+            None
+        };
+        batch.merge_conflict = None;
+        leader.integration_base = branch_tip;
+        leader.release_commit = None;
+        self.save(leader, Phase::Composing)
     }
 
     pub(super) fn batch_input(&self, job: &Job) -> Result<serde_json::Value> {
@@ -214,8 +252,11 @@ impl Worker<'_> {
             &self.config.common_git_dir,
             &self.worktree(job),
             &job.id.0,
-            batch.composition_head.as_ref().unwrap_or(&batch.base),
-            &members,
+            std::iter::once(&batch.base)
+                .chain(&batch.composition_head)
+                .chain(&job.integration_base)
+                .chain(&members),
+            batch.commit.as_ref(),
             &commit,
         )?;
         job.batch
@@ -335,7 +376,10 @@ impl Worker<'_> {
                     || (!job.phase.terminal()
                         && !matches!(
                             job.phase,
-                            Phase::WaitingRelease | Phase::Queued | Phase::AwaitingRepair
+                            Phase::WaitingRelease
+                                | Phase::Queued
+                                | Phase::AwaitingRepair
+                                | Phase::WaitingMerge
                         ))
             }) {
                 continue;
@@ -376,6 +420,8 @@ impl Worker<'_> {
                         continue;
                     }
                     member.release_commit.clone_from(&leader.release_commit);
+                    member.merged_commit.clone_from(&leader.merged_commit);
+                    member.merge_cleanup.clone_from(&leader.merge_cleanup);
                     self.finish(
                         &mut member,
                         leader.phase,

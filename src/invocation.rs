@@ -38,6 +38,7 @@ pub(crate) fn bind(
         || job.workflow.analyze.is_some()
         || job.workflow.repair.is_some()
         || job.workflow.batch.is_some()
+        || job.workflow.integration().is_some()
     {
         source["submitted_commit"] = json!(job.commit);
         source["result_ref"] = json!(crate::git::result_ref(&job.id.0)?);
@@ -53,6 +54,10 @@ pub(crate) fn bind(
     }
     if let Some(release) = &job.release_id {
         source["release_id"] = json!(release);
+    }
+    if job.release_id.is_some()
+        || (job.workflow.integration().is_some() && matches!(stage, "prepare" | "deploy"))
+    {
         source["checked_commit"] = json!(job.effective_commit());
     }
     command.context = Some(CommandContext {

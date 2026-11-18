@@ -9,7 +9,13 @@ impl Worker<'_> {
         let preparation = job
             .runs
             .iter()
-            .find(|run| run.stage == "prepare" && run.result.success())
+            .rev()
+            .find(|run| {
+                stage == "deploy"
+                    && run.stage == "prepare"
+                    && run.commit == *job.execution_commit()
+                    && run.result.success()
+            })
             .and_then(|run| run.command.context.as_ref())
             .map(|context| context.value["outputs"]["directory"].clone());
         let fix = job
@@ -210,6 +216,9 @@ impl Worker<'_> {
         } else {
             None
         };
+        if stage == "deploy" && job.operation.is_none() {
+            self.confirm_integration(job)?;
+        }
         if self.begin_operation(job, operation.clone(), result_path.clone())? {
             broker::run(self.paths, &Self::workflow_key(job, &operation), &command)?;
         }
@@ -255,6 +264,7 @@ impl Worker<'_> {
             || job.workflow.analyze.is_some()
             || job.workflow.repair.is_some()
             || job.workflow.batch.is_some()
+            || job.workflow.integration().is_some()
         {
             crate::git::unchanged(self.paths, &self.worktree(job), job.execution_commit())?;
         }
@@ -324,10 +334,16 @@ impl Worker<'_> {
         if stage == "check" && job.workflow.batch.is_some() {
             return self.defer_release(job);
         }
+        if stage == "check" && job.workflow.integration().is_some() {
+            return self.compose_single(job);
+        }
         if matches!(stage, "check" | "compose") && job.workflow.prepare.is_some() {
             return self.save(job, Phase::Preparing);
         }
         if stage != "deploy" && job.workflow.deploy.is_some() {
+            if job.workflow.integration().is_some() {
+                return self.ready_to_merge(job);
+            }
             return self.save(job, Phase::Deploying);
         }
         self.finish(

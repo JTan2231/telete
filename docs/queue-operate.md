@@ -1,10 +1,10 @@
 # Operate Telete
 
-Telete runs a serial queue for committed repository source on macOS. The project
-config selects one required check command and optional fix, analysis, repair,
-preparation, and deployment commands. Telete owns the queue and execution
-records. Configured commands own the meaning of their checks, outputs, and
-deployment effects.
+Telete runs committed repository workflows on macOS. By default, projects
+under the same macOS account share one serial queue. The project config selects
+one required check command and optional fix, analysis, repair, preparation, and
+deployment commands. Telete owns scheduling and execution records. Configured
+commands own the meaning of their checks, outputs, and deployment effects.
 
 ## Select a project
 
@@ -63,9 +63,37 @@ against the invocation's current directory. The branch name is the destination's
 last normalized path component and must be a valid literal Git branch name:
 `../feature-a` creates `feature-a`. An existing destination or branch is an
 error; Telete does not adopt an existing worktree. Uncommitted
-changes stay in the source checkout. This command uses Git alone: it does not
-submit work, inspect runtime state, bind a queue, or coordinate with a worker.
-Its result contains only `path`, `branch`, and `commit`.
+changes stay in the source checkout. Telete records the new worktree's ownership
+in Git metadata for possible cleanup after integration. Creation is independent
+of the queue. Its result contains only `path`, `branch`, and `commit`.
+
+## Choose a queue mode
+
+Omit `queue` or set `"queue": "global"` to use one shared execution slot for
+projects under the same macOS account, including submissions from different
+terminals. When the slot is free, the oldest eligible submission can run.
+A job holds the slot through its runnable stages, including preparation and
+deployment. Work awaiting committed repairs, other batch members, or manual
+integration releases the slot. When it becomes ready again, it joins behind
+already waiting work.
+
+Set `"queue": "repository"` in a project's JSON config to give its repository
+an independent serial queue. It can run at the same time as a project in the
+global queue or another independent repository. Configs for the same Git common
+directory must agree on the mode while the repository has unfinished work.
+Settle that work before submitting in a different mode.
+
+Telete coordinates the global slot on demand. Each repository's worker runs its
+commands with that worker's inherited environment. `status`, `pause`,
+maintenance, and recovery operate through the selected repository config.
+The private scheduler state lives at
+`~/Library/Application Support/Telete/shared-queue`, in the macOS account's
+home directory.
+
+Let unfinished work submitted by older Telete versions settle across all
+projects before relying on the global limit. Existing unfinished work uses
+repository mode. Once it settles, the next submission selects the mode from
+its config.
 
 ## Share a queue
 
@@ -74,8 +102,8 @@ absolute `state` path. Telete keeps the private binding at
 `G/telete/queue.json`, where `G` is Git's common directory. From then on, the
 original checkout, all linked worktrees, and all configs selecting those
 checkouts use this one runtime directory. This includes manually created Git
-worktrees. Separate clones have separate Git common directories and keep
-independent queues.
+worktrees. Separate clones have separate Git common directories and runtime
+directories. They share the execution slot when both use the global queue mode.
 
 Telete coordinates initial binding and queue ownership internally. Development
 worktree creation remains independent of the queue before and after binding.
@@ -94,10 +122,9 @@ telete --config ../feature-b/telete.json submit
 telete --config telete.json status
 ```
 
-These submissions join the same queue and retain their own selected commits,
-workflows, and parameters. Passing the original checkout's config while standing
-in a child still selects the original repository's `HEAD`. Queue order is the
-order submissions are admitted to the shared queue.
+These submissions join the same repository queue and retain their own selected
+commits, workflows, and parameters. Passing the original checkout's config
+while standing in a child still selects the original repository's `HEAD`.
 
 Queue operation results include the effective absolute runtime directory in the
 top-level `state_root` field. Preserve the shared Git repository, queue binding,
@@ -140,13 +167,13 @@ Telete retains the resulting commit at `refs/telete/results/JOB`. It creates thi
 ref even when corrections produce no changes or the fix command fails. A failed
 fix command stops the workflow after retaining its edits. Cancellation and
 scratch cleanup preserve the ref. The ref belongs to source history and remains
-until the project explicitly removes it. Telete does not merge or advance project
-branches; the project can integrate the returned commit.
+until the project explicitly removes it.
 
 `commit` in job status remains the submitted SHA. When a workflow retains
 source for fixes, analysis, repair, or a batch, `resulting_commit` and
-`result_ref` identify that source. Subsequent commands run on the resulting
-commit unless a batched release selects combined source below.
+`result_ref` identify that source. Individual commands use the resulting
+commit. Preparation and deployment use the combined source when batching or
+integration selects a release candidate.
 Commands after fixes must preserve HEAD and tracked source, except for automatic
 repair and the selected batch composition stage. A violation fails the job.
 Resuming the job consumes saved command evidence and reuses its result commit
@@ -160,15 +187,17 @@ The supported workflow fields are:
 | `analyze` | absent | Analyze source once and trigger repair on ordinary findings. |
 | `check` | required | Build or check the resulting source, including accepted repairs. |
 | `repair` | absent | Run a script to create a committed repair from a failed command's output. |
-| `prepare` | absent | Run after a successful check. |
+| `prepare` | absent | Prepare the selected release source after checks and any composition. |
 | `deploy` | absent | Run after successful preceding stages. |
 | `batch` | absent | Combine compatible deployment requests before preparation and deployment. |
+| `integration` | automatic into `main` for deployments | Publish the exact release source on a local branch before deploying. |
 | `parameters` | `{}` | Pass the supplied object unchanged to commands. |
 
-The normal order is optional fixes, optional analysis, check, optional
-preparation, and optional deployment. The repair command runs when eligible work
-needs repair. Deployment can be selected without preparation. Unknown config and
-command fields are rejected.
+The normal order is optional fixes, optional analysis, check, optional release
+composition and preparation, integration when enabled, and deployment when
+selected. The repair command runs when eligible work needs repair. Deployment
+can be selected without preparation. Unknown config and command fields are
+rejected.
 
 Every command accepts `program`, optional literal `args`, optional `env`
 overrides, and optional `timeout_seconds`. Arguments default to an empty array
@@ -194,6 +223,50 @@ reproducible execution. If the project needs a particular environment, cache,
 compiler target directory, or credential reference, select it in its commands
 and configuration. Environment values are not resolved relative to the config
 file and are not expanded by Telete.
+
+## Integrate before deployment
+
+New deployment workflows default to automatic integration into local `main`.
+Use `integration.branch` to select an existing literal local branch name.
+`integration.mode` defaults to `automatic`. Select `manual` to wait after
+preparation, or set `"integration": {"mode": "off"}` to deploy without branch
+updates and development worktree cleanup. Check-only workflows and jobs already
+recorded without integration keep their original behavior.
+Use off for a promotion workflow whose deploy command requires the exact
+previously prepared revision selected at submission.
+
+For a manual release, authorize the prepared source with:
+
+```sh
+telete --config telete.json merge JOB
+```
+
+Supply any member job ID for a shared release. Authorization covers the entire
+prepared batch. The command arranges background execution. Use a config from a
+retained checkout to observe `status JOB` or `wait JOB` after Telete removes the
+submitting worktree.
+
+Telete builds the candidate in a private checkout using the destination branch
+and the checked source. Batched candidates include the preceding release source.
+If those two bases conflict, reconcile them before submitting again. The batch
+merge repair hook handles conflicts with checked members during composition.
+The configured preparation command runs on the candidate before the destination
+branch advances. If the branch has moved and still needs the candidate, Telete
+recomposes and prepares against the new tip. In manual mode, authorize the new
+candidate with `merge JOB`. If the destination checkout is dirty, commit or set
+aside the local edits, then run `merge JOB` to retry. Updates are local
+fast-forwards.
+
+After updating the branch, Telete can remove the original development worktree
+and branch when it created them, their source has been integrated, and they are
+still safe to remove. Previously created worktrees without Telete ownership
+metadata remain available for manual cleanup. `status` lists releases that
+need action under `waiting_merge`. The release enters `merging` while Telete
+applies the change.
+`merged_commit` identifies the commit published to the destination and
+`merge_cleanup` reports any cleanup that needs attention. Deployment uses the
+prepared commit. A deployment failure preserves the integrated source. For a
+batch, the target's release ref still names its last successful deployment.
 
 ## Batch deployment requests
 
@@ -226,7 +299,8 @@ Telete pins the submitted bootstrap base at `refs/telete/jobs/base-JOB` until
 request cleanup.
 Use the same target for commands that deploy to the same destination. Compatible
 requests have the same target, composition, merge repair, preparation,
-deployment, and parameters. Individual fixes, analysis, and checks may differ.
+integration, deployment, and parameters. Individual fixes, analysis, and checks
+may differ.
 
 When the first member finishes its check, Telete closes the group over compatible
 requests already admitted to the queue. Those requests finish their individual
@@ -253,10 +327,9 @@ merge policy, conflicts, release identifiers, and package format.
 The compose command must leave a clean, detached HEAD at the combined commit
 and write that full commit ID to `outputs.directory/commit`. The commit must
 descend from the release base and every member's checked source. Telete retains
-it at `refs/telete/releases/RELEASE`, then runs the configured preparation and
-deployment on it. These ancestry checks establish which source was included;
-configured commands own the release's domain success claims. No project branch
-is advanced.
+it at `refs/telete/releases/RELEASE` and prepares, integrates when enabled, and
+deploys that source. These ancestry checks establish which source was included.
+Configured commands own the release's domain success claims.
 
 For example, a project using `jq` can make this `ci/compose.sh` executable and
 commit it in its base source:
@@ -294,8 +367,9 @@ merge commit fails the release.
 
 Status distinguishes each member's checked source from `release_commit`, and
 `release_id` links members to their shared outcome. Members wait in
-`waiting_release`. The leader runs `composing`, optionally `repairing_merge`,
-then preparation and deployment.
+`waiting_release` with the leader's `release_phase`. The leader runs `composing`,
+optionally `repairing_merge`, then preparation, integration when enabled, and
+deployment.
 `wait` and `submit --follow` observe the requested deployment through that shared
 outcome. Individual submitted, analyzed, and repaired identities remain intact.
 
@@ -303,8 +377,8 @@ A successful composition is required for deployment. The existing cancellation
 and command recovery rules apply to release work. Missing terminal evidence
 never authorizes replay. Release refs survive checkout cleanup, and
 `refs/telete/releases/targets/TARGET` retains the latest confirmed release source.
-Successful completion markers retain only individual source and shared release
-identities. A shared failure retains the leader and actual failed-member
+Successful completion markers preserve the checked, merged, and shared release
+identities when present. A shared failure retains the leader and actual failed-member
 diagnostics until a newer workflow succeeds or fails. Preserve durable packages and
 release records in project outputs.
 
@@ -337,8 +411,9 @@ names the retained result. `source.commit` identifies the submitted source in
 the fix command and the resulting source in later individual commands.
 Composition selects the starting HEAD. Merge repair selects the pre-merge HEAD.
 Preparation and deployment select the combined release source.
-`source.checked_commit` preserves the individual source, and `source.release_id`
-identifies a frozen group.
+`source.checked_commit` preserves the individual source for batched commands
+and for integrated preparation and deployment. `source.release_id` identifies
+a frozen group.
 
 `outputs.directory` names the private output directory for the command. With
 fixes selected, `inputs.fix` is null during fixes and names the completed fix
@@ -442,17 +517,22 @@ Use `status` or `status JOB` to inspect work, and `wait JOB` to observe a job
 without submitting it again. Waiting has no timeout by default; supply
 `--timeout 60` to limit observation. Both `wait` and `submit --follow` stop
 observing when the job succeeds, fails, is cancelled, becomes blocked, or
-waits for manual repair.
+waits for manual repair or integration.
 Ctrl-C stops observation without cancelling the job. Add `--json` for compact
 JSON output and structured operation errors. `wait` and `submit --follow` exit 0
 only when the observed job succeeded. Failure, cancellation, blockage, waiting
-for manual repair, and an observation timeout use exit 1. Ctrl-C uses exit 130.
+for manual repair or integration, and an observation timeout use exit 1.
+Ctrl-C uses exit 130.
 Ordinary operation failures use exit 1; CLI syntax errors use exit 2.
 
-For a bound repository, these operations act on the shared queue from every
-linked checkout. Only one worker can own it. Pause, maintenance holds,
-cancellation, recovery, and retained diagnostics are shared too. An unresolved
-command blocks later jobs from every checkout.
+Queue status reports `queue_mode`. In global mode, `shared_slot` gives the
+holding job's ID as `job` and its runtime directory as `state_root`, or is
+`null` when the slot is free. `waiting_for_shared_slot` is true when this
+repository has eligible work and another repository holds the slot.
+
+These operations act on the repository queue from every linked checkout. One
+worker owns each repository queue. Pause, maintenance holds, cancellation,
+recovery, and retained diagnostics apply across that repository's worktrees.
 
 `pause` prevents new claims. `resume` permits claims when no maintenance hold or
 unresolved work blocks admission. `cancel JOB` requests an intended stop at a
@@ -470,9 +550,12 @@ not automatically repeat or roll back its effects. Preserve the runtime
 directory while work is active or unresolved. Deleting it loses the evidence
 needed to distinguish completed effects from uncertain ones.
 
-The broker serializes command execution. Equal gate identities join the same
-recorded result only for the same command. Missing terminal evidence blocks the
-resource slot. `gates` exposes current diagnostic records.
+The broker serializes command execution within a repository. Equal gate
+identities join the same recorded result only for the same command. Missing
+terminal evidence blocks the affected repository. If the interrupted command
+held the global slot, Telete holds it until it can confirm the command and its
+process group have stopped, then lets other eligible repositories proceed.
+`gates` exposes current diagnostic records.
 
 Diagnostics are for current operation, not historical browsing. The latest failed
 workflow retains its details and private checkout until a newer workflow
@@ -487,12 +570,12 @@ queue sequence, and update time. Jobs with completed fixes or a successful
 batched check also retain the
 submitted commit, resulting commit, and result ref. Jobs with analysis also retain
 the analyzed and accepted repair identities. Batched members also retain
-`release_id` and `release_commit`. Markers contain no command,
+`release_id` and `release_commit`. Integration retains `merged_commit` when
+present. Markers contain no command,
 parameters, environment, or output. Old markers are pruned, and `wait JOB` then
 reports that the job is unavailable. Archive any project outputs through the
 configured commands when they need a longer lifetime.
-These retention limits apply to the shared queue as a whole, not separately to
-each worktree.
+The retention limits apply per repository, across its worktrees.
 
 ## Coordinate maintenance
 

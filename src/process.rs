@@ -6,12 +6,16 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
+    sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
 
 use crate::paths::{self, Paths};
 use anyhow::{Context, Result, ensure};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,15 +164,84 @@ fn prepare_context(paths: &Paths, spec: &CommandSpec) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run(paths: &Paths, spec: &CommandSpec) -> Result<ProcessResult> {
+#[cfg(test)]
+fn run(paths: &Paths, spec: &CommandSpec) -> Result<ProcessResult> {
     run_without(paths, spec, &[])
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn run_without(
     paths: &Paths,
     spec: &CommandSpec,
     removed: &[std::ffi::OsString],
+) -> Result<ProcessResult> {
+    run_command(paths, spec, removed, None)
+}
+
+pub(crate) fn boot_id() -> Result<String> {
+    static BOOT: OnceLock<String> = OnceLock::new();
+    if let Some(boot) = BOOT.get() {
+        return Ok(boot.clone());
+    }
+    #[cfg(target_os = "macos")]
+    let bytes = {
+        let output = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.bootsessionuuid"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "could not identify the current boot"
+        );
+        output.stdout
+    };
+    #[cfg(not(target_os = "macos"))]
+    let bytes = std::fs::read("/proc/sys/kernel/random/boot_id")?;
+    let value = String::from_utf8(bytes)?;
+    let boot = uuid::Uuid::parse_str(value.trim())
+        .context("invalid boot identifier")?
+        .to_string();
+    Ok(BOOT.get_or_init(|| boot).clone())
+}
+
+fn group_stopped(group: Pid) -> Result<bool> {
+    match test_kill_process_group(group) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => Ok(false),
+        Err(rustix::io::Errno::SRCH) => Ok(true),
+        Err(error) => Err(error).context("inspect workflow process group"),
+    }
+}
+
+fn kill_group(group: Pid) -> Result<()> {
+    match kill_process_group(group, Signal::KILL) {
+        // Darwin reports EPERM when only the unreaped group leader remains.
+        // The liveness check after reaping still checks for surviving members.
+        Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => Ok(()),
+        Err(error) => Err(error).context("stop workflow process group"),
+    }
+}
+
+#[allow(unsafe_code)]
+fn record_process_group(command: &mut Command, file: File) {
+    // SAFETY: the child only calls getpid, write, and fsync. Command sets the
+    // process group before this hook and aborts exec if the hook fails.
+    unsafe {
+        command.pre_exec(move || {
+            let bytes = rustix::process::getpid().as_raw_pid().to_le_bytes();
+            let count = rustix::io::write(&file, &bytes)?;
+            if count != bytes.len() {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            rustix::fs::fsync(&file)?;
+            Ok(())
+        });
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_command(
+    paths: &Paths,
+    spec: &CommandSpec,
+    removed: &[std::ffi::OsString],
+    group_record: Option<File>,
 ) -> Result<ProcessResult> {
     ensure!(
         spec.timeout_seconds.is_none_or(|seconds| seconds > 0) && spec.cwd.is_absolute(),
@@ -191,6 +264,9 @@ pub(crate) fn run_without(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(file) = group_record {
+        record_process_group(&mut command, file);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -205,6 +281,7 @@ pub(crate) fn run_without(
             });
         }
     };
+    let group = Pid::from_child(&child);
     let out = child.stdout.take().context("stdout missing")?;
     let err = child.stderr.take().context("stderr missing")?;
     let stdout = thread::spawn(move || read_stream(out));
@@ -218,22 +295,24 @@ pub(crate) fn run_without(
     let started = Instant::now();
     let mut timed_out = false;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        if waitid(
+            WaitId::Pid(group),
+            WaitIdOptions::NOHANG | WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )?
+        .is_some()
+        {
+            // Keep the leader's PID reserved while sending the final signal.
+            kill_group(group)?;
+            break child.wait()?;
         }
         if spec
             .timeout_seconds
             .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
         {
             timed_out = true;
-            let pid = format!("-{}", child.id());
-            let _ = Command::new("/bin/kill")
-                .args(["-TERM", "--", &pid])
-                .status();
+            let _ = kill_process_group(group, Signal::TERM);
             thread::sleep(Duration::from_millis(150));
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &pid])
-                .status();
+            kill_group(group)?;
             let _ = child.kill();
             break child.wait()?;
         }
@@ -241,12 +320,9 @@ pub(crate) fn run_without(
     };
     // Close descendants' pipes as well: a direct process exit is not proof that
     // a surviving child stopped. Gate commands may not leave background work.
-    let pid = format!("-{}", child.id());
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", "--", &pid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    while !group_stopped(group)? {
+        thread::sleep(Duration::from_millis(25));
+    }
     if let Some(input) = input {
         let _ = input.join();
     }
@@ -277,6 +353,49 @@ struct Completion {
     schema: u32,
     request: CommandSpec,
     result: ProcessResult,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Started {
+    schema: u32,
+    pid: u32,
+    #[serde(default)]
+    boot_id: Option<String>,
+}
+
+/// Check process liveness after taking the inherited execution lock, so an
+/// executor cannot still be on its way from admission to recording its group.
+/// This evidence says nothing about the command's outcome.
+pub(crate) fn stopped(directory: &std::path::Path) -> Result<bool> {
+    let started = match std::fs::read(directory.join("started.json")) {
+        Ok(bytes) => serde_json::from_slice::<Started>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(started.schema == 1, "unsupported process start record");
+    let Some(boot) = started.boot_id else {
+        // Legacy records did not track the command's process group.
+        return Ok(observe(directory)?.is_some());
+    };
+    let boot = uuid::Uuid::parse_str(&boot).context("invalid process start boot identifier")?;
+    if boot.to_string() != boot_id()? {
+        return Ok(true);
+    }
+    let bytes = std::fs::read(directory.join("group"))?;
+    if bytes.len() < size_of::<i32>() {
+        // The child cannot exec unless its entire group record was written.
+        return Ok(true);
+    }
+    let group = bytes
+        .try_into()
+        .ok()
+        .map(i32::from_le_bytes)
+        .filter(|id| *id > 1)
+        .and_then(Pid::from_raw)
+        .context("invalid workflow process group record")?;
+    // A correlated completion was written after the group stopped. It also
+    // covers a different process group that has since reused this identifier.
+    Ok(group_stopped(group)? || observe(directory)?.is_some())
 }
 
 pub(crate) fn observe(directory: &std::path::Path) -> Result<Option<ProcessResult>> {
@@ -385,11 +504,20 @@ pub(crate) fn execute_request(paths: &Paths, directory: &std::path::Path) -> Res
     );
     let request: CommandSpec =
         serde_json::from_slice(&std::fs::read(directory.join("request.json"))?)?;
+    let group = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("group"))?;
     paths::atomic_json(
         &directory.join("started.json"),
-        &serde_json::json!({"schema":1,"pid":std::process::id()}),
+        &Started {
+            schema: 1,
+            pid: std::process::id(),
+            boot_id: Some(boot_id()?),
+        },
     )?;
-    let result = run(paths, &request)?;
+    let result = run_command(paths, &request, &[], Some(group))?;
     paths::atomic_json(
         &directory.join("result.json"),
         &Completion {
@@ -458,6 +586,44 @@ mod tests {
         execute_request(&paths, &directory).unwrap();
         assert_eq!(observe(&directory).unwrap().unwrap().exit_code, Some(7));
         assert!(execute_request(&paths, &directory).is_err());
+    }
+
+    #[test]
+    fn process_group_liveness_is_independent_of_command_outcome() {
+        let (_temporary, paths, _) = fixture();
+        let directory = paths.root.join("execution");
+        paths::ensure_private(&directory).unwrap();
+        let group = File::create(directory.join("group")).unwrap();
+        paths::atomic_json(
+            &directory.join("started.json"),
+            &Started {
+                schema: 1,
+                pid: std::process::id(),
+                boot_id: Some(boot_id().unwrap()),
+            },
+        )
+        .unwrap();
+        assert!(stopped(&directory).unwrap(), "command has not launched");
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        record_process_group(&mut command, group);
+        let mut child = command.spawn().unwrap();
+        let while_running = stopped(&directory);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!while_running.unwrap(), "command still owns the group");
+        assert!(stopped(&directory).unwrap(), "command group has stopped");
+        assert!(observe(&directory).unwrap().is_none());
+    }
+
+    #[test]
+    fn completion_waits_for_background_group_members_to_stop() {
+        let (_temporary, paths, mut request) = fixture();
+        request.args = vec!["-c".into(), "sleep 30 & printf '%s' \"$$\"".into()];
+        let result = run(&paths, &request).unwrap();
+        assert!(result.success());
+        let group = Pid::from_raw(result.stdout.parse().unwrap()).unwrap();
+        assert!(group_stopped(group).unwrap());
     }
 
     #[test]

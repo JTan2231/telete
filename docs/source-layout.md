@@ -10,10 +10,11 @@ corrections as child commits.
 Invocation, process, and broker modules resolve commands, supervise execution,
 and correlate results. Path helpers manage private local storage. The workflow
 module validates project JSON configuration and resolves its repository and
-initial runtime paths. The repository queue module resolves the shared queue
-binding in Git's common directory. Development worktree creation uses Git
-without opening or changing runtime state. Queue operations manage a private
-supervisor and worker, including startup, ownership, and shutdown.
+initial runtime paths. The repository queue module resolves the shared runtime
+binding in Git's common directory. By default, repository workers share one
+execution slot for the macOS account. Each repository has its own private
+supervisor and worker. Development worktree creation uses Git without opening
+or changing runtime state.
 
 `ci.sh` selects this repository's `ci/workflow.json` project config, which points
 to `.telete/` for runtime state. `ci/check.sh` runs formatting, Clippy, tests, and a
@@ -36,9 +37,10 @@ Configured commands own formatter, linter, and release-version policy.
 
 Optional deployment batching closes a group of admitted compatible requests at
 the first successful individual check. The manager waits for member checks,
-runs a configured composition command, then prepares and deploys the retained
-combined source once. No additional analysis or check is inserted. Git helpers
-retain release commits and the latest successful source for each target without
-advancing project branches.
+runs a configured composition command, then prepares the retained combined
+source. With integration enabled, the manager advances the configured local
+branch to the prepared commit and cleans up eligible Telete-created worktrees
+before deploying that commit. Git helpers retain release commits and the latest
+successful source for each target.
 
 Read [Operate Telete](queue-operate.md) for the command and execution contract.

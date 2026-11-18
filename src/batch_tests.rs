@@ -305,7 +305,7 @@ fn release_batch_waits_for_member_repairs_while_unrelated_ci_runs() -> Result<()
     other.analyze = None;
     other.prepare = None;
     other.deploy = None;
-    let unrelated = submit(&paths, &project.repo, &base.0, other)?;
+    let unrelated = submit(&paths, &project.repo, &base.0, other, project.queue)?;
     let unrelated_id = unrelated["id"].as_str().context("unrelated job")?;
     assert_eq!(batch_finish(&paths, unrelated_id)?["phase"], "succeeded");
     assert!(batch_records(&paths.root.join("deployed.jsonl"))?.is_empty());
@@ -444,7 +444,7 @@ fn release_batch_composition_failure_never_prepares_or_deploys() -> Result<()> {
     unrelated.batch = None;
     unrelated.prepare = None;
     unrelated.deploy = None;
-    let submitted = submit(&paths, &project.repo, &base.0, unrelated)?;
+    let submitted = submit(&paths, &project.repo, &base.0, unrelated, project.queue)?;
     let unrelated_id = submitted["id"].as_str().context("unrelated CI")?;
     assert_eq!(batch_finish(&paths, unrelated_id)?["phase"], "succeeded");
     Ok(())

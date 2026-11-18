@@ -1,6 +1,6 @@
-.TH TELETE 1 "October 18, 2026" "Telete 0.7.0" "General Commands Manual"
+.TH TELETE 1 "October 18, 2026" "Telete 0.8.0" "General Commands Manual"
 .SH NAME
-telete \- run a serial queue of committed repository workflows
+telete \- queue committed repository workflows
 .SH SYNOPSIS
 .B telete \-\-config
 .I file
@@ -20,7 +20,8 @@ A project JSON configuration selects the repository, initial private runtime
 directory, required check command, optional fix, analysis, repair, preparation,
 and deployment commands, and parameters.
 Each submitted job starts from one exact commit in a private checkout.
-Jobs run serially, in queue order.
+By default, projects under the same macOS account share one execution slot.
+See QUEUE MODES.
 .PP
 Submission resolves the requested revision once and freezes the workflow and
 parameters with the job.
@@ -28,8 +29,8 @@ The default revision is HEAD in the configured repository at submission time.
 Uncommitted changes are not included.
 Later changes to HEAD or the configuration do not alter a submitted job.
 An optional fix command edits tracked source before checks. Telete commits these
-edits as a direct child and checks and deploys that result. Telete does not merge
-source or update project branches.
+edits as a direct child and checks that result. Deployment workflows default to
+integrating the prepared source into local main before deployment.
 .PP
 Submission queues work and arranges background execution.
 Telete manages the worker while unfinished work exists and stops it after
@@ -42,8 +43,9 @@ Help and version requests do not require a configuration.
 .PP
 The first queue mutation binds the Git common directory to one queue.
 The original checkout, every linked worktree, and alternate configurations then
-share that queue, including worktrees created directly with Git.
-Separate clones retain independent queues.
+share that repository queue, including worktrees created directly with Git.
+Separate clones have separate repository queues and share the execution slot
+when both use the global queue mode.
 Creating a development worktree does not inspect or change queue state.
 .SH INSTALLATION
 From this repository, run:
@@ -141,9 +143,8 @@ The branch name is the normalized destination's last path component, which
 must be a valid literal Git branch name.
 An existing destination or branch is an error; no existing worktree is adopted.
 Uncommitted changes remain in the source checkout.
-This command uses Git alone.
-It does not submit work, inspect runtime state, bind a queue, or coordinate with
-a worker.
+Telete records ownership of the new worktree in Git metadata for cleanup after
+integration. Creation is independent of the queue.
 The result includes the absolute
 .BR path ,
 new
@@ -173,20 +174,32 @@ submitting it again.
 With
 .BR \-\-follow ,
 also observe the submitted job until it succeeds, fails, is cancelled, or
-becomes blocked or waits for manual repair.
+becomes blocked or waits for manual repair or integration.
 A second JSON result reports that observation.
 Press Ctrl-C to stop following without cancelling the job.
 Closing the observing terminal does not stop the managed worker.
 .TP
 .B status \fR[\fIjob\fR]
-Display the queue, active job, retained failure, settled-job markers, operator
-pause, and maintenance owners.
+Display the repository queue, active job, retained failure, settled-job markers,
+operator pause, and maintenance owners.
+Queue status reports
+.BR queue_mode .
+In global mode,
+.B shared_slot
+gives the holding job's ID as
+.B job
+and its runtime directory as
+.BR state_root ,
+or is null when the slot is free.
+.B waiting_for_shared_slot
+is true when this repository has eligible work and another repository holds
+the slot.
 With a job ID, display only that job's retained result.
 An unavailable or pruned job is an operation error.
 .TP
 .BI "wait " "job " "\fR[\fB\-\-timeout \fIseconds\fR]"
 Observe a job until it succeeds, fails, is cancelled, becomes blocked, waits for
-manual repair, or the observation times out.
+manual repair or integration, or the observation times out.
 The timeout is a positive integer number of seconds.
 By default, observation has no timeout.
 This timeout limits observation, not execution.
@@ -205,7 +218,7 @@ A blocked job is reported as a terminal observation but remains unresolved.
 Inspect the result to determine workflow success; see EXIT STATUS.
 .TP
 .B pause
-Prevent the worker from claiming new jobs.
+Prevent the repository's worker from claiming new jobs.
 Submissions are still accepted, and an already active job can continue.
 Pausing does not drain the queue.
 The managed worker waits while new claims are prevented.
@@ -244,6 +257,13 @@ uses repaired source for every later stage. Analysis and fixes are not repeated.
 Complete an interrupted repair with the same revision before cancelling its job.
 Selecting another
 revision during an interrupted handoff is an error.
+.TP
+.BI "merge " job
+Authorize integration of a prepared job into its configured local branch.
+For a batch, select any member job ID to authorize the whole release.
+Run the same command to retry after correcting a blocked branch update.
+Telete updates the branch, cleans up eligible development worktrees, and
+continues to deployment in the background. See INTEGRATION BEFORE DEPLOYMENT.
 .TP
 .BI "maintenance hold \-\-owner " owner
 Add a maintenance hold preventing new claims.
@@ -297,6 +317,16 @@ field cannot redirect the queue.
 A populated directory is bound to its repository and runtime path and cannot
 be reassigned to another repository or moved by changing the configuration.
 .TP
+.B queue
+Optional queue mode.
+The default is
+.BR global ,
+with one execution slot shared by projects under the same macOS account.
+Set to
+.B repository
+to run this repository's jobs in an independent serial queue.
+See QUEUE MODES.
+.TP
 .B fix
 Optional command object, run before checks. Telete commits tracked source edits
 as one direct child with Telete as both author and committer. No edits produce
@@ -325,7 +355,7 @@ original analysis. A later ordinary check failure waits for manual repair.
 A known repair command failure or invalid repair commit fails the job.
 .TP
 .B prepare
-Optional command object, run after a successful check.
+Optional command object, run on the candidate after checks and any composition.
 Omitted or null means no preparation stage.
 .TP
 .B deploy
@@ -342,6 +372,14 @@ a
 command, and an optional
 .B merge_repair
 command. Requires deployment. See BATCHED DEPLOYMENTS.
+.TP
+.B integration
+Optional object with
+.B branch
+and
+.BR mode .
+For new deployment jobs, the default is automatic integration into local main.
+See INTEGRATION BEFORE DEPLOYMENT.
 .TP
 .B parameters
 JSON object passed unchanged through the execution context.
@@ -398,7 +436,40 @@ Omitted or null means no time limit.
 On timeout, Telete terminates the command's process group and records failure.
 .PP
 Programs, arguments, and environment values cannot contain NUL.
-.SH SHARED QUEUE
+.SH QUEUE MODES
+Omit
+.B queue
+or set it to
+.B global
+to share one execution slot with other projects under the same macOS account.
+When the slot is free, the oldest eligible submission can run.
+A job holds the slot through its runnable stages, including preparation and
+deployment.
+Work awaiting committed repairs, other batch members, or manual integration
+releases the slot and
+joins behind already waiting work when it is ready again.
+.PP
+Set
+.B queue
+to
+.B repository
+to let the repository run independently, one job at a time, alongside the
+global queue and other independent repository queues.
+Configs for the same Git common directory must agree on the mode while the
+repository has unfinished work.
+Settle that work before submitting in a different mode.
+.PP
+Telete coordinates the global slot on demand.
+Each repository's worker runs its commands and owns its checkouts, diagnostics,
+and recovery state.
+Status, pause, maintenance, and recovery operate through the selected
+repository config.
+.PP
+Let unfinished work submitted by older Telete versions settle across all
+projects before relying on the global limit.
+Existing unfinished work uses repository mode.
+Once it settles, the next submission selects the mode from its config.
+.SH REPOSITORY QUEUE
 The first queue mutation binds Git's common directory to the selected
 configuration's absolute
 .B state
@@ -411,7 +482,7 @@ worktrees.
 Every queue operation selecting one of those checkouts then uses this runtime
 directory, including commands using another config or a manually created
 worktree.
-Separate clones have different Git common directories and independent queues.
+Separate clones have different Git common directories and runtime directories.
 .PP
 Telete coordinates initial binding and queue ownership internally.
 Development worktree creation is independent of runtime state before and after
@@ -428,16 +499,60 @@ the original repository's HEAD.
 A copied config's relative state path cannot create a second queue after
 binding.
 .PP
-All linked worktrees share queue order, worker ownership, pause, maintenance
-holds, cancellation, recovery, diagnostics, and retention limits.
-An unresolved command blocks subsequent work from every checkout.
-Telete rejects conflicting existing runtime state instead of combining queues.
+All linked worktrees share repository scheduling, worker ownership, pause,
+maintenance holds, cancellation, recovery, diagnostics, and retention limits.
+Telete rejects conflicting existing runtime state.
 .PP
 Preserve the shared Git repository, binding, and runtime directory while work
 is queued, active, or unresolved.
 If the binding survives but the runtime directory or queue database is missing,
 queue operations fail and require restoration of that operational state.
 Telete does not create an empty replacement queue behind an existing binding.
+.SH INTEGRATION BEFORE DEPLOYMENT
+New deployment workflows default to
+.B automatic
+integration into the existing local branch
+.BR main .
+Configure the literal local branch name in
+.BR integration.branch .
+Set
+.B integration.mode
+to
+.B manual
+to hold the prepared release until
+.BR "merge job" ,
+or
+.B off
+to disable integration and development worktree cleanup.
+Check-only workflows and older jobs recorded without integration continue
+without branch publication.
+.PP
+Telete composes a candidate from the integration branch and checked source.
+Batched candidates include the preceding release source. Preparation runs on
+the exact candidate before Telete fast-forwards the destination branch to it.
+A moving destination branch causes recomposition and preparation if it still
+needs the candidate. In manual mode, authorize the newly prepared candidate with
+.BR "merge job" .
+If the destination checkout is dirty, commit or set aside the local edits, then run
+.B "merge job"
+to retry.
+.PP
+After publication, Telete removes development worktrees it created when their
+source is integrated and their checkouts and branches are still safe to remove.
+The deployment command runs on the prepared commit. A deployment failure leaves
+the integrated source on the branch and the target's last successful release
+on its release ref.
+.PP
+Queue status lists jobs that need action under
+.BR waiting_merge .
+The release enters
+.B merging
+while Telete applies the change.
+Job status reports
+.B merged_commit
+after publication and
+.B merge_cleanup
+for any cleanup that needs attention.
 .SH BATCHED DEPLOYMENTS
 An optional
 .B batch
@@ -461,7 +576,7 @@ Telete retains the bootstrap base at refs/telete/jobs/base-JOB until cleanup.
 Every member runs its own selected fixes, analysis, and check. When the first
 member finishes its check, Telete closes the group over compatible requests
 already admitted. Compatibility requires the same target, composition,
-merge repair, preparation, deployment, and parameters.
+merge repair, preparation, integration, deployment, and parameters.
 Individual check commands can differ.
 An incompatible request for the same target ends the compatible segment;
 later compatible requests cannot jump ahead of it.
@@ -503,8 +618,8 @@ A known merge repair failure or an invalid repair commit fails the release.
 .PP
 Telete retains that commit at
 .I refs/telete/releases/RELEASE
-and runs preparation and deployment once on it. It does not add combined CI or
-advance project branches. A successful composition is required for deployment.
+and runs preparation, integration when enabled, and deployment on it.
+A successful composition is required for deployment.
 Existing cancellation and recovery rules apply; an uncertain command is never
 replayed.
 .PP
@@ -514,22 +629,26 @@ and reports
 .BR release_commit .
 Members wait in
 .B waiting_release
+with the leader's
+.B release_phase
 while the leader runs
 .BR composing ,
 optional
 .BR repairing_merge ,
-preparation, and deployment. A requested deployment completes only with the
+preparation, integration when enabled, and deployment.
+A requested deployment completes only with the
 shared release outcome. Successful deployment updates
 .IR refs/telete/releases/targets/TARGET .
 These refs survive runtime cleanup. Packages and durable release history belong
 to project commands.
 .SH EXECUTION
 The normal order is optional fixes, optional analysis, check, optional
-preparation, and optional deployment.
+composition and preparation, integration when enabled, and deployment when
+selected.
 With batching selected, each member runs its individual check, then the release
 runs composition with optional merge repair, followed by optional preparation
-and deployment once. No additional analysis or check is inserted.
-A stage succeeds only when its command exits with status 0 without a timeout,
+and integration and deployment once. No additional analysis or check is inserted.
+A configured command stage succeeds only when its command exits with status 0 without a timeout,
 signal, start error, or output collection error.
 An ordinary nonzero analysis exit or an ordinary check failure with analysis
 or repair selected triggers repair.
@@ -544,7 +663,7 @@ not as a successful execution.
 The configured commands own their checks, output formats, credentials,
 deployment effects, and any stronger claim of domain success.
 .PP
-All stages use the same private checkout as their working directory.
+Configured commands use the same private checkout as their working directory.
 They inherit the managed worker's environment at launch, with configured
 overrides and Telete's execution context.
 The private supervisor inherits the environment of the invocation that starts
@@ -580,7 +699,8 @@ The absolute private checkout path.
 .B source.commit
 The submitted commit during fixes, and the selected source in later individual
 commands. Composition uses the starting HEAD. Merge repair uses the pre-merge
-HEAD. Batched preparation and deployment use the combined release commit.
+HEAD. Preparation and deployment use the combined release commit when batching
+or integration selects a release candidate.
 .TP
 .B source.submitted_commit, source.result_ref
 Present when fixes, analysis, repair, or batching are selected. Preserve the
@@ -593,8 +713,9 @@ The analyzed source, from the analysis stage onward, and accepted repair source
 when present. After repair, source.commit selects the repaired source.
 .TP
 .B source.checked_commit, source.release_id
-For batching, preserve the individual checked source and identify its frozen
-release group. Release commands use their own selected source.commit.
+Preserve the individual checked source for batched commands and for integrated
+preparation and deployment. The release ID identifies the frozen batch.
+Release commands use their own selected source.commit.
 .TP
 .B inputs.analysis
 Present when analysis is selected. Null during analysis; its retained output
@@ -664,6 +785,8 @@ Job phases are
 .BR composing ,
 .BR repairing_merge ,
 .BR preparing ,
+.BR waiting_merge ,
+.BR merging ,
 .BR deploying ,
 .BR blocked ,
 .BR succeeded ,
@@ -691,7 +814,8 @@ For
 .B wait
 and
 .BR "submit \-\-follow" ,
-a failed, cancelled, blocked, or awaiting-repair job, or observation timeout, also uses exit 1.
+a failed, cancelled, or blocked job, waiting for repair or integration, and
+observation timeout also use exit 1.
 With
 .BR \-\-json ,
 the error object has
@@ -754,6 +878,9 @@ Private supervisor ownership and current worker diagnostics.
 .TP
 .IR state/tmp/ ", " state/deployments/ ", " state/*.lock
 Temporary files and execution coordination locks managed by Telete.
+.TP
+.I "~/Library/Application Support/Telete/shared-queue"
+Private scheduler state in the macOS account's home directory.
 .PP
 The
 .I state
@@ -797,16 +924,19 @@ batched check also retain commit,
 resulting_commit, and result_ref. Jobs with analysis also retain analyzed_commit
 and repaired_commit when present. The commit field preserves the submitted SHA;
 resulting_commit identifies checked source. Batched members also retain their
-release_id and release_commit; the latter identifies deployed source.
+release_id and release_commit. Integration retains merged_commit when present.
 After pruning,
 .B status job
 and
 .B wait job
 report that the job is unavailable.
-These limits apply to the shared queue as a whole, not separately per worktree.
+The retention limits apply per repository, across its worktrees.
 .SH RECOVERY
 An interrupted command without matching terminal evidence remains unresolved
-and blocks later work.
+and blocks later work in the affected repository.
+If the interrupted command held the global slot, Telete holds it until it can
+confirm the command and its process group have stopped, then lets other
+eligible repositories proceed.
 Process disappearance does not establish completion.
 Telete does not automatically repeat or roll back uncertain effects.
 .PP
@@ -841,7 +971,8 @@ Read the
 .BR telete (1)
 manual before using Telete.
 Use Telete to submit CI runs and create worktrees for code changes.
-Clean up those worktrees after successful completion.
+For deployments with integration enabled, check the result for any worktree
+that needs manual cleanup.
 While Telete is running, set a 3-minute heartbeat, if available, to monitor
 actionable emissions from the queue.
 .RE

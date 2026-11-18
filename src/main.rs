@@ -7,6 +7,7 @@ mod paths;
 mod process;
 mod repository_queue;
 mod runtime;
+mod shared_queue;
 mod store;
 mod workflow;
 
@@ -68,6 +69,10 @@ enum Command {
         job: String,
         #[arg(default_value = "HEAD")]
         revision: String,
+    },
+    /// Authorize merging a prepared job or batch into its configured local branch.
+    Merge {
+        job: String,
     },
     Maintenance {
         #[command(subcommand)]
@@ -202,10 +207,14 @@ async fn execute(cli: Cli) -> Result<(serde_json::Value, i32)> {
     let follow = matches!(&cli.command, Command::Submit { follow: true, .. });
     let submission = matches!(&cli.command, Command::Submit { .. });
     let result = match cli.command {
-        Command::Submit { revision, .. } => {
-            manager::submit(&paths, &project.repo, &revision, project.workflow)
-        }
-        Command::Status { job } => manager::status(&paths, job.as_deref()),
+        Command::Submit { revision, .. } => manager::submit(
+            &paths,
+            &project.repo,
+            &revision,
+            project.workflow,
+            project.queue,
+        ),
+        Command::Status { job } => manager::project_status(&paths, job.as_deref(), project.queue),
         Command::Wait { job, timeout } => return observe(&paths, &job, timeout).await,
         Command::Pause => manager::pause(&paths),
         Command::Resume => manager::resume(&paths),
@@ -214,6 +223,7 @@ async fn execute(cli: Cli) -> Result<(serde_json::Value, i32)> {
         Command::Repair { job, revision } => {
             manager::repair(&paths, &project.repo, &job, &revision)
         }
+        Command::Merge { job } => manager::merge(&paths, &job),
         Command::Maintenance { command } => match command {
             Maintenance::Hold { owner } => manager::maintenance_hold(&paths, &owner),
             Maintenance::Status => manager::maintenance_status(&paths),

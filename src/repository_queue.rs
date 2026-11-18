@@ -210,5 +210,11 @@ pub(crate) fn create_worktree(project: &ProjectConfig, target: &Path) -> Result<
         "worktree creation failed; inspect branch {branch} and destination {} for partial Git creation before retrying",
         target.display()
     ))?;
+    git::record_development_worktree(&discovery, &target, branch).with_context(|| {
+        format!(
+            "worktree was created at {} but could not be recorded for cleanup",
+            target.display()
+        )
+    })?;
     Ok(json!({"path":target,"branch":branch,"commit":commit}))
 }

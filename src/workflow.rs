@@ -118,6 +118,37 @@ impl BatchConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IntegrationMode {
+    #[default]
+    Automatic,
+    Manual,
+    Off,
+}
+
+fn default_integration_branch() -> String {
+    "main".into()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IntegrationConfig {
+    #[serde(default = "default_integration_branch")]
+    pub branch: String,
+    #[serde(default)]
+    pub mode: IntegrationMode,
+}
+
+impl Default for IntegrationConfig {
+    fn default() -> Self {
+        Self {
+            branch: default_integration_branch(),
+            mode: IntegrationMode::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Workflow {
@@ -134,11 +165,19 @@ pub(crate) struct Workflow {
     pub deploy: Option<WorkflowCommand>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<IntegrationConfig>,
     #[serde(default = "empty_parameters")]
     pub parameters: serde_json::Value,
 }
 
 impl Workflow {
+    pub(crate) fn integration(&self) -> Option<&IntegrationConfig> {
+        self.integration
+            .as_ref()
+            .filter(|config| config.mode != IntegrationMode::Off)
+    }
+
     pub(crate) fn command(&self, stage: &str) -> Result<&WorkflowCommand> {
         match stage {
             "fix" => self.fix.as_ref().context("automatic fixes not selected"),
@@ -189,14 +228,30 @@ impl Workflow {
             ensure!(self.deploy.is_some(), "batch requires deployment");
             batch.validate()?;
         }
+        if let Some(integration) = self.integration() {
+            ensure!(self.deploy.is_some(), "integration requires deployment");
+            ensure!(
+                !integration.branch.is_empty() && !integration.branch.contains('\0'),
+                "integration branch must be a literal local Git branch name"
+            );
+        }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueMode {
+    #[default]
+    Global,
+    Repository,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectConfig {
     pub repo: PathBuf,
     pub state: PathBuf,
+    pub queue: QueueMode,
     pub workflow: Workflow,
 }
 
@@ -205,6 +260,8 @@ pub(crate) struct ProjectConfig {
 struct ProjectFile {
     repo: PathBuf,
     state: PathBuf,
+    #[serde(default)]
+    queue: QueueMode,
     #[serde(default)]
     fix: Option<WorkflowCommand>,
     #[serde(default)]
@@ -218,6 +275,8 @@ struct ProjectFile {
     deploy: Option<WorkflowCommand>,
     #[serde(default)]
     batch: Option<BatchConfig>,
+    #[serde(default)]
+    integration: Option<IntegrationConfig>,
     #[serde(default = "empty_parameters")]
     parameters: serde_json::Value,
 }
@@ -256,6 +315,12 @@ pub(crate) fn read(path: &Path) -> Result<ProjectConfig> {
         !file.state.as_os_str().is_empty(),
         "config state path is empty"
     );
+    // Only a newly selected project gets the default. A retained workflow with
+    // no integration field predates branch publication and keeps its semantics.
+    let integration = file
+        .integration
+        .or_else(|| file.deploy.as_ref().map(|_| IntegrationConfig::default()))
+        .filter(|config| config.mode != IntegrationMode::Off);
     let workflow = Workflow {
         fix: file.fix,
         analyze: file.analyze,
@@ -264,6 +329,7 @@ pub(crate) fn read(path: &Path) -> Result<ProjectConfig> {
         prepare: file.prepare,
         deploy: file.deploy,
         batch: file.batch,
+        integration,
         parameters: file.parameters,
     };
     workflow.validate()?;
@@ -271,6 +337,7 @@ pub(crate) fn read(path: &Path) -> Result<ProjectConfig> {
     Ok(ProjectConfig {
         repo: normalized_absolute(&file.repo, directory),
         state: normalized_absolute(&file.state, directory),
+        queue: file.queue,
         workflow,
     })
 }
@@ -321,6 +388,50 @@ mod tests {
     #[test]
     fn deployment_does_not_require_preparation() -> Result<()> {
         workflow(json!({"check":{"program":"check"},"deploy":{"program":"deploy"}})).validate()
+    }
+
+    #[test]
+    fn project_defaults_integration_for_new_deployments_only() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("telete.json");
+        let mut value = json!({
+            "repo": ".", "state": ".telete",
+            "check": {"program": "check"},
+            "deploy": {"program": "deploy"},
+        });
+        std::fs::write(&config, serde_json::to_vec(&value)?)?;
+        assert_eq!(
+            read(&config)?.workflow.integration(),
+            Some(&IntegrationConfig::default())
+        );
+        assert!(
+            workflow(json!({
+                "check": {"program": "check"},
+                "deploy": {"program": "deploy"},
+            }))
+            .integration()
+            .is_none()
+        );
+
+        value["integration"] = json!({"mode": "manual", "branch": "release/main"});
+        std::fs::write(&config, serde_json::to_vec(&value)?)?;
+        assert_eq!(
+            read(&config)?.workflow.integration(),
+            Some(&IntegrationConfig {
+                branch: "release/main".into(),
+                mode: IntegrationMode::Manual,
+            })
+        );
+
+        value["integration"] = json!({"mode": "off"});
+        std::fs::write(&config, serde_json::to_vec(&value)?)?;
+        assert!(read(&config)?.workflow.integration().is_none());
+
+        value.as_object_mut().unwrap().remove("integration");
+        value.as_object_mut().unwrap().remove("deploy");
+        std::fs::write(&config, serde_json::to_vec(&value)?)?;
+        assert!(read(&config)?.workflow.integration().is_none());
+        Ok(())
     }
 
     #[test]
