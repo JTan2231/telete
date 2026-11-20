@@ -165,9 +165,10 @@ pub(crate) fn create_worktree(project: &ProjectConfig, target: &Path) -> Result<
         "worktree destination is empty"
     );
     let target = workflow::normalized_absolute(target, &std::env::current_dir()?);
-    let destination = target
-        .to_str()
-        .context("worktree destination must be UTF-8")?;
+    ensure!(
+        target.to_str().is_some(),
+        "worktree destination must be UTF-8"
+    );
     match fs::symlink_metadata(&target) {
         Ok(_) => anyhow::bail!("worktree destination already exists: {}", target.display()),
         Err(error) if error.kind() == ErrorKind::NotFound => (),
@@ -177,44 +178,6 @@ pub(crate) fn create_worktree(project: &ProjectConfig, target: &Path) -> Result<
         .file_name()
         .and_then(|name| name.to_str())
         .context("worktree destination has no branch name")?;
-    ensure!(
-        git::value(
-            &discovery,
-            &repository,
-            &["check-ref-format", "--branch", branch],
-        )? == branch,
-        "worktree branch name must be literal: {branch}"
-    );
-    let branch_exists = git::run(
-        &discovery,
-        &repository,
-        &[
-            "show-ref".into(),
-            "--verify".into(),
-            "--quiet".into(),
-            format!("refs/heads/{branch}"),
-        ],
-        None,
-        std::collections::BTreeMap::new(),
-    )?;
-    ensure!(
-        branch_exists.exited_with(&[1]),
-        "worktree branch already exists or could not be checked: {branch}"
-    );
-
-    git::value(
-        &discovery,
-        &repository,
-        &["worktree", "add", "-b", branch, destination, &commit.0],
-    ).with_context(|| format!(
-        "worktree creation failed; inspect branch {branch} and destination {} for partial Git creation before retrying",
-        target.display()
-    ))?;
-    git::record_development_worktree(&discovery, &target, branch).with_context(|| {
-        format!(
-            "worktree was created at {} but could not be recorded for cleanup",
-            target.display()
-        )
-    })?;
+    git::add_development_worktree(&discovery, &repository, &target, branch, &commit)?;
     Ok(json!({"path":target,"branch":branch,"commit":commit}))
 }

@@ -7,8 +7,12 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use git2::{Oid, Repository};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+#[path = "support/mod.rs"]
+mod test_support;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -103,41 +107,43 @@ impl Drop for Project {
     }
 }
 
-fn git(repo: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("/usr/bin/git");
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(b"GIT_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "user.name=Telete CLI Test",
-            "-c",
-            "user.email=telete-test@example.invalid",
-            "-C",
-        ])
-        .arg(repo)
-        .args(args);
-    command
+fn repository(path: &Path, content: &str) -> TestResult<String> {
+    let repo = test_support::init(path)?;
+    fs::write(path.join("source.txt"), content)?;
+    Ok(test_support::record(&repo, &["source.txt"], "source")?.to_string())
 }
 
-fn repository(path: &Path, content: &str) -> TestResult<String> {
-    fs::create_dir(path)?;
-    checked(git(path, &["init", "--quiet", "--initial-branch=main"]))?;
-    fs::write(path.join("source.txt"), content)?;
-    checked(git(path, &["add", "source.txt"]))?;
-    checked(git(path, &["commit", "--quiet", "-m", "source"]))?;
-    Ok(checked(git(path, &["rev-parse", "HEAD"]))?
-        .trim()
-        .to_owned())
+fn commit(repo: &Path, revision: &str) -> TestResult<String> {
+    Ok(test_support::commit(repo, revision)?.to_string())
+}
+
+fn assert_no_submission_refs(path: &Path) -> TestResult {
+    let repo = Repository::open(path)?;
+    assert!(repo.references_glob("refs/telete/jobs/*")?.next().is_none());
+    Ok(())
+}
+
+fn create_branch(path: &Path, name: &str) -> TestResult {
+    test_support::branch(path, name, "HEAD")?;
+    test_support::switch(path, name)?;
+    Ok(())
+}
+
+fn remove_branch(path: &Path, name: &str) -> TestResult {
+    Repository::open(path)?
+        .find_branch(name, git2::BranchType::Local)?
+        .delete()?;
+    Ok(())
+}
+
+fn assert_contains(path: &Path, ancestor: &str, revision: &str) -> TestResult {
+    let repo = Repository::open(path)?;
+    assert!(test_support::contains(
+        &repo,
+        Oid::from_str(ancestor)?,
+        Oid::from_str(revision)?
+    )?);
+    Ok(())
 }
 
 fn spawn(mut command: Command) -> TestResult<Child> {
@@ -223,11 +229,8 @@ fn commit_source(worktree: &Path, source: &str) -> TestResult<String> {
 
 fn commit_file(worktree: &Path, file: &str, source: &str) -> TestResult<String> {
     fs::write(worktree.join(file), source)?;
-    checked(git(worktree, &["add", file]))?;
-    checked(git(worktree, &["commit", "--quiet", "-m", source]))?;
-    Ok(checked(git(worktree, &["rev-parse", "HEAD"]))?
-        .trim()
-        .to_owned())
+    let repo = Repository::open(worktree)?;
+    Ok(test_support::record(&repo, &[file], source)?.to_string())
 }
 
 fn finish_jobs(directory: &Path, config: &Path, ids: &[String]) -> TestResult {
@@ -354,24 +357,9 @@ fn cold_project_runs_head_and_keeps_only_success_marker() -> TestResult {
     assert!(!result.contains("\"command\""));
     assert!(!project.state.join("jobs").join(id).exists());
     assert_eq!(fs::read_dir(project.state.join("jobs"))?.count(), 0);
-    assert!(
-        checked(git(
-            &project.repo,
-            &["for-each-ref", "--format=%(refname)", "refs/telete/jobs/"],
-        ))?
-        .trim()
-        .is_empty()
-    );
-    assert_eq!(
-        checked(git(&project.repo, &["worktree", "list", "--porcelain"]))?
-            .matches("worktree ")
-            .count(),
-        1
-    );
-    assert_eq!(
-        checked(git(&project.repo, &["rev-parse", "HEAD"]))?.trim(),
-        project.commit
-    );
+    assert_no_submission_refs(&project.repo)?;
+    assert!(Repository::open(&project.repo)?.worktrees()?.is_empty());
+    assert_eq!(commit(&project.repo, "HEAD")?, project.commit);
     Ok(())
 }
 
@@ -389,14 +377,7 @@ fn configured_repository_wins_over_ambient_git_selectors() -> TestResult {
     let submitted = checked(command)?;
     assert!(submitted.contains(&format!("\"commit\":\"{}\"", project.commit)));
     assert!(!submitted.contains(&foreign_commit));
-    assert!(
-        checked(git(
-            &foreign,
-            &["for-each-ref", "--format=%(refname)", "refs/telete/jobs/"],
-        ))?
-        .trim()
-        .is_empty()
-    );
+    assert_no_submission_refs(&foreign)?;
     checked(project.command(&["wait", job_id(&submitted)?]))?;
     wait_for_worker_ownership(&project.state, false)?;
     Ok(())
@@ -433,14 +414,7 @@ fn concurrent_first_submissions_publish_one_complete_queue() -> TestResult {
         &ids.into_iter().collect::<Vec<_>>(),
     )?;
     wait_for_worker_ownership(&project.state, false)?;
-    assert!(
-        checked(git(
-            &project.repo,
-            &["for-each-ref", "--format=%(refname)", "refs/telete/jobs/"],
-        ))?
-        .trim()
-        .is_empty()
-    );
+    assert_no_submission_refs(&project.repo)?;
     Ok(())
 }
 
@@ -449,30 +423,8 @@ fn batch_release_workflow(project: &Project) -> TestResult {
     let compositions = project.root.join("compositions");
     let prepared = project.root.join("prepared");
     let deployments = project.root.join("deployments");
-    let compose = r"import json,os,pathlib,subprocess
-c=json.load(open(os.environ['TELETE_CONTEXT']))
-b=c['inputs']['batch']
-open(os.environ['COMPOSED'],'a').write(json.dumps(b)+'\n')
-env={k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
-env.update(GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL='/dev/null')
-for member in b['members']:
-    subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-c','commit.gpgSign=false','-c','user.name=Telete CLI Test','-c','user.email=telete-test@example.invalid','merge','--no-edit','--no-ff',member['commit']],env=env,check=True)
-commit=subprocess.check_output(['/usr/bin/git','rev-parse','HEAD'],env=env,text=True).strip()
-pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\n')
-";
-    let deploy = r"import json,os,pathlib,subprocess
-c=json.load(open(os.environ['TELETE_CONTEXT']))
-commit=c['source']['commit']
-main=subprocess.check_output(['/usr/bin/git','-C',os.environ['REPO'],'rev-parse','HEAD'],text=True).strip()
-assert main==commit==pathlib.Path(os.environ['PREPARED']).read_text(), (main,commit)
-assert pathlib.Path('previous.txt').read_text()=='previous release'
-for name in ['change-a','change-b']:
-    assert pathlib.Path(name+'.txt').read_text()==name
-    assert not (pathlib.Path(os.environ['DEVELOPMENT'])/name).exists()
-refs=subprocess.check_output(['/usr/bin/git','for-each-ref','--format=%(refname)','refs/heads'],text=True).splitlines()
-assert refs==['refs/heads/main'], refs
-open(os.environ['DEPLOYED'],'a').write(commit+'\n')
-";
+    let test_executable = std::env::current_exe()?;
+    let fixture_args = test_support::workflow_args();
     fs::write(
         project.root.join("telete.json"),
         serde_json::to_vec(&json!({
@@ -485,8 +437,8 @@ open(os.environ['DEPLOYED'],'a').write(commit+'\n')
             "batch": {
                 "target":"production", "base":project.commit,
                 "compose": {
-                    "program":"/usr/bin/python3", "timeout_seconds":15,
-                    "args":["-c", compose], "env":{"COMPOSED":compositions}
+                    "program":test_executable, "timeout_seconds":15,
+                    "args":fixture_args, "env":{"FIXTURE_ACTION":"compose", "COMPOSED":compositions}
                 }
             },
             "prepare": {
@@ -495,9 +447,9 @@ open(os.environ['DEPLOYED'],'a').write(commit+'\n')
                 "env":{"PREPARED":prepared}
             },
             "deploy": {
-                "program":"/usr/bin/python3", "timeout_seconds":15,
-                "args":["-c", deploy],
-                "env":{"DEPLOYED":deployments,"PREPARED":prepared,"DEVELOPMENT":project.root,"REPO":project.repo}
+                "program":test_executable, "timeout_seconds":15,
+                "args":fixture_args,
+                "env":{"FIXTURE_ACTION":"batch_deploy","DEPLOYED":deployments,"PREPARED":prepared,"DEVELOPMENT":project.root,"REPO":project.repo}
             }
         }))?,
     )?;
@@ -511,18 +463,16 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
     let compositions = project.root.join("compositions");
     let deployments = project.root.join("deployments");
     batch_release_workflow(&project)?;
-    checked(git(&project.repo, &["switch", "-c", "previous-release"]))?;
+    create_branch(&project.repo, "previous-release")?;
     let previous = commit_file(&project.repo, "previous.txt", "previous release")?;
-    checked(git(
-        &project.repo,
-        &[
-            "update-ref",
-            "refs/telete/releases/targets/production",
-            &previous,
-        ],
-    ))?;
-    checked(git(&project.repo, &["switch", "main"]))?;
-    checked(git(&project.repo, &["branch", "-D", "previous-release"]))?;
+    Repository::open(&project.repo)?.reference(
+        "refs/telete/releases/targets/production",
+        Oid::from_str(&previous)?,
+        false,
+        "seed fixture's previous release",
+    )?;
+    test_support::switch(&project.repo, "main")?;
+    remove_branch(&project.repo, "previous-release")?;
     checked(project.command(&["pause"]))?;
     let mut commits = Vec::new();
     let mut ids = Vec::new();
@@ -574,17 +524,10 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
         vec![release]
     );
     for commit in commits.iter().chain([&previous]) {
-        checked(git(
-            &project.repo,
-            &["merge-base", "--is-ancestor", commit, release],
-        ))?;
+        assert_contains(&project.repo, commit, release)?;
     }
     assert_eq!(
-        checked(git(
-            &project.repo,
-            &["rev-parse", "refs/telete/releases/targets/production"]
-        ))?
-        .trim(),
+        commit(&project.repo, "refs/telete/releases/targets/production")?,
         release
     );
     wait_for_worker_ownership(&project.state, false)?;
@@ -621,9 +564,9 @@ fn wait_for_prepared_merge(
 #[test]
 fn automatic_merge_can_retry_after_the_destination_is_clean() -> TestResult {
     let project = Project::new()?;
-    checked(git(&project.repo, &["switch", "-c", "feature"]))?;
+    create_branch(&project.repo, "feature")?;
     let checked_commit = commit_source(&project.repo, "checked source")?;
-    checked(git(&project.repo, &["switch", "main"]))?;
+    test_support::switch(&project.repo, "main")?;
     fs::write(project.repo.join("source.txt"), "uncommitted main edits")?;
     let deployed = project.root.join("deployed");
     fs::write(
@@ -642,16 +585,13 @@ fn automatic_merge_can_retry_after_the_destination_is_clean() -> TestResult {
     assert_eq!(waiting["job"]["phase"], "waiting_merge");
     assert!(waiting["job"]["last_error"].is_string());
     assert!(!deployed.exists());
-    assert_eq!(
-        checked(git(&project.repo, &["rev-parse", "HEAD"]))?.trim(),
-        project.commit
-    );
+    assert_eq!(commit(&project.repo, "HEAD")?, project.commit);
     assert_eq!(
         fs::read_to_string(project.repo.join("source.txt"))?,
         "uncommitted main edits"
     );
 
-    checked(git(&project.repo, &["restore", "--", "source.txt"]))?;
+    fs::write(project.repo.join("source.txt"), "project source")?;
     checked(project.command(&["merge", id]))?;
     let result = checked_json(project.command(&["wait", id]))?;
     assert!(deployed.exists());
@@ -659,10 +599,7 @@ fn automatic_merge_can_retry_after_the_destination_is_clean() -> TestResult {
         result["job"]["merged_commit"],
         waiting["job"]["release_commit"]
     );
-    assert_eq!(
-        checked(git(&project.repo, &["rev-parse", "HEAD"]))?.trim(),
-        checked_commit
-    );
+    assert_eq!(commit(&project.repo, "HEAD")?, checked_commit);
     wait_for_worker_ownership(&project.state, false)?;
     Ok(())
 }
@@ -672,10 +609,12 @@ fn manual_merge_waits_for_the_current_candidate_and_preserves_new_work() -> Test
     let project = Project::new()?;
     checked(project.command(&["worktree", "manual-change"]))?;
     let worktree = project.root.join("manual-change");
-    let commit = commit_source(&worktree, "checked source")?;
+    let submitted_commit = commit_source(&worktree, "checked source")?;
     let config = project.root.join("manual.json");
     let prepared = project.root.join("prepared");
     let deployment = project.root.join("attempted-deployment");
+    let test_executable = std::env::current_exe()?;
+    let fixture_args = test_support::workflow_args();
     fs::write(
         &config,
         serde_json::to_vec(&json!({
@@ -683,14 +622,14 @@ fn manual_merge_waits_for_the_current_candidate_and_preserves_new_work() -> Test
             "check": {"program": "/usr/bin/true"},
             "integration": {"mode": "manual", "branch": "main"},
             "prepare": {
-                "program": "/bin/sh",
-                "args": ["-c", "/usr/bin/git rev-parse HEAD >> \"$PREPARED\""],
-                "env": {"PREPARED": prepared}
+                "program": test_executable,
+                "args": fixture_args,
+                "env": {"FIXTURE_ACTION": "prepare_head", "PREPARED": prepared}
             },
             "deploy": {
-                "program": "/bin/sh",
-                "args": ["-c", "set -eu; /usr/bin/git -C \"$REPO\" rev-parse HEAD > \"$DEPLOYMENT\"; exit 23"],
-                "env": {"REPO": project.repo, "DEPLOYMENT": deployment}
+                "program": test_executable,
+                "args": fixture_args,
+                "env": {"FIXTURE_ACTION": "deploy_head_failure", "REPO": project.repo, "DEPLOYMENT": deployment}
             }
         }))?,
     )?;
@@ -698,18 +637,9 @@ fn manual_merge_waits_for_the_current_candidate_and_preserves_new_work() -> Test
     let id = receipt["id"].as_str().ok_or("missing job ID")?;
     let first = wait_for_prepared_merge(&project, id, None)?;
     assert!(!deployment.exists());
-    assert_eq!(
-        checked(git(&project.repo, &["rev-parse", "HEAD"]))?.trim(),
-        project.commit
-    );
+    assert_eq!(commit(&project.repo, "HEAD")?, project.commit);
     fs::write(worktree.join("source.txt"), "new uncommitted work")?;
-    fs::write(project.repo.join("other.txt"), "another change to main")?;
-    checked(git(&project.repo, &["add", "other.txt"]))?;
-    checked(git(
-        &project.repo,
-        &["commit", "--quiet", "-m", "advance main"],
-    ))?;
-    let moved_main = checked(git(&project.repo, &["rev-parse", "HEAD"]))?;
+    let moved_main = commit_file(&project.repo, "other.txt", "another change to main")?;
 
     checked(project.command(&["merge", id]))?;
     let second = wait_for_prepared_merge(&project, id, Some(&first))?;
@@ -717,10 +647,7 @@ fn manual_merge_waits_for_the_current_candidate_and_preserves_new_work() -> Test
         fs::read_to_string(prepared)?,
         format!("{first}\n{second}\n")
     );
-    checked(git(
-        &project.repo,
-        &["merge-base", "--is-ancestor", moved_main.trim(), &second],
-    ))?;
+    assert_contains(&project.repo, &moved_main, &second)?;
     assert!(!deployment.exists());
 
     checked(project.command(&["merge", id]))?;
@@ -730,13 +657,10 @@ fn manual_merge_waits_for_the_current_candidate_and_preserves_new_work() -> Test
     assert_eq!(result["job"]["phase"], "failed");
     assert_eq!(result["job"]["stopped_phase"], "deploying");
     assert_eq!(result["job"]["merged_commit"], second);
-    let main = checked(git(&project.repo, &["rev-parse", "HEAD"]))?;
-    assert_eq!(fs::read_to_string(&deployment)?, main);
-    assert_eq!(main.trim(), second);
-    checked(git(
-        &project.repo,
-        &["merge-base", "--is-ancestor", &commit, main.trim()],
-    ))?;
+    let main = commit(&project.repo, "HEAD")?;
+    assert_eq!(fs::read_to_string(&deployment)?.trim(), main);
+    assert_eq!(main, second);
+    assert_contains(&project.repo, &submitted_commit, &main)?;
     assert_eq!(
         fs::read_to_string(project.repo.join("source.txt"))?,
         "checked source"
@@ -745,10 +669,7 @@ fn manual_merge_waits_for_the_current_candidate_and_preserves_new_work() -> Test
         fs::read_to_string(worktree.join("source.txt"))?,
         "new uncommitted work"
     );
-    assert_eq!(
-        checked(git(&worktree, &["rev-parse", "HEAD"]))?.trim(),
-        commit
-    );
+    assert_eq!(commit(&worktree, "HEAD")?, submitted_commit);
     wait_for_worker_ownership(&project.state, false)?;
     Ok(())
 }
@@ -775,12 +696,9 @@ fn worktree_uses_configured_head_and_resolves_destination_from_invocation() -> T
     assert!(result.get("state_root").is_none());
     assert!(!project.state.exists());
     assert!(!project.repo.join(".git/telete").exists());
+    assert_eq!(commit(&destination, "HEAD")?, project.commit);
     assert_eq!(
-        checked(git(&destination, &["rev-parse", "HEAD"]))?.trim(),
-        project.commit
-    );
-    assert_eq!(
-        checked(git(&destination, &["branch", "--show-current"]))?.trim(),
+        Repository::open(&destination)?.head()?.shorthand()?,
         "feature-a"
     );
     assert_eq!(
@@ -791,10 +709,7 @@ fn worktree_uses_configured_head_and_resolves_destination_from_invocation() -> T
         fs::read_to_string(project.repo.join("source.txt"))?,
         "uncommitted caller change"
     );
-    assert_eq!(
-        checked(git(&invocation, &["rev-parse", "HEAD"]))?.trim(),
-        foreign_commit
-    );
+    assert_eq!(commit(&invocation, "HEAD")?, foreign_commit);
 
     let occupied = project.root.join("occupied");
     fs::create_dir(&occupied)?;
@@ -802,14 +717,11 @@ fn worktree_uses_configured_head_and_resolves_destination_from_invocation() -> T
     let output = bounded_output(spawn(project.command(&["worktree", "occupied"]))?)?;
     assert!(!output.status.success());
     assert_eq!(fs::read_to_string(occupied.join("keep"))?, "user file");
-    checked(git(&project.repo, &["branch", "existing-branch"]))?;
+    test_support::branch(&project.repo, "existing-branch", "HEAD")?;
     let output = bounded_output(spawn(project.command(&["worktree", "existing-branch"]))?)?;
     assert!(!output.status.success());
     assert!(!project.root.join("existing-branch").exists());
-    assert_eq!(
-        checked(git(&project.repo, &["rev-parse", "existing-branch"]))?.trim(),
-        project.commit
-    );
+    assert_eq!(commit(&project.repo, "existing-branch")?, project.commit);
     Ok(())
 }
 
@@ -935,9 +847,7 @@ fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -
     let nested_path = project.root.join("nested");
     let nested_config = write_worktree_config(&nested_path)?;
     let manual = project.root.join("manual");
-    let mut add_manual = git(&project.repo, &["worktree", "add", "-b", "manual"]);
-    add_manual.arg(&manual).arg(&project.commit);
-    checked(add_manual)?;
+    test_support::worktree(&project.repo, "manual", &manual, &project.commit)?;
     let manual_config = write_worktree_config(&manual)?;
     let original = checked_json(configured_command(
         &child,
@@ -949,10 +859,8 @@ fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -
     let submitted = checked_json(configured_command(&child, &child_config, &["submit"]))?;
     let id = submitted["id"].as_str().ok_or("missing job ID")?.to_owned();
     assert_eq!(submitted["commit"], selected);
-    let mut remove = git(&project.repo, &["worktree", "remove", "--force"]);
-    remove.arg(&child);
-    checked(remove)?;
-    checked(git(&project.repo, &["branch", "-D", "child"]))?;
+    test_support::remove_worktree(&project.repo, &child)?;
+    remove_branch(&project.repo, "child")?;
     assert!(!child.exists());
     for (directory, config) in [(&manual, &manual_config), (&nested_path, &nested_config)] {
         let status = checked_json(configured_command(directory, config, &["status", &id]))?;
@@ -963,10 +871,7 @@ fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -
     checked(configured_command(&manual, &manual_config, &["resume"]))?;
     finish_jobs(&manual, &manual_config, &[original_id, id])?;
     wait_for_worker_ownership(&project.state, false)?;
-    assert_eq!(
-        checked(git(&nested_path, &["rev-parse", "HEAD"]))?.trim(),
-        selected
-    );
+    assert_eq!(commit(&nested_path, "HEAD")?, selected);
     Ok(())
 }
 
@@ -974,9 +879,7 @@ fn nested_and_manual_worktrees_share_accepted_source_after_submitter_removal() -
 fn first_queue_mutation_binds_the_runtime_for_all_worktrees() -> TestResult {
     let project = Project::new()?;
     let manual = project.root.join("independent");
-    let mut add_manual = git(&project.repo, &["worktree", "add", "-b", "independent"]);
-    add_manual.arg(&manual).arg(&project.commit);
-    checked(add_manual)?;
+    test_support::worktree(&project.repo, "independent", &manual, &project.commit)?;
     let config = write_worktree_config(&manual)?;
     checked_json(configured_command(&manual, &config, &["status"]))?;
     assert!(!manual.join(".telete").exists());

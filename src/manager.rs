@@ -412,20 +412,8 @@ pub(crate) fn repair(paths: &Paths, repo: &Path, id: &str, revision: &str) -> Re
 fn validate_repair(paths: &Paths, config: &Config, job: &Job, commit: &CommitId) -> Result<()> {
     let id = &job.id.0;
     let previous = job.effective_commit();
-    let ancestor = git::run(
-        paths,
-        &config.common_git_dir,
-        &[
-            "merge-base".into(),
-            "--is-ancestor".into(),
-            previous.0.clone(),
-            commit.0.clone(),
-        ],
-        None,
-        std::collections::BTreeMap::new(),
-    )?;
     ensure!(
-        ancestor.success(),
+        git::is_ancestor(paths, &config.common_git_dir, previous, commit)?,
         "repair commit must descend from the current job source"
     );
     ensure!(
@@ -481,7 +469,7 @@ fn accept_repair(
         Some(&previous),
         &commit,
     )?;
-    git::value(paths, &checkout, &["reset", "--hard", &commit.0])?;
+    git::reset_private(paths, &checkout, &commit)?;
     let mut queued = job.clone();
     queued.resulting_commit = Some(commit);
     queued.runs.extend(run);

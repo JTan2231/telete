@@ -272,7 +272,7 @@ impl Worker<'_> {
         let Some(member) = git::merge_head(self.paths, &checkout)? else {
             return Ok(None);
         };
-        if git::value(self.paths, &checkout, &["ls-files", "--unmerged"])?.is_empty() {
+        if !git::has_conflicts(&checkout)? {
             return Ok(None);
         }
         git::ensure_detached(self.paths, &checkout)?;
@@ -307,13 +307,9 @@ impl Worker<'_> {
         );
         git::ensure_detached(self.paths, &checkout)?;
         let commit = git::commit(self.paths, &checkout, "HEAD")?;
-        let parents = git::value(
-            self.paths,
-            &checkout,
-            &["rev-list", "--parents", "-n", "1", &commit.0],
-        )?;
+        let parents = git::parents(&checkout, &commit)?;
         ensure!(
-            parents == format!("{commit} {} {}", conflict.head, conflict.member),
+            parents.iter().eq([&conflict.head, &conflict.member]),
             "merge repair must commit the merge of {} and {}",
             conflict.head,
             conflict.member

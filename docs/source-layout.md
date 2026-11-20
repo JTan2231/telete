@@ -5,16 +5,16 @@ Telete is one standalone Rust package. `Cargo.toml` declares its dependencies an
 `cargo build --locked --bin telete`.
 
 `src/main.rs` defines the CLI. The manager coordinates the queue lifecycle; the
-store holds runtime state; Git helpers create private checkouts and retain Telete-authored automatic
-corrections as child commits.
+store holds runtime state. The Git module uses bundled libgit2 to create private
+checkouts and retain Telete-authored automatic corrections as child commits.
 Invocation, process, and broker modules resolve commands, supervise execution,
 and correlate results. Path helpers manage private local storage. The workflow
 module validates project JSON configuration and resolves its repository and
 initial runtime paths. The repository queue module resolves the shared runtime
 binding in Git's common directory. By default, repository workers share one
 execution slot for the macOS account. Each repository has its own private
-supervisor and worker. Development worktree creation uses Git without opening
-or changing runtime state.
+supervisor and worker. Development worktree creation adds a linked checkout
+without opening or changing runtime state.
 
 `ci.sh` selects this repository's `ci/workflow.json` project config, which points
 to `.telete/` for runtime state. `ci/check.sh` runs formatting, Clippy, tests, and a

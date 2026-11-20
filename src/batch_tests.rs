@@ -20,17 +20,9 @@ fn batch_workflow(project: &mut ProjectConfig, base: &CommitId) {
     project.workflow.batch = Some(crate::workflow::BatchConfig {
         target: "production".into(),
         base: base.0.clone(),
-        compose: batch_python(
-            r"import json,os,pathlib,subprocess
-c=json.load(open(os.environ['TELETE_CONTEXT']))
-b=c['inputs']['batch']
-open(os.environ['COMPOSED'],'a').write(json.dumps(b)+'\n')
-for member in b['members']:
-    subprocess.run(['git','-c','user.name=Fixture','-c','user.email=fixture@localhost','merge','--no-edit','--no-ff',member['commit']],check=True)
-commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\n')
-",
-            vec![("COMPOSED", project.state.join("composed.jsonl"))],
+        compose: fixture_command(
+            "compose",
+            [("COMPOSED".into(), project.state.join("composed.jsonl").display().to_string())],
         ),
         merge_repair: None,
     });
@@ -44,18 +36,11 @@ pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\n')
     ));
 }
 
-fn batch_branch(
-    paths: &Paths,
-    project: &ProjectConfig,
-    base: &CommitId,
-    name: &str,
-) -> Result<CommitId> {
-    git::value(paths, &project.repo, &["checkout", "-b", name, &base.0])?;
-    fs::write(
-        project.repo.join(format!("{name}.txt")),
-        format!("{name}\n"),
-    )?;
-    record_commit(paths, &project.repo)
+fn batch_branch(project: &ProjectConfig, base: &CommitId, name: &str) -> Result<CommitId> {
+    crate::test_support::branch(&project.repo, name, &base.0)?;
+    crate::test_support::switch(&project.repo, name)?;
+    fs::write(project.repo.join(format!("{name}.txt")), format!("{name}\n"))?;
+    record_commit(&project.repo)
 }
 
 fn batch_records(path: &Path) -> Result<Vec<Value>> {
@@ -92,17 +77,13 @@ fn batch_freeze(paths: &Paths, id: &str) -> Result<()> {
     bail!("batch fixture did not freeze")
 }
 
-fn batch_contains(
-    paths: &Paths,
-    repo: &Path,
-    source: &CommitId,
-    ancestor: &CommitId,
-) -> Result<()> {
-    git::value(
-        paths,
-        repo,
-        &["merge-base", "--is-ancestor", &ancestor.0, &source.0],
-    )?;
+fn batch_contains(repo: &Path, source: &CommitId, ancestor: &CommitId) -> Result<()> {
+    let repo = git2::Repository::open(repo)?;
+    ensure!(crate::test_support::contains(
+        &repo,
+        git2::Oid::from_str(&ancestor.0)?,
+        git2::Oid::from_str(&source.0)?,
+    )?);
     Ok(())
 }
 
@@ -110,9 +91,8 @@ fn batch_contains(
 fn release_batch_checks_each_divergent_source_once_and_prepares_and_deploys_once() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    let b = batch_branch(&paths, &project, &base, "change-b")?;
+    let a = batch_branch(&project, &base, "change-a")?;
+    let b = batch_branch(&project, &base, "change-b")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     let (_, second) = enqueue(&project, &b.0)?;
 
@@ -130,8 +110,8 @@ fn release_batch_checks_each_divergent_source_once_and_prepares_and_deploys_once
             .as_str()
             .context("release source")?,
     )?;
-    batch_contains(&paths, &project.repo, &release, &a)?;
-    batch_contains(&paths, &project.repo, &release, &b)?;
+    batch_contains(&project.repo, &release, &a)?;
+    batch_contains(&project.repo, &release, &b)?;
     let checks = batch_records(&paths.root.join("checked.jsonl"))?;
     assert_eq!(
         checks,
@@ -181,10 +161,9 @@ fn release_batch_checks_each_divergent_source_once_and_prepares_and_deploys_once
 fn release_batch_freezes_before_later_arrivals_and_next_release_is_cumulative() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    let b = batch_branch(&paths, &project, &base, "change-b")?;
-    let c = batch_branch(&paths, &project, &base, "change-c")?;
+    let a = batch_branch(&project, &base, "change-a")?;
+    let b = batch_branch(&project, &base, "change-b")?;
+    let c = batch_branch(&project, &base, "change-c")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     let (_, second) = enqueue(&project, &b.0)?;
     batch_freeze(&paths, &first)?;
@@ -201,8 +180,8 @@ fn release_batch_freezes_before_later_arrivals_and_next_release_is_cumulative() 
             .context("previous release")?,
     )?;
     let current = CommitId::new(next["release_commit"].as_str().context("next release")?)?;
-    batch_contains(&paths, &project.repo, &current, &previous)?;
-    batch_contains(&paths, &project.repo, &current, &c)?;
+    batch_contains(&project.repo, &current, &previous)?;
+    batch_contains(&project.repo, &current, &c)?;
     let compositions = batch_records(&paths.root.join("composed.jsonl"))?;
     assert_eq!(compositions.len(), 2);
     assert_eq!(
@@ -236,9 +215,8 @@ fn release_batch_freezes_before_later_arrivals_and_next_release_is_cumulative() 
 fn release_batch_does_not_mix_incompatible_deployment_commands_for_the_same_target() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    let b = batch_branch(&paths, &project, &base, "change-b")?;
+    let a = batch_branch(&project, &base, "change-a")?;
+    let b = batch_branch(&project, &base, "change-b")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     project
         .workflow
@@ -283,11 +261,10 @@ fn release_batch_waits_for_member_repairs_while_unrelated_ci_runs() -> Result<()
         "import json,os,pathlib,sys; c=json.load(open(os.environ['TELETE_CONTEXT'])); open(os.environ['ANALYZED'],'a').write(c['job_id']+'\\n'); sys.exit(1 if pathlib.Path('needs-repair').exists() else 0)",
         vec![("ANALYZED", project.state.join("analyzed"))],
     ));
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    batch_branch(&paths, &project, &base, "change-b")?;
+    let a = batch_branch(&project, &base, "change-a")?;
+    batch_branch(&project, &base, "change-b")?;
     fs::write(project.repo.join("needs-repair"), "findings\n")?;
-    let b = record_commit(&paths, &project.repo)?;
+    let b = record_commit(&project.repo)?;
     let (paths, first) = enqueue(&project, &a.0)?;
     let (_, second) = enqueue(&project, &b.0)?;
     for _ in 0..20 {
@@ -311,7 +288,7 @@ fn release_batch_waits_for_member_repairs_while_unrelated_ci_runs() -> Result<()
     assert!(batch_records(&paths.root.join("deployed.jsonl"))?.is_empty());
     fs::remove_file(project.repo.join("needs-repair"))?;
     fs::write(project.repo.join("repaired.txt"), "accepted repair\n")?;
-    let repaired = record_commit(&paths, &project.repo)?;
+    let repaired = record_commit(&project.repo)?;
     let store = Store::open(&paths.root)?;
     let mut interrupted = store.job(&second)?;
     interrupted.repaired_commit = Some(repaired.clone());
@@ -331,8 +308,8 @@ fn release_batch_waits_for_member_repairs_while_unrelated_ci_runs() -> Result<()
             .as_str()
             .context("repaired release")?,
     )?;
-    batch_contains(&paths, &project.repo, &release, &a)?;
-    batch_contains(&paths, &project.repo, &release, &repaired)?;
+    batch_contains(&project.repo, &release, &a)?;
+    batch_contains(&project.repo, &release, &repaired)?;
     assert_eq!(
         fs::read_to_string(paths.root.join("analyzed"))?
             .lines()
@@ -357,9 +334,8 @@ fn release_batch_waits_for_member_repairs_while_unrelated_ci_runs() -> Result<()
 fn release_batch_retains_a_members_failed_check_until_a_newer_workflow_finishes() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    let b = batch_branch(&paths, &project, &base, "change-b")?;
+    let a = batch_branch(&project, &base, "change-a")?;
+    let b = batch_branch(&project, &base, "change-b")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     project.workflow.check = crate::workflow::WorkflowCommand {
         program: "/bin/sh".into(),
@@ -415,14 +391,13 @@ fn release_batch_composition_failure_never_prepares_or_deploys() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
     let batch = project.workflow.batch.as_mut().context("batch")?;
-    batch.compose.args = vec!["-c".into(), "raise SystemExit(7)".into()];
+    batch.compose = batch_python("raise SystemExit(7)", vec![]);
     batch.merge_repair = Some(batch_python(
         "import os,pathlib; pathlib.Path(os.environ['REPAIRED']).touch()",
         vec![("REPAIRED", project.state.join("repaired"))],
     ));
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    let b = batch_branch(&paths, &project, &base, "change-b")?;
+    let a = batch_branch(&project, &base, "change-a")?;
+    let b = batch_branch(&project, &base, "change-b")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     let (_, second) = enqueue(&project, &b.0)?;
     assert_eq!(batch_finish(&paths, &first)?["phase"], "failed");
@@ -454,25 +429,17 @@ fn release_batch_composition_failure_never_prepares_or_deploys() -> Result<()> {
 fn release_batch_repairs_each_conflict_and_reuses_member_checks() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    project.workflow.batch.as_mut().context("batch")?.merge_repair = Some(batch_python(
-        r"import json,os,pathlib,subprocess,sys
-c=json.load(open(os.environ['TELETE_CONTEXT']))
-m=c['inputs']['merge']
-assert c['stage']=='merge_repair' and c['source']['commit']==m['head']
-assert subprocess.check_output(['git','rev-parse','HEAD','MERGE_HEAD'],text=True).splitlines()==[m['head'],m['member']]
-assert 'CONFLICT' in sys.stdin.read()
-open(os.environ['REPAIRED'],'a').write(json.dumps(m)+'\n')
-pathlib.Path('payload.txt').write_text('combined source\n')
-subprocess.run(['git','-c','user.name=Fixture','-c','user.email=fixture@localhost','commit','-am','Resolve merge'],check=True)
-",
-        vec![("REPAIRED", project.state.join("repaired.jsonl"))],
+    project.workflow.batch.as_mut().context("batch")?.merge_repair = Some(fixture_command(
+        "merge_repair",
+        [("REPAIRED".into(), project.state.join("repaired.jsonl").display().to_string())],
     ));
     let paths = Paths::selected(project.state.clone(), false)?;
     let mut sources = Vec::new();
     for name in ["first", "second", "third"] {
-        git::value(&paths, &project.repo, &["checkout", "-b", name, &base.0])?;
+        crate::test_support::branch(&project.repo, name, &base.0)?;
+        crate::test_support::switch(&project.repo, name)?;
         fs::write(project.repo.join("payload.txt"), format!("{name}\n"))?;
-        sources.push(record_commit(&paths, &project.repo)?);
+        sources.push(record_commit(&project.repo)?);
     }
     let mut ids = Vec::new();
     for commit in &sources {
@@ -486,7 +453,7 @@ subprocess.run(['git','-c','user.name=Fixture','-c','user.email=fixture@localhos
         assert_eq!(member["phase"], "succeeded");
         assert_eq!(member["resulting_commit"], commit.0);
         assert_eq!(member["release_commit"], release.0);
-        batch_contains(&paths, &project.repo, &release, commit)?;
+        batch_contains(&project.repo, &release, commit)?;
     }
     let repairs = batch_records(&paths.root.join("repaired.jsonl"))?;
     assert_eq!(repairs.len(), 2);
@@ -503,13 +470,10 @@ subprocess.run(['git','-c','user.name=Fixture','-c','user.email=fixture@localhos
 fn release_batch_rejects_a_successful_composer_that_omits_checked_members() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    project.workflow.batch.as_mut().context("batch")?.compose.args = vec![
-        "-c".into(),
-        "import json,os,pathlib,subprocess; c=json.load(open(os.environ['TELETE_CONTEXT'])); commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(); pathlib.Path(c['outputs']['directory'],'commit').write_text(commit+'\\n')".into(),
-    ];
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    let b = batch_branch(&paths, &project, &base, "change-b")?;
+    project.workflow.batch.as_mut().context("batch")?.compose =
+        fixture_command("empty_compose", []);
+    let a = batch_branch(&project, &base, "change-a")?;
+    let b = batch_branch(&project, &base, "change-b")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     let (_, second) = enqueue(&project, &b.0)?;
     let failed = batch_finish(&paths, &first)?;
@@ -539,8 +503,7 @@ fn release_batch_rejects_a_successful_composer_that_omits_checked_members() -> R
 fn release_batch_never_replays_a_composition_without_terminal_evidence() -> Result<()> {
     let (_temporary, mut project, base) = fixture()?;
     batch_workflow(&mut project, &base);
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
+    let a = batch_branch(&project, &base, "change-a")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     for _ in 0..16 {
         if status(&paths, Some(&first))?["phase"] == "preparing" {
@@ -616,9 +579,8 @@ fn release_batch_records_a_successful_deployment_even_when_cancelled_during_the_
     cancelling_deploy
         .env
         .insert("STATE".into(), project.state.display().to_string());
-    let paths = Paths::selected(project.state.clone(), false)?;
-    let a = batch_branch(&paths, &project, &base, "change-a")?;
-    let b = batch_branch(&paths, &project, &base, "change-b")?;
+    let a = batch_branch(&project, &base, "change-a")?;
+    let b = batch_branch(&project, &base, "change-b")?;
     let (paths, first) = enqueue(&project, &a.0)?;
     let cancelled = batch_finish(&paths, &first)?;
     assert_eq!(cancelled["phase"], "cancelled");
@@ -646,8 +608,8 @@ fn release_batch_records_a_successful_deployment_even_when_cancelled_during_the_
             .as_str()
             .context("next source")?,
     )?;
-    batch_contains(&paths, &project.repo, &current, &released)?;
-    batch_contains(&paths, &project.repo, &current, &b)?;
+    batch_contains(&project.repo, &current, &released)?;
+    batch_contains(&project.repo, &current, &b)?;
     let compositions = batch_records(&paths.root.join("composed.jsonl"))?;
     assert_eq!(compositions.len(), 2);
     assert_eq!(compositions[1]["base"], released.0);

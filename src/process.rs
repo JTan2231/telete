@@ -166,15 +166,7 @@ fn prepare_context(paths: &Paths, spec: &CommandSpec) -> Result<()> {
 
 #[cfg(test)]
 fn run(paths: &Paths, spec: &CommandSpec) -> Result<ProcessResult> {
-    run_without(paths, spec, &[])
-}
-
-pub(crate) fn run_without(
-    paths: &Paths,
-    spec: &CommandSpec,
-    removed: &[std::ffi::OsString],
-) -> Result<ProcessResult> {
-    run_command(paths, spec, removed, None)
+    run_command(paths, spec, None)
 }
 
 pub(crate) fn boot_id() -> Result<String> {
@@ -240,7 +232,6 @@ fn record_process_group(command: &mut Command, file: File) {
 fn run_command(
     paths: &Paths,
     spec: &CommandSpec,
-    removed: &[std::ffi::OsString],
     group_record: Option<File>,
 ) -> Result<ProcessResult> {
     ensure!(
@@ -249,9 +240,6 @@ fn run_command(
     );
     prepare_context(paths, spec)?;
     let mut command = Command::new(&spec.program);
-    for name in removed {
-        command.env_remove(name);
-    }
     command
         .args(&spec.args)
         .current_dir(&spec.cwd)
@@ -517,7 +505,7 @@ pub(crate) fn execute_request(paths: &Paths, directory: &std::path::Path) -> Res
             boot_id: Some(boot_id()?),
         },
     )?;
-    let result = run_command(paths, &request, &[], Some(group))?;
+    let result = run_command(paths, &request, Some(group))?;
     paths::atomic_json(
         &directory.join("result.json"),
         &Completion {
@@ -729,20 +717,6 @@ mod tests {
         assert_eq!(saved, context.value);
         let metadata = std::fs::metadata(&context.path).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    fn selected_environment_removals_allow_explicit_overrides() {
-        let (_temporary, paths, mut request) = fixture();
-        request.args = vec!["-c".into(), "printf '%s' \"${HOME-unset}\"".into()];
-        let removed = [std::ffi::OsString::from("HOME")];
-        let result = run_without(&paths, &request, &removed).unwrap();
-        assert!(result.success());
-        assert_eq!(result.stdout, "unset");
-        request.env.insert("HOME".into(), "/explicit/home".into());
-        let result = run_without(&paths, &request, &removed).unwrap();
-        assert!(result.success());
-        assert_eq!(result.stdout, "/explicit/home");
     }
 
     #[test]

@@ -15,6 +15,9 @@ Install the release binary and manual:
 
 Ensure `~/.local/bin` is on your `PATH`.
 
+Telete uses bundled libgit2 for repository operations. Configured workflow
+commands can bring their own tools.
+
 ## Use
 
 Every command selects a project JSON configuration. Submit the configured

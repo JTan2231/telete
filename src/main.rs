@@ -9,6 +9,9 @@ mod repository_queue;
 mod runtime;
 mod shared_queue;
 mod store;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
 mod workflow;
 
 use anyhow::{Context, Result};
@@ -116,7 +119,12 @@ enum Maintenance {
 async fn main() {
     let cli = Cli::parse();
     let machine = cli.json;
-    match execute(cli).await {
+    let result = async {
+        git::configure()?;
+        execute(cli).await
+    }
+    .await;
+    match result {
         Ok((value, code)) => {
             if let Err(error) = print_result(&value, machine) {
                 eprintln!("telete: {error:#}");

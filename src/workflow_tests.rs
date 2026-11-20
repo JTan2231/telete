@@ -6,11 +6,23 @@ fn script(path: &Path, body: &str) -> Result<()> {
     Ok(())
 }
 
-fn record_commit(paths: &Paths, repo: &Path) -> Result<CommitId> {
-    git::value(paths, repo, &["add", "."])?;
-    git::value(paths, repo, &["-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
-        "commit", "-m", "Fixture source"])?;
-    git::commit(paths, repo, "HEAD")
+fn record_commit(repo: &Path) -> Result<CommitId> {
+    let repo = git2::Repository::open(repo)?;
+    CommitId::new(crate::test_support::record(&repo, &[], "Fixture source")?.to_string())
+}
+
+fn fixture_command(
+    action: &str,
+    env: impl IntoIterator<Item = (String, String)>,
+) -> crate::workflow::WorkflowCommand {
+    let mut env: BTreeMap<_, _> = env.into_iter().collect();
+    env.insert("FIXTURE_ACTION".into(), action.into());
+    crate::workflow::WorkflowCommand {
+        program: std::env::current_exe().expect("fixture executable"),
+        args: crate::test_support::workflow_args(),
+        env,
+        timeout_seconds: Some(20),
+    }
 }
 
 fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
@@ -19,10 +31,10 @@ fn fixture() -> Result<(tempfile::TempDir, ProjectConfig, CommitId)> {
     let repo = directory.join("project");
     fs::create_dir(&repo)?;
     let paths = Paths::selected(directory.join("state"), false)?;
-    git::value(&paths, &repo, &["init", "--initial-branch=main"])?;
+    crate::test_support::init(&repo)?;
     fs::write(repo.join("payload.txt"), "selected source\n")?;
     script(&repo.join("check.sh"), "cat payload.txt >> \"$MARKER\"")?;
-    let commit = record_commit(&paths, &repo)?;
+    let commit = record_commit(&repo)?;
     let project = ProjectConfig { repo, state:paths.root.clone(), queue:QueueMode::Repository, workflow:Workflow {
         fix:None, analyze:None, repair:None, check:crate::workflow::WorkflowCommand { program:"check.sh".into(), args:Vec::new(),
             timeout_seconds:Some(10), env:BTreeMap::from([("MARKER".into(),
@@ -71,7 +83,7 @@ fn source_is_resolved_at_submission_and_success_discards_details() -> Result<()>
     let (paths, id) = enqueue(&project, "HEAD")?;
     assert_eq!(status(&paths, Some(&id))?["commit"], original.0);
     fs::write(project.repo.join("payload.txt"), "later source\n")?;
-    let later = record_commit(&paths, &project.repo)?;
+    let later = record_commit(&project.repo)?;
     fs::write(project.repo.join("payload.txt"), "dirty caller\n")?;
     script(&project.repo.join("check.sh"), "exit 88")?;
     fs::write(project.repo.join("untracked"), "caller only")?;
@@ -97,10 +109,9 @@ fn linked_checkouts_submit_in_one_order_with_their_selected_workflows() -> Resul
     let (temporary, project, original) = fixture()?;
     let (paths, first) = enqueue(&project, "HEAD")?;
     let linked = temporary.path().canonicalize()?.join("feature");
-    git::value(&paths, &project.repo, &["worktree", "add", "-b", "feature",
-        linked.to_str().context("linked path")?, &original.0])?;
+    crate::test_support::worktree(&project.repo, "feature", &linked, &original.0)?;
     fs::write(linked.join("payload.txt"), "feature source\n")?;
-    let selected = record_commit(&paths, &linked)?;
+    let selected = record_commit(&linked)?;
     let mut workflow = project.workflow.clone();
     workflow.check.program = "/bin/sh".into();
     workflow.check.args = vec!["-c".into(), "printf '%s: ' \"$MODE\" >> \"$MARKER\"; cat payload.txt >> \"$MARKER\"".into()];
@@ -124,17 +135,14 @@ fn linked_checkouts_submit_in_one_order_with_their_selected_workflows() -> Resul
 #[test]
 fn accepted_source_survives_removal_of_the_queue_origin_checkout() -> Result<()> {
     let (temporary, mut project, original) = fixture()?;
-    let paths = Paths::selected(project.state.clone(), false)?;
     let primary = project.repo.clone();
     let linked = temporary.path().canonicalize()?.join("feature");
-    git::value(&paths, &primary, &["worktree", "add", "-b", "feature",
-        linked.to_str().context("linked path")?, &original.0])?;
+    crate::test_support::worktree(&primary, "feature", &linked, &original.0)?;
     project.repo = linked.clone();
     let (paths, id) = enqueue(&project, "HEAD")?;
     assert_eq!(Store::open(&paths.root)?.config()?.repository, linked);
     assert!(paths.job(&id).join("worktree").is_dir());
-    git::value(&paths, &primary, &["worktree", "remove",
-        linked.to_str().context("linked path")?])?;
+    crate::test_support::remove_worktree(&primary, &linked)?;
     assert!(!linked.exists());
     assert_eq!(finish_run(&paths, &id)?["phase"], "succeeded");
     assert_eq!(fs::read_to_string(paths.root.join("observed"))?, "selected source\n");
@@ -263,7 +271,7 @@ fn config_cannot_rebind_existing_queue_to_a_different_checkout() -> Result<()> {
     let before = fs::read(paths.root.join("queue.sqlite3"))?;
     let other_repo = project.repo.with_file_name("other-project");
     fs::create_dir(&other_repo)?;
-    git::value(&paths, &other_repo, &["init", "--initial-branch=main"])?;
+    crate::test_support::init(&other_repo)?;
     let mut changed = project;
     changed.repo = other_repo;
     assert!(select(&changed, true).is_err());
@@ -358,13 +366,11 @@ fn automatic_edits(project: &mut ProjectConfig, body: &str) {
 #[test]
 fn automatic_edits_create_a_retained_telete_child_checked_and_deployed_as_source() -> Result<()> {
     let (_temporary, mut project, original) = fixture()?;
-    automatic_edits(&mut project, "printf 'corrected source\\n' > payload.txt; printf generated > build-output");
-    let observer = crate::workflow::WorkflowCommand {
-        program: "/usr/bin/python3".into(), args: vec!["-c".into(),
-            "import json,os,pathlib,subprocess; c=json.load(open(os.environ['TELETE_CONTEXT'])); assert c['source']['commit']==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(); assert c['source']['submitted_commit']!=c['source']['commit']; assert pathlib.Path(c['inputs']['fix']).is_dir(); pathlib.Path(os.environ['MARKER']).write_text(json.dumps(c))".into()],
-        env: BTreeMap::from([("MARKER".into(), project.state.join("source.json").display().to_string())]),
-        timeout_seconds: Some(20),
-    };
+    project.workflow.fix = Some(fixture_command("stage_fix", []));
+    let observer = fixture_command(
+        "observe_fix",
+        [("MARKER".into(), project.state.join("source.json").display().to_string())],
+    );
     project.workflow.check = observer.clone();
     project.workflow.deploy = Some(observer);
     let (paths, id) = enqueue(&project, "HEAD")?;
@@ -373,11 +379,22 @@ fn automatic_edits_create_a_retained_telete_child_checked_and_deployed_as_source
     assert_eq!(fixed["phase"], "checking");
     let derived = fixed["resulting_commit"].as_str().context("resulting commit")?;
     assert_ne!(derived, original.0);
-    let parents = git::value(&paths, &project.repo, &["rev-list", "--parents", "-n", "1", derived])?;
-    assert_eq!(parents, format!("{derived} {original}"));
-    let identity = git::value(&paths, &project.repo, &["show", "-s", "--format=%an <%ae>|%cn <%ce>", derived])?;
-    assert_eq!(identity, "Telete <telete@localhost>|Telete <telete@localhost>");
-    assert_eq!(git::value(&paths, &project.repo, &["diff", "--name-only", &original.0, derived])?, "payload.txt");
+    {
+        let repo = git2::Repository::open(&project.repo)?;
+        let commit = repo.find_commit(git2::Oid::from_str(derived)?)?;
+        assert_eq!(commit.parent_count(), 1);
+        let parent = commit.parent(0)?;
+        assert_eq!(parent.id().to_string(), original.0);
+        for signature in [commit.author(), commit.committer()] {
+            assert_eq!(signature.name()?, "Telete");
+            assert_eq!(signature.email()?, "telete@localhost");
+        }
+        let diff = repo.diff_tree_to_tree(Some(&parent.tree()?), Some(&commit.tree()?), None)?;
+        let changed: Vec<_> = diff.deltas().map(|delta| delta.new_file().path()).collect();
+        assert_eq!(changed, [Some(Path::new("payload.txt"))]);
+        let entry = commit.tree()?.get_path(Path::new("payload.txt"))?;
+        assert_eq!(repo.find_blob(entry.id())?.content(), b"corrected source\n");
+    }
     assert_eq!(fixed["stages"][0]["commit"], original.0);
     assert_eq!(fixed["stages"][1]["commit"], derived);
     let completion = finish_run(&paths, &id)?;
@@ -516,7 +533,7 @@ fn analysis_findings_release_the_queue_and_repairs_skip_analysis() -> Result<()>
 
     fs::write(project.repo.join("payload.txt"), "agent repair\n")?;
     fs::write(project.repo.join("new-source.txt"), "new tracked file\n")?;
-    let repaired = record_commit(&paths, &project.repo)?;
+    let repaired = record_commit(&project.repo)?;
     let receipt = repair(&paths, &project.repo, &id, "HEAD")?;
     assert_eq!(receipt["phase"], "queued");
     assert_eq!(receipt["analyzed_commit"], original.0);
@@ -549,14 +566,15 @@ fn interrupted_repair_handoff_reuses_its_selected_commit() -> Result<()> {
     worker_once(&paths)?;
     worker_once(&paths)?;
     fs::write(project.repo.join("payload.txt"), "repaired\n")?;
-    let repaired = record_commit(&paths, &project.repo)?;
+    let repaired = record_commit(&project.repo)?;
     let store = Store::open(&paths.root)?;
     let mut job = store.job(&id)?;
     job.repaired_commit = Some(repaired.clone());
     store.save(&mut job)?;
     git::advance(&paths, &project.repo, &git::result_ref(&id)?, Some(&original), &repaired)?;
     // A reset can stop after changing HEAD but before restoring every tracked file.
-    git::value(&paths, &paths.job(&id).join("worktree"), &["reset", "--hard", &repaired.0])?;
+    let checkout = git2::Repository::open(paths.job(&id).join("worktree"))?;
+    checkout.reset(&checkout.revparse_single(&repaired.0)?, git2::ResetType::Hard, None)?;
     fs::write(paths.job(&id).join("worktree/payload.txt"), "partial reset\n")?;
     assert!(cancel(&paths, &id).is_err());
     assert_eq!(repair(&paths, &project.repo, &id, "HEAD")?["phase"], "queued");
@@ -600,7 +618,7 @@ fn build_repairs_repeat_only_the_check_and_preserve_the_original_analysis() -> R
     assert_eq!(status(&paths, Some(&id))?["phase"], "awaiting_repair");
     assert_eq!(status(&paths, Some(&id))?["stopped_phase"], "checking");
     fs::write(project.repo.join("payload.txt"), "still broken\n")?;
-    let first = record_commit(&paths, &project.repo)?;
+    let first = record_commit(&project.repo)?;
     repair(&paths, &project.repo, &id, "HEAD")?;
     worker_once(&paths)?;
     worker_once(&paths)?;
@@ -609,7 +627,7 @@ fn build_repairs_repeat_only_the_check_and_preserve_the_original_analysis() -> R
     assert_eq!(waiting["resulting_commit"], first.0);
     assert!(repair(&paths, &project.repo, &id, &original.0).is_err());
     fs::write(project.repo.join("payload.txt"), "done\n")?;
-    let final_source = record_commit(&paths, &project.repo)?;
+    let final_source = record_commit(&project.repo)?;
     repair(&paths, &project.repo, &id, "HEAD")?;
     let completion = finish_run(&paths, &id)?;
     assert_eq!(completion["phase"], "succeeded");
@@ -623,24 +641,14 @@ fn automatic_check_repair(project: &mut ProjectConfig, replacement: &str) {
     project.workflow.check.program = "/bin/sh".into();
     project.workflow.check.args = vec!["-c".into(),
         "if [ \"$(cat payload.txt)\" = done ]; then cat payload.txt >> \"$MARKER\"; else printf stdout; printf stderr >&2; exit 7; fi".into()];
-    project.workflow.repair = Some(crate::workflow::WorkflowCommand {
-        program: "/bin/sh".into(),
-        args: vec!["-c".into(), r#"
-            set -eu
-            if git symbolic-ref -q HEAD; then exit 9; fi
-            printf repair >> "$ATTEMPTS"
-            cat > "$DIAGNOSTICS"
-            printf stdoutstderr | cmp - "$DIAGNOSTICS"
-            printf '%s\n' "$1" > payload.txt
-            git add payload.txt
-            git -c user.name=Fixture -c user.email=fixture@localhost commit -m 'Repair source'
-        "#.into(), "repair".into(), replacement.into()],
-        env: BTreeMap::from([
+    project.workflow.repair = Some(fixture_command(
+        "repair",
+        [
             ("ATTEMPTS".into(), project.state.join("repair-attempts").display().to_string()),
             ("DIAGNOSTICS".into(), project.state.join("repair-input").display().to_string()),
-        ]),
-        timeout_seconds: Some(10),
-    });
+            ("REPLACEMENT".into(), replacement.into()),
+        ],
+    ));
 }
 
 #[test]
@@ -686,9 +694,12 @@ fn automatic_repair_runs_once_before_a_failed_recheck_waits_for_manual_repair() 
     assert_eq!(waiting["repaired_commit"], repaired.0);
     assert!(Store::open(&paths.root)?.active()?.is_none());
 
-    git::value(&paths, &project.repo, &["checkout", "--detach", &repaired.0])?;
+    let repo = git2::Repository::open(&project.repo)?;
+    let selected = repo.revparse_single(&repaired.0)?;
+    repo.checkout_tree(&selected, None)?;
+    repo.set_head_detached(selected.id())?;
     fs::write(project.repo.join("payload.txt"), "done\n")?;
-    let manual = record_commit(&paths, &project.repo)?;
+    let manual = record_commit(&project.repo)?;
     assert_eq!(repair(&paths, &project.repo, &id, &manual.0)?["phase"], "queued");
     let completion = finish_run(&paths, &id)?;
     assert_eq!(completion["phase"], "succeeded");
