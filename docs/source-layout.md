@@ -35,12 +35,15 @@ continues with the accepted source. Telete retains automatic
 edits under a result ref and identifies both submitted and checked source.
 Configured commands own formatter, linter, and release-version policy.
 
-Optional deployment batching closes a group of admitted compatible requests at
-the first successful individual check. The manager waits for member checks,
-runs a configured composition command, then prepares the retained combined
-source. With integration enabled, the manager advances the configured local
-branch to the prepared commit and cleans up eligible Telete-created worktrees
-before deploying that commit. Git helpers retain release commits and the latest
-successful source for each target.
+Optional deployment batching closes a group of admitted compatible requests
+after the opening job's CI. With a batch check configured, the manager composes
+the submitted commits and checks and repairs the combined source. Other batched
+workflows compose the members' individually checked commits. With integration
+enabled, the manager advances the configured local branch to the prepared
+commit and cleans up eligible Telete-created worktrees before deploying it.
+Git helpers retain release commits and the latest successful source for each
+target. The shared report exposes the same release state from every member.
+The retry manager admits a new attempt for the frozen inputs of a failed
+release.
 
 Read [Operate Telete](queue-operate.md) for the command and execution contract.

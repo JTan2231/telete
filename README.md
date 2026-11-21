@@ -42,8 +42,10 @@ alongside other projects, one job at a time. See the
 [queue modes](docs/queue-operate.md#choose-a-queue-mode).
 
 Optional [deployment batching](docs/queue-operate.md#batch-deployment-requests)
-runs each change's CI, freezes already queued compatible requests into a group,
-and combines their checked commits for one preparation and deployment.
+freezes compatible requests after preliminary CI and combines them for one
+deployment. A batch can run CI and automatic repair on the combined candidate.
+Inspect shared state with `telete status JOB` and retry a failed release with
+`telete retry JOB` from any of its members.
 
 ## Further documentation
 

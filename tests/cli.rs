@@ -457,6 +457,60 @@ fn batch_release_workflow(project: &Project) -> TestResult {
 }
 
 #[test]
+fn retry_starts_a_new_worker_for_a_settled_release() -> TestResult {
+    let project = Project::new()?;
+    let ready = project.root.join("allow-release");
+    fs::write(
+        project.root.join("telete.json"),
+        serde_json::to_vec(&json!({
+            "repo": "repo",
+            "state": "state",
+            "queue": "repository",
+            "check": {"program": "/usr/bin/true"},
+            "integration": {"mode": "off"},
+            "deploy": {"program": "/usr/bin/true"},
+            "batch": {
+                "target": "production",
+                "base": "main",
+                "compose": {
+                    "program": std::env::current_exe()?,
+                    "args": test_support::workflow_args(),
+                    "env": {"FIXTURE_ACTION":"compose","COMPOSED":project.root.join("composed.jsonl")}
+                },
+                "check": {"program": "/bin/test", "args": ["-f", ready.to_str().unwrap()]}
+            }
+        }))?,
+    )?;
+    let first = checked_json(project.command(&["submit"]))?;
+    let original = first["id"].as_str().unwrap();
+    let observed = bounded_output(spawn(project.command(&[
+        "wait",
+        original,
+        "--timeout",
+        "20",
+    ]))?)?;
+    assert_eq!(observed.status.code(), Some(1));
+    let observed: Value = serde_json::from_slice(&observed.stdout)?;
+    assert_eq!(
+        observed["job"]["release"]["failure"]["stage"],
+        "release_check"
+    );
+    assert_eq!(observed["job"]["release"]["next_action"], "retry");
+    wait_for_worker_ownership(&project.state, false)?;
+
+    fs::write(&ready, "")?;
+    let retry = checked_json(project.command(&["retry", original]))?;
+    assert_eq!(retry["retry_of"], original);
+    let attempt = retry["id"].as_str().unwrap();
+    let settled = checked_json(project.command(&["wait", attempt, "--timeout", "20"]))?;
+    assert_eq!(settled["job"]["phase"], "succeeded");
+    assert_eq!(settled["job"]["release"]["retry_of"], original);
+    assert_eq!(checked_json(project.command(&["retry", original]))?, retry);
+    wait_for_worker_ownership(&project.state, false)?;
+    Ok(())
+}
+
+#[test]
 fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> TestResult {
     let project = Project::new()?;
     let checked_sources = project.root.join("checked");

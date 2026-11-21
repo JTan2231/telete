@@ -55,8 +55,9 @@ pub(crate) fn bind(
     if let Some(release) = &job.release_id {
         source["release_id"] = json!(release);
     }
-    if job.release_id.is_some()
-        || (job.workflow.integration().is_some() && matches!(stage, "prepare" | "deploy"))
+    if !job.workflow.combined_release()
+        && (job.release_id.is_some()
+            || (job.workflow.integration().is_some() && matches!(stage, "prepare" | "deploy")))
     {
         source["checked_commit"] = json!(job.effective_commit());
     }

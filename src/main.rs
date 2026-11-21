@@ -67,6 +67,10 @@ enum Command {
     Recover {
         job: String,
     },
+    /// Retry a settled failed release with all its frozen members.
+    Retry {
+        job: String,
+    },
     /// Accept committed agent repairs and continue after completed analysis.
     Repair {
         job: String,
@@ -213,7 +217,7 @@ async fn execute(cli: Cli) -> Result<(serde_json::Value, i32)> {
     );
     let paths = manager::select(&project, create)?;
     let follow = matches!(&cli.command, Command::Submit { follow: true, .. });
-    let submission = matches!(&cli.command, Command::Submit { .. });
+    let submission = matches!(&cli.command, Command::Submit { .. } | Command::Retry { .. });
     let result = match cli.command {
         Command::Submit { revision, .. } => manager::submit(
             &paths,
@@ -228,6 +232,7 @@ async fn execute(cli: Cli) -> Result<(serde_json::Value, i32)> {
         Command::Resume => manager::resume(&paths),
         Command::Cancel { job } => manager::cancel(&paths, &job),
         Command::Recover { job } => manager::recover(&paths, &job),
+        Command::Retry { job } => manager::retry(&paths, &job),
         Command::Repair { job, revision } => {
             manager::repair(&paths, &project.repo, &job, &revision)
         }

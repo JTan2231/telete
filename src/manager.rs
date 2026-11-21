@@ -1,5 +1,6 @@
 //! Serial execution of configured committed-source workflows.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -19,6 +20,11 @@ mod batch_manager;
 #[path = "integration_manager.rs"]
 mod integration_manager;
 pub(crate) use integration_manager::request_merge as merge;
+#[path = "retry_manager.rs"]
+mod retry_manager;
+pub(crate) use retry_manager::request_retry as retry;
+#[path = "release_report.rs"]
+mod release_report;
 #[path = "workflow_manager.rs"]
 mod workflow_manager;
 
@@ -154,6 +160,8 @@ fn new_job(id: JobId, commit: CommitId, workflow: Workflow) -> Job {
         analyzed_commit: None,
         repaired_commit: None,
         release_id: None,
+        retry_of: None,
+        recheck: None,
         batch: None,
         release_commit: None,
         integration_base: None,
@@ -230,38 +238,53 @@ pub(crate) fn project_status(
     Ok(value)
 }
 
-fn job_status(store: &Store, id: &str) -> Result<Value> {
-    if let Some(completion) = store.completion(id)? {
-        return Ok(completion);
-    }
-    let job = store.job(id)?;
-    let mut output = job.output()?;
-    if job.phase == Phase::WaitingRelease
-        && let Some(release) = &job.release_id
-        && *release != job.id
-    {
-        let leader = store.job(&release.0)?;
-        output["release_phase"] = json!(leader.phase);
-        if let Some(commit) = leader.merged_commit {
-            output["merged_commit"] = json!(commit);
+fn job_status(paths: &Paths, store: &Store, id: &str) -> Result<Value> {
+    store.snapshot(|| {
+        let mut value = match store.completion(id)? {
+            Some(completion) => completion,
+            None => store.job(id)?.output()?,
+        };
+        let Some(release) = value["release_id"].as_str() else {
+            return Ok(value);
+        };
+        let release = JobId::new(release)?;
+        let jobs = store.jobs()?;
+        if value["phase"] == "waiting_release"
+            && value["id"] != release.0
+            && let Some(leader) = jobs.iter().find(|job| job.id == release)
+        {
+            value["release_phase"] = json!(leader.phase);
+            if let Some(commit) = &leader.merged_commit {
+                value["merged_commit"] = json!(commit);
+            }
+            if leader.phase == Phase::WaitingMerge {
+                value["merge_requested"] = json!(leader.merge_requested);
+            }
         }
-        if leader.phase == Phase::WaitingMerge {
-            output["merge_requested"] = json!(leader.merge_requested);
-        }
-    }
-    Ok(output)
+        let completions = if jobs.iter().any(|job| job.id == release) {
+            Vec::new()
+        } else {
+            store.completion_list()?
+        };
+        value["release"] = release_report::output(paths, store, &jobs, &completions, &release)?;
+        Ok(value)
+    })
 }
 
 pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
     if store::probe_config(&paths.root)?.is_none() {
         ensure!(id.is_none(), "no retained result for this job");
         return Ok(json!({"schema_version":3,"paused":false,"active":null,
-            "queue":[],"awaiting_repair":[],"waiting_release":[],"waiting_merge":[],"failure":null,"completions":[],"maintenance_owners":[]}));
+            "queue":[],"awaiting_repair":[],"waiting_release":[],"waiting_merge":[],"failure":null,"completions":[],"releases":[],"maintenance_owners":[]}));
     }
     let (store, config) = configured(paths)?;
     if let Some(id) = id {
-        return job_status(&store, id);
+        return job_status(paths, &store, id);
     }
+    store.snapshot(|| queue_status(paths, &store, &config))
+}
+
+fn queue_status(paths: &Paths, store: &Store, config: &Config) -> Result<Value> {
     let jobs = store.jobs()?;
     let queue = jobs
         .iter()
@@ -289,13 +312,24 @@ pub(crate) fn status(paths: &Paths, id: Option<&str>) -> Result<Value> {
         .filter(|job| job.phase == Phase::WaitingMerge)
         .map(Job::output)
         .collect::<Result<Vec<_>>>()?;
+    let completions = store.completion_list()?;
+    let mut release_ids = BTreeSet::new();
+    for job in &jobs {
+        if let Some(id) = &job.release_id {
+            release_ids.insert(&id.0);
+        }
+    }
+    let releases = release_ids
+        .into_iter()
+        .map(|id| release_report::output(paths, store, &jobs, &completions, &JobId::new(id)?))
+        .collect::<Result<Vec<_>>>()?;
     Ok(
         json!({"schema_version":3,"version":env!("CARGO_PKG_VERSION"),
         "paused":store.paused()?,"config":config,
-        "active":store.active()?.map(|job|job.output()).transpose()?,
+        "active":Store::active_job(&jobs)?.map(Job::output).transpose()?,
         "queue":queue,"awaiting_repair":awaiting_repair,"waiting_release":waiting_release,
         "waiting_merge":waiting_merge,
-        "failure":failure,"completions":store.completion_list()?,
+        "failure":failure,"completions":completions,"releases":releases,
         "maintenance_owners":store.holds()?}),
     )
 }
@@ -306,12 +340,16 @@ pub(crate) async fn wait(paths: &Paths, id: &str, timeout_seconds: Option<u64>) 
     loop {
         let value = status(paths, Some(id))?;
         let phase = value["phase"].as_str().context("job has no phase")?;
-        if matches!(
+        let terminal = matches!(
             phase,
             "succeeded" | "failed" | "cancelled" | "blocked" | "awaiting_repair"
-        ) || ((phase == "waiting_merge" || value["release_phase"] == "waiting_merge")
-            && value["merge_requested"] != true)
-        {
+        ) || matches!(
+            value["release"]["next_action"].as_str(),
+            Some("repair" | "recover" | "merge")
+        ) || ((phase == "waiting_merge"
+            || value["release_phase"] == "waiting_merge")
+            && value["merge_requested"] != true);
+        if terminal && value["release"]["blocker"]["kind"] != "settling" {
             return Ok(json!({"observation":"terminal","job":value}));
         }
         if timeout_seconds.is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
@@ -386,7 +424,7 @@ pub(crate) fn cancel(paths: &Paths, id: &str) -> Result<Value> {
         }
         Ok(())
     })?;
-    job_status(&store, id)
+    job_status(paths, &store, id)
 }
 
 /// An explicit repair accepts a new source identity without repeating analysis.
@@ -553,6 +591,8 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
                 | Phase::Repairing
                 | Phase::Composing
                 | Phase::RepairingMerge
+                | Phase::CheckingRelease
+                | Phase::RepairingRelease
                 | Phase::Preparing
                 | Phase::Deploying
         ),
@@ -569,7 +609,7 @@ pub(crate) fn recover(paths: &Paths, id: &str) -> Result<Value> {
     if queue_mode(&worker.store)? == QueueMode::Repository {
         worker.tick()?;
     }
-    job_status(&worker.store, id)
+    job_status(paths, &worker.store, id)
 }
 
 #[cfg(test)]
@@ -608,7 +648,7 @@ pub(crate) fn needs_worker(paths: &Paths) -> Result<bool> {
 fn needs_worker_in(store: &Store) -> Result<bool> {
     let latest = store.get::<u64>("latest_finished_sequence")?;
     let jobs = store.jobs()?;
-    Ok(jobs.iter().any(|job| {
+    if jobs.iter().any(|job| {
         let retained_failure = job.phase == Phase::Failed
             && (Some(job.sequence) == latest
                 || job.release_id.as_ref().is_some_and(|id| {
@@ -619,7 +659,15 @@ fn needs_worker_in(store: &Store) -> Result<bool> {
                     })
                 }));
         job.phase != Phase::AwaitingRepair && !retained_failure
-    }))
+    }) {
+        return Ok(true);
+    }
+    for job in &jobs {
+        if retry_manager::awaiting_retry_recipe(store, &jobs, job)? {
+            return Ok(true);
+        }
+    }
+    store.has_stale_retries()
 }
 
 fn next_job(store: &Store, mode: QueueMode) -> Result<Option<Job>> {
@@ -632,13 +680,20 @@ fn next_job(store: &Store, mode: QueueMode) -> Result<Option<Job>> {
     if store.paused()? || !store.holds()?.is_empty() {
         return Ok(None);
     }
-    let releases = Worker::ready_releases(&jobs)?;
+    next_in_queue(&jobs, mode)
+}
+
+fn next_in_queue(jobs: &[Job], mode: QueueMode) -> Result<Option<Job>> {
+    let releases = Worker::ready_releases(jobs)?;
     let merges = jobs
         .iter()
         .filter(|job| job.phase == Phase::WaitingMerge && job.merge_requested)
         .cloned()
         .collect::<Vec<_>>();
-    let mut queued = jobs.into_iter().filter(|job| job.phase == Phase::Queued);
+    let mut queued = jobs
+        .iter()
+        .filter(|job| job.phase == Phase::Queued)
+        .cloned();
     if mode == QueueMode::Repository {
         return Ok(merges
             .into_iter()
@@ -798,7 +853,7 @@ impl Worker<'_> {
         if job.phase.terminal() {
             self.forget_idle()?;
         }
-        job_status(&self.store, &job.id.0)
+        job_status(self.paths, &self.store, &job.id.0)
     }
 
     fn forget_idle(&self) -> Result<()> {
@@ -829,6 +884,18 @@ impl Worker<'_> {
                     None,
                     &job.commit,
                 )?;
+                if let Some(checked) = &job.recheck {
+                    git::advance(
+                        self.paths,
+                        &self.config.common_git_dir,
+                        &git::result_ref(&job.id.0)?,
+                        None,
+                        &checked.commit,
+                    )?;
+                    job.resulting_commit = Some(checked.commit.clone());
+                    job.analyzed_commit.clone_from(&checked.analyzed);
+                    job.repaired_commit.clone_from(&checked.repaired);
+                }
                 git::ensure_worktree(
                     self.paths,
                     &self.config.common_git_dir,
@@ -837,7 +904,11 @@ impl Worker<'_> {
                 )?;
                 self.save(
                     job,
-                    if job.workflow.fix.is_some() && !job.runs.iter().any(|run| run.stage == "fix")
+                    if job.recheck.is_some() {
+                        Phase::Checking
+                    } else if !job.workflow.combined_release()
+                        && job.workflow.fix.is_some()
+                        && !job.runs.iter().any(|run| run.stage == "fix")
                     {
                         Phase::Fixing
                     } else if job.workflow.analyze.is_some()
@@ -855,6 +926,8 @@ impl Worker<'_> {
             Phase::Repairing => self.workflow_stage(job, "repair"),
             Phase::Composing => self.workflow_stage(job, "compose"),
             Phase::RepairingMerge => self.workflow_stage(job, "merge_repair"),
+            Phase::CheckingRelease => self.workflow_stage(job, "release_check"),
+            Phase::RepairingRelease => self.workflow_stage(job, "release_repair"),
             Phase::Preparing => self.workflow_stage(job, "prepare"),
             Phase::Merging => self.integrate(job),
             Phase::Deploying => self.workflow_stage(job, "deploy"),
@@ -904,6 +977,15 @@ impl Worker<'_> {
         {
             self.store.set("latest_finished_sequence", &sequence)?;
         }
+        for leader in jobs
+            .iter()
+            .filter(|job| job.phase == Phase::Failed && job.batch.is_some())
+        {
+            if self.store.release_report(&leader.id)?.is_none() {
+                let report = release_report::live_report(leader, &jobs)?;
+                self.store.save_release_report(&report)?;
+            }
+        }
         for mut job in jobs {
             if job.phase.terminal()
                 && !job.unresolved
@@ -913,7 +995,7 @@ impl Worker<'_> {
                 self.cleanup(&mut job)?;
             }
         }
-        Ok(())
+        self.prune_retry_inputs()
     }
 
     fn cleanup(&self, job: &mut Job) -> Result<()> {

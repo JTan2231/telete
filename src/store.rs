@@ -16,6 +16,15 @@ use crate::workflow::{StageRun, Workflow};
 const SCHEMA: u32 = 3;
 const COMPLETION_LIMIT: usize = 128;
 const APPLICATION: u32 = 0x5445_4c45;
+const STALE_RETRIES: &str = "SELECT substr(retry.key,7) AS release FROM control AS retry
+     WHERE retry.key LIKE 'retry:%'
+        AND NOT EXISTS (SELECT 1 FROM jobs
+            WHERE json_extract(data,'$.release_id') = substr(retry.key,7))
+        AND NOT EXISTS (SELECT 1 FROM control AS result
+            WHERE result.key LIKE 'result:%'
+            AND json_extract(result.value,'$.release_id') = substr(retry.key,7))
+        AND NOT EXISTS (SELECT 1 FROM jobs JOIN json_each(retry.value,'$.attempt')
+            ON jobs.id = json_each.value)";
 
 pub(crate) fn now() -> u64 {
     SystemTime::now()
@@ -89,6 +98,8 @@ pub(crate) enum Phase {
     WaitingRelease,
     Composing,
     RepairingMerge,
+    CheckingRelease,
+    RepairingRelease,
     Preparing,
     WaitingMerge,
     Merging,
@@ -115,6 +126,8 @@ impl Phase {
             Self::WaitingRelease => "waiting_release",
             Self::Composing => "composing",
             Self::RepairingMerge => "repairing_merge",
+            Self::CheckingRelease => "checking_release",
+            Self::RepairingRelease => "repairing_release",
             Self::Preparing => "preparing",
             Self::WaitingMerge => "waiting_merge",
             Self::Merging => "merging",
@@ -180,6 +193,57 @@ pub(crate) struct ReleaseBatch {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RecheckSource {
+    pub commit: CommitId,
+    pub analyzed: Option<CommitId>,
+    pub repaired: Option<CommitId>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RetryMember {
+    pub id: JobId,
+    pub commit: CommitId,
+    pub checked: Option<RecheckSource>,
+    pub workflow: Workflow,
+    pub development_worktree: Option<crate::git::DevelopmentWorktree>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ReleaseRetry {
+    pub base: CommitId,
+    pub members: Vec<RetryMember>,
+    pub attempt: Option<Vec<JobId>>,
+}
+
+impl ReleaseRetry {
+    pub(crate) fn leader_index(&self, leader: &JobId) -> Result<usize> {
+        self.members
+            .iter()
+            .position(|member| &member.id == leader)
+            .context("retry recipe has no release leader")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ReleaseFailure {
+    pub job: JobId,
+    pub stage: String,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ReleaseReport {
+    pub id: JobId,
+    pub phase: Phase,
+    pub members: Vec<JobId>,
+    pub candidate_commit: Option<CommitId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<JobId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ReleaseFailure>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 // Persist orthogonal facts independently of the phase: cancellation
 // and uncertain operations can coexist and must survive recovery.
@@ -202,6 +266,10 @@ pub(crate) struct Job {
     pub repaired_commit: Option<CommitId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_id: Option<JobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<JobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recheck: Option<RecheckSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<ReleaseBatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +296,10 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    pub(crate) fn next_stage_operation(&self, stage: &str) -> String {
+        format!("workflow-{stage}-{}", self.runs.len())
+    }
+
     pub(crate) fn effective_commit(&self) -> &CommitId {
         self.resulting_commit.as_ref().unwrap_or(&self.commit)
     }
@@ -267,99 +339,155 @@ impl Job {
                     batch.composition_head.as_ref().unwrap_or(&batch.base)
                 },
             )
-        } else if matches!(stage, "prepare" | "merge" | "deploy") {
+        } else if matches!(
+            stage,
+            "release_check" | "release_repair" | "prepare" | "merge" | "deploy"
+        ) {
             self.execution_commit()
         } else {
             self.effective_commit()
         }
     }
 
+    pub(crate) fn release_runs(&self) -> &[StageRun] {
+        self.runs
+            .iter()
+            .rposition(|run| run.stage == "compose")
+            .map_or(&[], |index| &self.runs[index + 1..])
+    }
+
+    fn stage_run(&self, stage: &str, active_composition: bool) -> Option<&StageRun> {
+        if active_composition {
+            return None;
+        }
+        let runs = if matches!(stage, "release_check" | "release_repair") {
+            self.release_runs()
+        } else {
+            &self.runs
+        };
+        runs.iter().rev().find(|run| {
+            run.stage == stage
+                && (matches!(stage, "repair" | "merge_repair" | "release_repair")
+                    || *self.stage_commit(stage) == run.commit)
+        })
+    }
+
+    fn stages(&self) -> [(&'static str, bool, Phase); 11] {
+        let workflow = &self.workflow;
+        let combined = workflow.combined_release();
+        let preliminary = !combined
+            || (self.retry_of.is_none()
+                && self
+                    .release_id
+                    .as_ref()
+                    .is_none_or(|leader| *leader == self.id));
+        [
+            ("fix", workflow.fix.is_some() && !combined, Phase::Fixing),
+            (
+                "analyze",
+                workflow.analyze.is_some() && preliminary,
+                Phase::Analyzing,
+            ),
+            ("check", preliminary, Phase::Checking),
+            (
+                "repair",
+                workflow.repair.is_some() && !combined,
+                Phase::Repairing,
+            ),
+            ("compose", self.batch.is_some(), Phase::Composing),
+            (
+                "merge_repair",
+                self.batch.is_some() && workflow.command("merge_repair").is_ok(),
+                Phase::RepairingMerge,
+            ),
+            (
+                "release_check",
+                self.batch.is_some() && combined,
+                Phase::CheckingRelease,
+            ),
+            (
+                "release_repair",
+                self.batch.is_some() && workflow.command("release_repair").is_ok(),
+                Phase::RepairingRelease,
+            ),
+            ("prepare", workflow.prepare.is_some(), Phase::Preparing),
+            ("merge", workflow.integration().is_some(), Phase::Merging),
+            ("deploy", workflow.deploy.is_some(), Phase::Deploying),
+        ]
+    }
+
     pub(crate) fn output(&self) -> Result<serde_json::Value> {
         let mut value = serde_json::to_value(self)?;
-        let workflow = &self.workflow;
         if self.resulting_commit.is_some() {
             value["result_ref"] = serde_json::json!(crate::git::result_ref(&self.id.0)?);
         }
         value["stages"] = serde_json::Value::Array(
-            [
-                ("fix", workflow.fix.is_some(), Phase::Fixing),
-                ("analyze", workflow.analyze.is_some(), Phase::Analyzing),
-                ("check", true, Phase::Checking),
-                ("repair", workflow.repair.is_some(), Phase::Repairing),
-                ("compose", self.batch.is_some(), Phase::Composing),
-                (
-                    "merge_repair",
-                    self.batch.is_some() && workflow.command("merge_repair").is_ok(),
-                    Phase::RepairingMerge,
-                ),
-                ("prepare", workflow.prepare.is_some(), Phase::Preparing),
-                ("merge", workflow.integration().is_some(), Phase::Merging),
-                ("deploy", workflow.deploy.is_some(), Phase::Deploying),
-            ]
-            .into_iter()
-            .filter(|(stage, requested, _)| {
-                !matches!(
-                    *stage,
-                    "analyze" | "repair" | "compose" | "merge_repair" | "merge"
-                ) || *requested
-            })
-            .map(|(stage, requested, phase)| {
-                let active = self
-                    .operation
-                    .as_ref()
-                    .is_some_and(|operation| operation.phase == phase)
-                    || self.phase == phase;
-                let stopped = self.stopped_phase == Some(phase);
-                let composing = matches!(stage, "compose" | "merge_repair");
-                let run = self.runs.iter().rev().find(|run| {
-                    run.stage == stage
-                        && !(composing && active)
-                        && (matches!(stage, "repair" | "merge_repair")
-                            || *self.stage_commit(stage) == run.commit)
-                });
-                let status = if !requested {
-                    "not_requested"
-                } else if (active || stopped) && self.unresolved {
-                    "unresolved"
-                } else if composing && active {
-                    "running"
-                } else if stage == "merge" && self.merged_commit.is_some() {
-                    "succeeded"
-                } else if stage == "merge" && self.phase == Phase::WaitingMerge {
-                    "waiting"
-                } else if matches!(stage, "repair" | "merge_repair")
-                    && stopped
-                    && self.outcome == Some(Phase::Failed)
-                {
-                    "failed"
-                } else if let Some(run) = run {
-                    if run.result.success() {
-                        "succeeded"
-                    } else if stage == "analyze"
-                        && self.repaired_commit.is_some()
-                        && self.resulting_commit.as_ref() == self.repaired_commit.as_ref()
-                    {
-                        "accepted_after_repair"
-                    } else {
-                        "failed"
-                    }
-                } else if stopped && self.outcome == Some(Phase::Failed) {
-                    "failed"
-                } else if active {
-                    "running"
-                } else if self.phase.terminal() || self.outcome.is_some() {
-                    "not_run"
-                } else {
-                    "pending"
-                };
-                serde_json::json!({
-                    "stage": stage,
-                    "status": status,
-                    "commit": run.map_or_else(|| self.stage_commit(stage), |run| &run.commit),
-                    "operation": run.map(|run| &run.operation),
+            self.stages()
+                .into_iter()
+                .filter(|(stage, requested, _)| {
+                    !matches!(
+                        *stage,
+                        "analyze"
+                            | "repair"
+                            | "compose"
+                            | "merge_repair"
+                            | "release_check"
+                            | "release_repair"
+                            | "merge"
+                    ) || *requested
                 })
-            })
-            .collect(),
+                .map(|(stage, requested, phase)| {
+                    let active = self
+                        .operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.phase == phase)
+                        || self.phase == phase;
+                    let stopped = self.stopped_phase == Some(phase);
+                    let composing = matches!(stage, "compose" | "merge_repair");
+                    let run = self.stage_run(stage, composing && active);
+                    let status = if !requested {
+                        "not_requested"
+                    } else if (active || stopped) && self.unresolved {
+                        "unresolved"
+                    } else if composing && active {
+                        "running"
+                    } else if stage == "merge" && self.merged_commit.is_some() {
+                        "succeeded"
+                    } else if stage == "merge" && self.phase == Phase::WaitingMerge {
+                        "waiting"
+                    } else if matches!(stage, "repair" | "merge_repair" | "release_repair")
+                        && stopped
+                        && self.outcome == Some(Phase::Failed)
+                    {
+                        "failed"
+                    } else if let Some(run) = run {
+                        if run.result.success() {
+                            "succeeded"
+                        } else if stage == "analyze"
+                            && self.repaired_commit.is_some()
+                            && self.resulting_commit.as_ref() == self.repaired_commit.as_ref()
+                        {
+                            "accepted_after_repair"
+                        } else {
+                            "failed"
+                        }
+                    } else if stopped && self.outcome == Some(Phase::Failed) {
+                        "failed"
+                    } else if active {
+                        "running"
+                    } else if self.phase.terminal() || self.outcome.is_some() {
+                        "not_run"
+                    } else {
+                        "pending"
+                    };
+                    serde_json::json!({
+                        "stage": stage,
+                        "status": status,
+                        "commit": run.map_or_else(|| self.stage_commit(stage), |run| &run.commit),
+                        "operation": run.map(|run| &run.operation),
+                    })
+                })
+                .collect(),
         );
         Ok(value)
     }
@@ -544,6 +672,13 @@ impl Store {
         }
     }
 
+    pub(crate) fn snapshot<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        let transaction = self.db.unchecked_transaction()?;
+        let result = read()?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub(crate) fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let value = self
             .db
@@ -561,6 +696,67 @@ impl Store {
             "INSERT INTO control VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, serde_json::to_string(value)?],
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn retry_recipe(&self, release: &JobId) -> Result<Option<ReleaseRetry>> {
+        self.get(&format!("retry:{release}"))
+    }
+
+    pub(crate) fn save_retry(&self, release: &JobId, retry: &ReleaseRetry) -> Result<()> {
+        self.set(&format!("retry:{release}"), retry)
+    }
+
+    pub(crate) fn retry_available(&self, release: &JobId) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM control WHERE key=?)",
+            [format!("retry:{release}")],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn release_retry(&self, release: &JobId) -> Result<Option<JobId>> {
+        let Some(recipe) = self.retry_recipe(release)? else {
+            return Ok(None);
+        };
+        let index = recipe.leader_index(release)?;
+        Ok(recipe.attempt.and_then(|ids| ids.get(index).cloned()))
+    }
+
+    pub(crate) fn has_stale_retries(&self) -> Result<bool> {
+        Ok(self.db.prepare(STALE_RETRIES)?.exists([])?)
+    }
+
+    /// Keep a recipe while an original receipt can address it, or while the
+    /// retry itself may still need its source pins before composition.
+    pub(crate) fn prune_retries(
+        &self,
+        mut unpin: impl FnMut(&JobId, &ReleaseRetry) -> Result<()>,
+    ) -> Result<()> {
+        let mut query = self.db.prepare(STALE_RETRIES)?;
+        let stale = query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in stale {
+            let release = JobId::new(id)?;
+            self.transaction(|| {
+                if !self
+                    .db
+                    .prepare(&format!("{STALE_RETRIES} AND retry.key=?"))?
+                    .exists([format!("retry:{release}")])?
+                {
+                    return Ok(());
+                }
+                if let Some(recipe) = self.retry_recipe(&release)? {
+                    unpin(&release, &recipe)?;
+                    self.db.execute(
+                        "DELETE FROM control WHERE key=?",
+                        [format!("retry:{release}")],
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 
@@ -725,6 +921,14 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn release_report(&self, id: &JobId) -> Result<Option<ReleaseReport>> {
+        self.get(&format!("release-report:{id}"))
+    }
+
+    pub(crate) fn save_release_report(&self, report: &ReleaseReport) -> Result<()> {
+        self.set(&format!("release-report:{}", report.id), report)
+    }
+
     /// Replace settled run details with a bounded completion signal. The caller
     /// first removes its checkout, logs, and any remaining run-owned files.
     pub(crate) fn retire(&self, job: &Job) -> Result<()> {
@@ -749,6 +953,9 @@ impl Store {
                 if let Some(id) = &job.release_id {
                     source["release_id"] = serde_json::json!(id);
                 }
+                if let Some(id) = &job.retry_of {
+                    source["retry_of"] = serde_json::json!(id);
+                }
                 if let Some(commit) = &job.release_commit {
                     source["release_commit"] = serde_json::json!(commit);
                 }
@@ -763,6 +970,13 @@ impl Store {
             self.db.execute("DELETE FROM jobs WHERE id=? AND revision=?", params![job.id.0,i64::try_from(job.revision)?])?;
             self.db.execute("DELETE FROM completions WHERE id IN (SELECT id FROM completions ORDER BY sequence DESC LIMIT -1 OFFSET ?)", [i64::try_from(COMPLETION_LIMIT)?])?;
             self.db.execute("DELETE FROM control WHERE key LIKE 'result:%' AND substr(key,8) NOT IN (SELECT id FROM completions)", [])?;
+            self.db.execute(
+                "DELETE FROM control AS report WHERE report.key LIKE 'release-report:%'
+                 AND NOT EXISTS (SELECT 1 FROM jobs WHERE json_extract(data,'$.release_id')=substr(report.key,16))
+                 AND NOT EXISTS (SELECT 1 FROM control AS result WHERE result.key LIKE 'result:%'
+                                 AND json_extract(result.value,'$.release_id')=substr(report.key,16))",
+                [],
+            )?;
             Ok(())
         })
     }
@@ -865,6 +1079,8 @@ mod tests {
             analyzed_commit: None,
             repaired_commit: None,
             release_id: None,
+            retry_of: None,
+            recheck: None,
             batch: None,
             release_commit: None,
             integration_base: None,

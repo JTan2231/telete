@@ -250,10 +250,11 @@ Telete builds the candidate in a private checkout using the destination branch
 and the checked source. Batched candidates include the preceding release source.
 If those two bases conflict, reconcile them before submitting again. The batch
 merge repair hook handles conflicts with checked members during composition.
-The configured preparation command runs on the candidate before the destination
-branch advances. If the branch has moved and still needs the candidate, Telete
-recomposes and prepares against the new tip. In manual mode, authorize the new
-candidate with `merge JOB`. If the destination checkout is dirty, commit or set
+The configured batch check and preparation commands run on the candidate before
+the destination branch advances. If the branch has moved and still needs the
+candidate, Telete recomposes against the new tip and repeats those commands.
+In manual mode, authorize the new candidate with `merge JOB`.
+If the destination checkout is dirty, commit or set
 aside the local edits, then run `merge JOB` to retry. Updates are local
 fast-forwards.
 
@@ -270,10 +271,10 @@ batch, the target's release ref still names its last successful deployment.
 
 ## Batch deployment requests
 
-Select `batch` to run each submitted change's individual fixes, analysis, and
-check, then combine compatible deployment requests into one release. A batch
-requires `deploy`. Preparation and deployment run once on the combined commit;
-Telete does not add another analysis or check.
+Select `batch` to combine compatible deployment requests into one release.
+A batch requires `deploy`. Set `batch.check` to validate the combined source
+before preparation and deployment. Set `batch.repair` to let one command
+repair the combined source if that check reports an ordinary failure.
 
 ```json
 {
@@ -286,7 +287,9 @@ Telete does not add another analysis or check.
     "target": "production",
     "base": "main",
     "compose": {"program": "ci/compose.sh"},
-    "merge_repair": {"program": "ci/merge-repair.sh"}
+    "merge_repair": {"program": "ci/merge-repair.sh"},
+    "check": {"program": "ci/release-check.sh"},
+    "repair": {"program": "ci/release-repair.sh"}
   }
 }
 ```
@@ -298,19 +301,26 @@ deployment, the next group uses that target's last successful release instead.
 Telete pins the submitted bootstrap base at `refs/telete/jobs/base-JOB` until
 request cleanup.
 Use the same target for commands that deploy to the same destination. Compatible
-requests have the same target, composition, merge repair, preparation,
-integration, deployment, and parameters. Individual fixes, analysis, and checks
-may differ.
+requests have the same target, composition, merge repair, batch check and
+repair, preparation, integration, deployment, and parameters. Individual fixes,
+analysis, and checks may differ.
 
-When the first member finishes its check, Telete closes the group over compatible
-requests already admitted to the queue. Those requests finish their individual
-CI before the shared release starts. An incompatible request for the same target
-closes that compatible segment; later compatible requests cannot jump ahead of
-it. Later submissions enter the next group,
-even if the first group has not deployed yet. A group waiting for members does
-not occupy the execution slot. A member awaiting repair keeps its group waiting
-while other CI can run. Telete does not silently omit failed members or let a
-later release for the same target overtake a pending one.
+With `batch.check`, the first member runs preliminary CI using its individual
+analysis and check commands. These commands are read-only for tracked source.
+The first successful check or ordinary analysis or check failure closes the
+group over compatible requests already admitted to the queue. Composition then
+uses each member's submitted commit. The other members proceed directly to the
+shared release, and source-changing repairs happen on the combined candidate.
+Without `batch.check`, each member runs its individual fixes, analysis, repair,
+and check as configured. The first successful check closes membership and the
+group waits for the other members to complete their own CI.
+
+An incompatible request for the same target closes the compatible segment.
+Later submissions enter the next group, even if the first group has not
+deployed yet. A group waiting for members does not occupy the execution slot.
+A member awaiting repair keeps its group waiting while other CI can run.
+Telete does not silently omit failed members or let a later release for the same
+target overtake a pending one.
 
 Cancelling any frozen member cancels the group at a safe boundary. Complete an
 interrupted repair handoff on any member before cancelling. A group with a
@@ -320,16 +330,19 @@ cancellation, preserving the repair evidence.
 The first ready job identifies the release. The configured `compose` command
 runs in its private checkout, starting at the group's release base. Its context
 contains `inputs.batch.base` and `inputs.batch.members` in queue order. Every
-member includes `job_id`, its final checked `commit`, `submitted_commit`,
-`analyzed_commit`, `repaired_commit`, and `parameters`. Project commands own the
-merge policy, conflicts, release identifiers, and package format.
+member includes `job_id`, its composition input `commit`, `submitted_commit`,
+`analyzed_commit`, `repaired_commit`, and `parameters`. The composition input
+is the submitted commit with `batch.check` and the individually checked commit
+otherwise. A combined-release composer can use the member parameters to select
+the systems to validate. Project commands own the merge policy, conflicts,
+release identifiers, and package format.
 
 The compose command must leave a clean, detached HEAD at the combined commit
 and write that full commit ID to `outputs.directory/commit`. The commit must
-descend from the release base and every member's checked source. Telete retains
-it at `refs/telete/releases/RELEASE` and prepares, integrates when enabled, and
-deploys that source. These ancestry checks establish which source was included.
-Configured commands own the release's domain success claims.
+descend from the release base and every member's composition input. Telete
+retains it at `refs/telete/releases/RELEASE`. These ancestry checks establish
+which source was included. Configured commands own the release's domain success
+claims.
 
 For example, a project using `jq` can make this `ci/compose.sh` executable and
 commit it in its base source:
@@ -349,29 +362,64 @@ git rev-parse HEAD > "$(jq -r '.outputs.directory' "$TELETE_CONTEXT")/commit"
 ### Repair a composition conflict
 
 Set `batch.merge_repair` to run a command when an ordinary nonzero `compose`
-exit leaves an unresolved Git merge of one checked member. The
+exit leaves an unresolved Git merge of one member. The
 command runs in the same checkout and reads the compose command's captured
 standard output followed by its standard error. Its context provides the
-pre-merge HEAD as `inputs.merge.head` and the checked member as
+pre-merge HEAD as `inputs.merge.head` and the member commit as
 `inputs.merge.member`.
 
 Resolve the conflict and commit the merge in that checkout. Leave a clean
 tracked tree at detached HEAD. The merge commit must have exactly two parents,
-in order: the pre-merge HEAD and the checked member. Telete runs `compose` again
+in order: the pre-merge HEAD and the member commit. Telete runs `compose` again
 from the repaired HEAD with a new execution identity and preserves the completed
 member checks. Make the compose command continue from its current HEAD. Another
 member conflict can invoke the hook again. A known hook failure or an invalid
 merge commit fails the release.
 
+### Check and repair the combined candidate
+
+The `batch.check` command runs at stage `release_check` on the composed
+candidate. It receives that commit as `source.commit` and the frozen
+`inputs.batch.members` list. Include any analysis, tests, or builds required to
+validate that candidate. The command must preserve the selected commit and
+tracked source.
+
+When the check exits with an ordinary failure and `batch.repair` is configured,
+Telete runs that command at stage `release_repair` in the same checkout. The
+failed check's captured stdout followed by stderr arrives on standard input.
+The repair must leave a clean tracked tree at detached HEAD with a new commit
+descended from the failed candidate. Telete retains that commit as the candidate
+and runs the batch check again. Each composition permits one repair. A passing
+check is required before preparing the selected commit. Any project manifest
+that records the candidate SHA must account for source changes made by repair.
+
 ### Observe the release
 
-Status distinguishes each member's checked source from `release_commit`, and
+Status distinguishes each member's source from `release_commit`, and
 `release_id` links members to their shared outcome. Members wait in
 `waiting_release` with the leader's `release_phase`. The leader runs `composing`,
-optionally `repairing_merge`, then preparation, integration when enabled, and
-deployment.
+optionally `repairing_merge`, then any `checking_release` and `repairing_release`,
+preparation, integration when enabled, and deployment.
 `wait` and `submit --follow` observe the requested deployment through that shared
 outcome. Individual submitted, analyzed, and repaired identities remain intact.
+The `release` object in job status includes the frozen members, shared phase,
+candidate commit when available, and any blocker or next action. For a job
+action such as `merge`, `repair`, or `recover`, `release.blocker.job`
+identifies the job to act on. Queue-wide status lists live shared releases
+under `releases`. A failure summary records the failing job, stage, and reason.
+Its diagnostic path is available while the log is retained.
+
+Run `telete --config telete.json retry JOB` with any member ID to queue a new
+attempt of a known failed release. The receipt links each new job to its original
+member. Repeating the request from any original member returns the same
+attempt. If that attempt fails, use one of its member IDs to retry it.
+The retry includes the frozen membership and composes against the
+release base and integration branch selected when it runs. With combined CI it
+uses the original submitted commits. A retry of individual CI regenerates
+check outputs for previously checked members from their checked commits, and
+runs CI for any member without a passing check. Private analysis and fix outputs
+from the old attempt are subject to normal cleanup. A failure from an older
+Telete worker may lack enough retained input to retry.
 
 A successful composition is required for deployment. The existing cancellation
 and command recovery rules apply to release work. Missing terminal evidence
@@ -379,11 +427,13 @@ never authorizes replay. Release refs survive checkout cleanup, and
 `refs/telete/releases/targets/TARGET` retains the latest confirmed release source.
 Successful completion markers preserve the checked, merged, and shared release
 identities when present. A shared failure retains the leader and actual failed-member
-diagnostics until a newer workflow succeeds or fails. Preserve durable packages and
-release records in project outputs.
+diagnostics until a newer workflow succeeds or fails. Bounded settled receipts
+retain the shared failure summary and retry information. Preserve durable
+packages and release records in project outputs.
 
 Telete 0.5 reads earlier queue records. Let a 0.4 worker settle before submitting
 batched workflows, and keep 0.5 or later while batching records remain.
+Let an earlier worker settle before using batch checks or release retries.
 
 ## Command results and context
 
@@ -410,7 +460,8 @@ analysis, repair, or batching,
 names the retained result. `source.commit` identifies the submitted source in
 the fix command and the resulting source in later individual commands.
 Composition selects the starting HEAD. Merge repair selects the pre-merge HEAD.
-Preparation and deployment select the combined release source.
+Batch check and repair, preparation, and deployment select the combined release
+source.
 `source.checked_commit` preserves the individual source for batched commands
 and for integrated preparation and deployment. `source.release_id` identifies
 a frozen group.
@@ -428,7 +479,7 @@ identifies the accepted repair and `source.commit` selects that source for every
 later command. `inputs.analysis` is null during analysis and names its output
 directory in later stages. Analysis outputs remain available after agent repair.
 
-Standard input is closed except during automatic repair and merge repair.
+Standard input is closed except during automatic, batch, and merge repair.
 A known terminal exit remains known if output collection fails. Collection
 failure is a separate observation.
 A program that fails to start has a recorded start-error result. Neither failure

@@ -45,7 +45,7 @@ pub(crate) fn request_merge(paths: &Paths, id: &str) -> Result<Value> {
             leader.id
         );
     }
-    super::job_status(&store, &leader.id.0)
+    super::job_status(paths, &store, &leader.id.0)
 }
 
 impl Worker<'_> {
@@ -115,6 +115,7 @@ impl Worker<'_> {
     }
 
     pub(super) fn integrate(&self, job: &mut Job) -> Result<()> {
+        Self::confirm_release_check(job)?;
         let destination = job
             .workflow
             .integration()

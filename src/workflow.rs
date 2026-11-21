@@ -92,6 +92,10 @@ pub(crate) struct BatchConfig {
     pub compose: WorkflowCommand,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_repair: Option<WorkflowCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<WorkflowCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<WorkflowCommand>,
 }
 
 impl BatchConfig {
@@ -113,6 +117,13 @@ impl BatchConfig {
         self.compose.validate("compose")?;
         if let Some(command) = &self.merge_repair {
             command.validate("merge_repair")?;
+        }
+        if let Some(command) = &self.check {
+            command.validate("batch.check")?;
+        }
+        if let Some(command) = &self.repair {
+            ensure!(self.check.is_some(), "batch.repair requires batch.check");
+            command.validate("batch.repair")?;
         }
         Ok(())
     }
@@ -172,6 +183,12 @@ pub(crate) struct Workflow {
 }
 
 impl Workflow {
+    pub(crate) fn combined_release(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|batch| batch.check.is_some())
+    }
+
     pub(crate) fn integration(&self) -> Option<&IntegrationConfig> {
         self.integration
             .as_ref()
@@ -197,6 +214,16 @@ impl Workflow {
                 .as_ref()
                 .and_then(|batch| batch.merge_repair.as_ref())
                 .context("merge repair not selected"),
+            "release_check" => self
+                .batch
+                .as_ref()
+                .and_then(|batch| batch.check.as_ref())
+                .context("release check not selected"),
+            "release_repair" => self
+                .batch
+                .as_ref()
+                .and_then(|batch| batch.repair.as_ref())
+                .context("release repair not selected"),
             "prepare" => self.prepare.as_ref().context("preparation not selected"),
             "deploy" => self.deploy.as_ref().context("deployment not selected"),
             _ => bail!("unknown workflow stage"),

@@ -1,4 +1,4 @@
-//! A closed group of checked sources shares preparation and deployment.
+//! A closed group shares composition and deployment.
 
 use super::{CommitId, Context, Job, Phase, Result, Worker, ensure, git, json, store};
 use crate::store::{MergeConflict, ReleaseBatch};
@@ -9,6 +9,8 @@ fn compatible(left: &Job, right: &Job) -> bool {
             left_batch.target == right_batch.target
                 && left_batch.compose == right_batch.compose
                 && left_batch.merge_repair == right_batch.merge_repair
+                && left_batch.check == right_batch.check
+                && left_batch.repair == right_batch.repair
                 && left.workflow.prepare == right.workflow.prepare
                 && left.workflow.deploy == right.workflow.deploy
                 && left.workflow.integration() == right.workflow.integration()
@@ -20,7 +22,10 @@ fn compatible(left: &Job, right: &Job) -> bool {
 
 impl Worker<'_> {
     pub(super) fn defer_release(&self, job: &mut Job) -> Result<()> {
-        self.retain_checked(job)?;
+        let combined = job.workflow.combined_release();
+        if !combined {
+            self.retain_checked(job)?;
+        }
         let _admission = store::lock(&self.paths.root.join("admission.lock"), true)?;
         let global = job.shared_order.is_some();
         let mut defer = |order| {
@@ -52,7 +57,10 @@ impl Worker<'_> {
                         {
                             continue;
                         }
-                        if member.release_id.is_some() || !compatible(job, &member) {
+                        if member.release_id.is_some()
+                            || !compatible(job, &member)
+                            || (combined && member.id != job.id && member.phase != Phase::Queued)
+                        {
                             if candidates.iter().any(|member: &Job| member.id == job.id) {
                                 break;
                             }
@@ -68,6 +76,9 @@ impl Worker<'_> {
                         } else {
                             members.push(member.id.clone());
                             member.release_id = Some(job.id.clone());
+                            if combined {
+                                member.phase = Phase::WaitingRelease;
+                            }
                             self.store.save(&mut member)?;
                         }
                     }
@@ -107,48 +118,69 @@ impl Worker<'_> {
         }
     }
 
-    /// Closed membership never grows while the selected jobs finish their CI.
+    pub(super) fn earlier_release_job<'a>(
+        jobs: &'a [Job],
+        leader: &Job,
+    ) -> Result<Option<&'a Job>> {
+        let selected = leader
+            .workflow
+            .batch
+            .as_ref()
+            .context("batch not selected")?;
+        Ok(jobs.iter().find(|job| {
+            job.sequence < leader.sequence
+                && !job.phase.terminal()
+                && job.release_id.as_ref() != Some(&leader.id)
+                && job
+                    .workflow
+                    .batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.target == selected.target)
+        }))
+    }
+
+    pub(super) fn unready_release_member<'a>(
+        jobs: &'a [Job],
+        leader: &Job,
+    ) -> Result<Option<&'a Job>> {
+        let batch = leader.batch.as_ref().context("release has no membership")?;
+        let combined = leader.workflow.combined_release();
+        let mut first_unready = None;
+        for id in &batch.members {
+            let job = jobs
+                .iter()
+                .find(|job| job.id == *id)
+                .context("pending release lost a member")?;
+            let ready = job.phase == Phase::WaitingRelease
+                && !job.cancel_requested
+                && (combined
+                    || job.runs.iter().any(|run| {
+                        run.stage == "check"
+                            && run.commit == *job.effective_commit()
+                            && run.result.success()
+                    }));
+            if !ready {
+                if matches!(job.phase, Phase::AwaitingRepair | Phase::Blocked) {
+                    return Ok(Some(job));
+                }
+                first_unready.get_or_insert(job);
+            }
+        }
+        Ok(first_unready)
+    }
+
+    /// Closed membership never grows while the release waits for its turn.
     pub(super) fn ready_releases(jobs: &[Job]) -> Result<Vec<Job>> {
         let mut releases = Vec::new();
         for mut leader in jobs.iter().filter(|job| job.batch.is_some()).cloned() {
-            if leader.phase != Phase::WaitingRelease {
-                continue;
-            }
-            let selected = leader
-                .workflow
-                .batch
-                .as_ref()
-                .context("batch not selected")?;
-            let earlier = jobs.iter().any(|job| {
-                job.sequence < leader.sequence
-                    && !job.phase.terminal()
-                    && job.release_id.as_ref() != Some(&leader.id)
-                    && job
-                        .workflow
-                        .batch
-                        .as_ref()
-                        .is_some_and(|batch| batch.target == selected.target)
-            });
-            if earlier {
+            if leader.phase != Phase::WaitingRelease
+                || Self::earlier_release_job(jobs, &leader)?.is_some()
+                || Self::unready_release_member(jobs, &leader)?.is_some()
+            {
                 continue;
             }
             let batch = leader.batch.as_ref().context("release has no membership")?;
-            let ready = batch.members.iter().all(|id| {
-                jobs.iter().any(|job| {
-                    job.id == *id
-                        && job.phase == Phase::WaitingRelease
-                        && !job.cancel_requested
-                        && job.runs.iter().any(|run| {
-                            run.stage == "check"
-                                && run.commit == *job.effective_commit()
-                                && run.result.success()
-                        })
-                })
-            });
-            if !ready {
-                continue;
-            }
-            // The last member to finish makes composition ready at its turn.
+            // Use the latest ticket from preliminary CI or individual CI.
             leader.shared_order = jobs
                 .iter()
                 .filter(|member| batch.members.contains(&member.id))
@@ -204,6 +236,7 @@ impl Worker<'_> {
 
     pub(super) fn batch_input(&self, job: &Job) -> Result<serde_json::Value> {
         let batch = job.batch.as_ref().context("release has no membership")?;
+        let combined = job.workflow.combined_release();
         let mut members = Vec::new();
         for id in &batch.members {
             let member = self.store.job(&id.0)?;
@@ -213,7 +246,7 @@ impl Worker<'_> {
             );
             members.push(json!({
                 "job_id": member.id,
-                "commit": member.effective_commit(),
+                "commit": if combined { &member.commit } else { member.effective_commit() },
                 "submitted_commit": member.commit,
                 "analyzed_commit": member.analyzed_commit,
                 "repaired_commit": member.repaired_commit,
@@ -264,6 +297,53 @@ impl Worker<'_> {
             .context("release has no membership")?
             .commit = Some(commit.clone());
         job.release_commit = Some(commit);
+        Ok(())
+    }
+
+    pub(super) fn retain_release_repair(&self, job: &mut Job) -> Result<()> {
+        let checkout = self.worktree(job);
+        let previous = job
+            .release_commit
+            .as_ref()
+            .context("release has no source")?;
+        let batch = job.batch.as_mut().context("release has no membership")?;
+        ensure!(
+            batch.commit.as_ref() == Some(previous),
+            "release source changed"
+        );
+        let commit = git::commit(self.paths, &checkout, "HEAD")?;
+        ensure!(&commit != previous, "release repair requires a new commit");
+        ensure!(
+            git::merge_head(self.paths, &checkout)?.is_none(),
+            "release repair left a merge in progress"
+        );
+        git::retain_release(
+            self.paths,
+            &self.config.common_git_dir,
+            &checkout,
+            &job.id.0,
+            [previous],
+            Some(previous),
+            &commit,
+        )?;
+        batch.commit = Some(commit.clone());
+        job.release_commit = Some(commit);
+        Ok(())
+    }
+
+    pub(super) fn confirm_release_check(job: &Job) -> Result<()> {
+        if job.workflow.combined_release() {
+            let candidate = job
+                .release_commit
+                .as_ref()
+                .context("release has no source")?;
+            ensure!(
+                job.release_runs().iter().any(|run| {
+                    run.stage == "release_check" && run.commit == *candidate && run.result.success()
+                }),
+                "release source {candidate} has no successful check"
+            );
+        }
         Ok(())
     }
 
@@ -348,6 +428,19 @@ impl Worker<'_> {
         )
     }
 
+    pub(super) fn can_settle_release_member(job: &Job) -> bool {
+        !job.unresolved
+            && job.operation.is_none()
+            && (job.phase.terminal()
+                || matches!(
+                    job.phase,
+                    Phase::WaitingRelease
+                        | Phase::Queued
+                        | Phase::AwaitingRepair
+                        | Phase::WaitingMerge
+                ))
+    }
+
     pub(super) fn settle_releases(&self) -> Result<()> {
         for mut leader in self
             .store
@@ -366,18 +459,10 @@ impl Worker<'_> {
                 }
             }
             // Never settle other members around an uncertain or active command.
-            if members.iter().any(|job| {
-                job.unresolved
-                    || job.operation.is_some()
-                    || (!job.phase.terminal()
-                        && !matches!(
-                            job.phase,
-                            Phase::WaitingRelease
-                                | Phase::Queued
-                                | Phase::AwaitingRepair
-                                | Phase::WaitingMerge
-                        ))
-            }) {
+            if members
+                .iter()
+                .any(|job| !Self::can_settle_release_member(job))
+            {
                 continue;
             }
             if !leader.phase.terminal() {
@@ -411,6 +496,7 @@ impl Worker<'_> {
             // Publish all receipts together; cleanup cannot prune a dependency
             // before every member has its shared outcome.
             self.store.transaction(|| {
+                self.retain_failed_release(&leader, &members)?;
                 for mut member in members {
                     if member.id == leader.id || member.phase.terminal() {
                         continue;

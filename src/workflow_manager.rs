@@ -48,16 +48,20 @@ impl Worker<'_> {
                 .context("merge repair has no conflict")?;
             inputs["merge"] = json!(conflict);
         }
-        let stdin = if matches!(stage, "repair" | "merge_repair") {
+        let stdin = if matches!(stage, "repair" | "merge_repair" | "release_repair") {
             let failed = job
                 .runs
                 .last()
                 .context("repair has no triggering failure")?;
-            let matches_stage = if stage == "merge_repair" {
-                failed.stage == "compose"
-            } else {
-                matches!(failed.stage.as_str(), "analyze" | "check")
-                    && failed.commit == *job.effective_commit()
+            let matches_stage = match stage {
+                "merge_repair" => failed.stage == "compose",
+                "release_repair" => {
+                    failed.stage == "release_check" && failed.commit == *job.execution_commit()
+                }
+                _ => {
+                    matches!(failed.stage.as_str(), "analyze" | "check")
+                        && failed.commit == *job.effective_commit()
+                }
             };
             ensure!(
                 matches_stage && !failed.result.success(),
@@ -103,6 +107,8 @@ impl Worker<'_> {
             Phase::Repairing => "repair",
             Phase::Composing => "compose",
             Phase::RepairingMerge => "merge_repair",
+            Phase::CheckingRelease => "release_check",
+            Phase::RepairingRelease => "release_repair",
             Phase::Preparing => "prepare",
             Phase::Deploying => "deploy",
             _ => bail!("workflow operation has another phase"),
@@ -151,7 +157,10 @@ impl Worker<'_> {
 
     pub(super) fn workflow_stage(&self, job: &mut Job, stage: &str) -> Result<()> {
         if (stage == "analyze" && job.analyzed_commit.is_none())
-            || (stage == "check" && job.workflow.repair.is_some() && job.resulting_commit.is_none())
+            || (stage == "check"
+                && !job.workflow.combined_release()
+                && job.workflow.repair.is_some()
+                && job.resulting_commit.is_none())
         {
             let commit = job.effective_commit().clone();
             crate::git::advance(
@@ -170,15 +179,31 @@ impl Worker<'_> {
         if stage == "repair" && job.operation.is_none() {
             crate::git::ensure_detached(self.paths, &self.worktree(job))?;
         }
+        if matches!(stage, "release_check" | "release_repair") {
+            let candidate = job
+                .release_commit
+                .as_ref()
+                .context("release has no source")?;
+            if job.operation.is_none() {
+                let checkout = self.worktree(job);
+                crate::git::ensure_detached(self.paths, &checkout)?;
+                crate::git::unchanged(self.paths, &checkout, candidate)?;
+            }
+        }
         if !matches!(stage, "fix" | "analyze" | "check" | "repair") {
             ensure!(
-                job.runs
-                    .iter()
-                    .any(|run| run.stage == "check" && run.result.success()),
+                (job.workflow.combined_release() && job.batch.is_some())
+                    || job
+                        .runs
+                        .iter()
+                        .any(|run| run.stage == "check" && run.result.success()),
                 "workflow has no successful check"
             );
         }
-        let operation = format!("workflow-{stage}-{}", job.runs.len());
+        if matches!(stage, "prepare" | "deploy") {
+            Self::confirm_release_check(job)?;
+        }
+        let operation = job.next_stage_operation(stage);
         let result_path = self.directory(job)?.join(format!("{operation}.json"));
         let command = self.workflow_command(job, stage, &operation)?;
         let request = invocation::directory(self.paths, job, &operation)?.join("request.json");
@@ -229,12 +254,15 @@ impl Worker<'_> {
 
     fn complete_stage(&self, job: &mut Job, stage: &str, run: StageRun) -> Result<()> {
         let success = run.result.success();
+        let combined_check = job.workflow.combined_release()
+            && matches!(stage, "analyze" | "check" | "release_check");
         let ordinary_failure = run
             .result
             .exit_code
             .is_some_and(|code| code != 0 && run.result.exited_with(&[code]));
         let repairable = (stage == "analyze"
             || (stage == "check"
+                && job.recheck.is_none()
                 && (job.workflow.analyze.is_some() || job.workflow.repair.is_some())))
             && ordinary_failure;
         store::atomic_bytes(
@@ -248,6 +276,9 @@ impl Worker<'_> {
         job.operation = None;
         if stage == "merge_repair" {
             return self.complete_merge_repair(job, run);
+        }
+        if stage == "release_repair" {
+            return self.complete_release_repair(job, run);
         }
         if stage == "fix" {
             job.resulting_commit = Some(crate::git::retain_fixes(
@@ -267,9 +298,15 @@ impl Worker<'_> {
             || job.workflow.integration().is_some()
         {
             crate::git::unchanged(self.paths, &self.worktree(job), job.execution_commit())?;
+            if combined_check {
+                crate::git::ensure_detached(self.paths, &self.worktree(job))?;
+            }
         }
         job.runs.push(run);
         job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
+        if combined_check {
+            return self.complete_combined_check(job, stage, success, ordinary_failure);
+        }
         if stage == "compose"
             && ordinary_failure
             && !job.cancel_requested
@@ -294,12 +331,7 @@ impl Worker<'_> {
             return self.save(job, Phase::AwaitingRepair);
         }
         if !success {
-            return self.finish(
-                job,
-                Phase::Failed,
-                format!("Workflow {stage} failed for {}", job.effective_commit()),
-                false,
-            );
+            return self.fail_workflow_stage(job, stage);
         }
         // A successful deployment is the cumulative base even if cancellation
         // was requested while that command was already running.
@@ -315,6 +347,49 @@ impl Worker<'_> {
             );
         }
         self.advance_workflow(job, stage)
+    }
+
+    fn complete_combined_check(
+        &self,
+        job: &mut Job,
+        stage: &str,
+        success: bool,
+        ordinary_failure: bool,
+    ) -> Result<()> {
+        if job.cancel_requested {
+            return self.finish(
+                job,
+                Phase::Cancelled,
+                format!("Cancelled after {stage} settled"),
+                false,
+            );
+        }
+        if success {
+            return self.advance_workflow(job, stage);
+        }
+        if ordinary_failure {
+            if stage != "release_check" {
+                return self.defer_release(job);
+            }
+            if job.workflow.command("release_repair").is_ok()
+                && !job
+                    .release_runs()
+                    .iter()
+                    .any(|run| run.stage == "release_repair")
+            {
+                return self.save(job, Phase::RepairingRelease);
+            }
+        }
+        self.fail_workflow_stage(job, stage)
+    }
+
+    fn fail_workflow_stage(&self, job: &mut Job, stage: &str) -> Result<()> {
+        self.finish(
+            job,
+            Phase::Failed,
+            format!("Workflow {stage} failed for {}", job.execution_commit()),
+            false,
+        )
     }
 
     fn advance_workflow(&self, job: &mut Job, stage: &str) -> Result<()> {
@@ -337,7 +412,11 @@ impl Worker<'_> {
         if stage == "check" && job.workflow.integration().is_some() {
             return self.compose_single(job);
         }
-        if matches!(stage, "check" | "compose") && job.workflow.prepare.is_some() {
+        if stage == "compose" && job.workflow.combined_release() {
+            return self.save(job, Phase::CheckingRelease);
+        }
+        if matches!(stage, "check" | "compose" | "release_check") && job.workflow.prepare.is_some()
+        {
             return self.save(job, Phase::Preparing);
         }
         if stage != "deploy" && job.workflow.deploy.is_some() {
@@ -369,6 +448,27 @@ impl Worker<'_> {
         ensure!(success, "Workflow merge repair failed");
         self.accept_merge_repair(job)?;
         self.save(job, Phase::Composing)
+    }
+
+    fn complete_release_repair(&self, job: &mut Job, run: StageRun) -> Result<()> {
+        let success = run.result.success();
+        job.runs.push(run);
+        job.cancel_requested = self.store.job(&job.id.0)?.cancel_requested;
+        if job.cancel_requested {
+            return self.finish(
+                job,
+                Phase::Cancelled,
+                "Cancelled after release repair settled".into(),
+                false,
+            );
+        }
+        ensure!(
+            success,
+            "Workflow release repair failed for {}",
+            job.execution_commit()
+        );
+        self.retain_release_repair(job)?;
+        self.save(job, Phase::CheckingRelease)
     }
 
     fn complete_repair(&self, job: &mut Job, run: StageRun) -> Result<()> {
