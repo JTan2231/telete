@@ -49,6 +49,10 @@ pub(crate) struct Slot {
 
 impl Queue {
     pub(crate) fn open(create: bool) -> Result<Option<Self>> {
+        #[cfg(feature = "scenario-tests")]
+        if let Some(root) = std::env::var_os("TELETE_TEST_SHARED_QUEUE") {
+            return Self::at(PathBuf::from(root), create);
+        }
         Self::at(
             account_home()?.join("Library/Application Support/Telete/shared-queue"),
             create,

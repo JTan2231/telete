@@ -11,6 +11,15 @@ use git2::{Oid, Repository};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "cli/operations.rs"]
+mod operations;
+#[path = "cli/recovery.rs"]
+mod recovery;
+#[path = "cli/releases.rs"]
+mod releases;
+#[cfg(feature = "scenario-tests")]
+#[path = "cli/scheduling.rs"]
+mod scheduling;
 #[path = "support/mod.rs"]
 mod test_support;
 
@@ -22,6 +31,7 @@ struct Project {
     repo: PathBuf,
     state: PathBuf,
     commit: String,
+    shared_queue: Option<PathBuf>,
 }
 
 impl Project {
@@ -41,11 +51,15 @@ impl Project {
             repo,
             state,
             commit,
+            shared_queue: None,
         })
     }
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_telete"));
+        if let Some(root) = &self.shared_queue {
+            command.env("TELETE_TEST_SHARED_QUEUE", root);
+        }
         command
             .current_dir(&self.root)
             .args(["--json", "--config", "telete.json"])
@@ -418,42 +432,38 @@ fn concurrent_first_submissions_publish_one_complete_queue() -> TestResult {
     Ok(())
 }
 
-fn batch_release_workflow(project: &Project) -> TestResult {
+fn batch_release_workflow(project: &Project) -> TestResult<Value> {
     let checked_sources = project.root.join("checked");
     let compositions = project.root.join("compositions");
     let prepared = project.root.join("prepared");
     let deployments = project.root.join("deployments");
     let test_executable = std::env::current_exe()?;
     let fixture_args = test_support::workflow_args();
-    fs::write(
-        project.root.join("telete.json"),
-        serde_json::to_vec(&json!({
-            "repo":"repo", "state":"state", "queue":"repository",
-            "check": {
-                "program":"/usr/bin/python3", "timeout_seconds":15,
-                "args":["-c", r"import json,os; c=json.load(open(os.environ['TELETE_CONTEXT'])); open(os.environ['CHECKED'],'a').write(c['source']['commit']+'\n')"],
-                "env":{"CHECKED":checked_sources}
-            },
-            "batch": {
-                "target":"production", "base":project.commit,
-                "compose": {
-                    "program":test_executable, "timeout_seconds":15,
-                    "args":fixture_args, "env":{"FIXTURE_ACTION":"compose", "COMPOSED":compositions}
-                }
-            },
-            "prepare": {
-                "program":"/usr/bin/python3", "timeout_seconds":15,
-                "args":["-c", r"import json,os,pathlib; c=json.load(open(os.environ['TELETE_CONTEXT'])); pathlib.Path(os.environ['PREPARED']).write_text(c['source']['commit'])"],
-                "env":{"PREPARED":prepared}
-            },
-            "deploy": {
+    Ok(json!({
+        "repo":"repo", "state":"state", "queue":"repository",
+        "check": {
+            "program":"/usr/bin/python3", "timeout_seconds":15,
+            "args":["-c", r"import json,os; c=json.load(open(os.environ['TELETE_CONTEXT'])); open(os.environ['CHECKED'],'a').write(c['source']['commit']+'\n')"],
+            "env":{"CHECKED":checked_sources}
+        },
+        "batch": {
+            "target":"production", "base":project.commit,
+            "compose": {
                 "program":test_executable, "timeout_seconds":15,
-                "args":fixture_args,
-                "env":{"FIXTURE_ACTION":"batch_deploy","DEPLOYED":deployments,"PREPARED":prepared,"DEVELOPMENT":project.root,"REPO":project.repo}
+                "args":fixture_args, "env":{"FIXTURE_ACTION":"compose", "COMPOSED":compositions}
             }
-        }))?,
-    )?;
-    Ok(())
+        },
+        "prepare": {
+            "program":"/usr/bin/python3", "timeout_seconds":15,
+            "args":["-c", r"import json,os,pathlib; c=json.load(open(os.environ['TELETE_CONTEXT'])); pathlib.Path(os.environ['PREPARED']).write_text(c['source']['commit'])"],
+            "env":{"PREPARED":prepared}
+        },
+        "deploy": {
+            "program":test_executable, "timeout_seconds":15,
+            "args":fixture_args,
+            "env":{"FIXTURE_ACTION":"batch_deploy","DEPLOYED":deployments,"PREPARED":prepared,"DEVELOPMENT":project.root,"REPO":project.repo}
+        }
+    }))
 }
 
 #[test]
@@ -516,7 +526,11 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
     let checked_sources = project.root.join("checked");
     let compositions = project.root.join("compositions");
     let deployments = project.root.join("deployments");
-    batch_release_workflow(&project)?;
+    let mut workflow = batch_release_workflow(&project)?;
+    fs::write(
+        project.root.join("telete.json"),
+        serde_json::to_vec(&workflow)?,
+    )?;
     create_branch(&project.repo, "previous-release")?;
     let previous = commit_file(&project.repo, "previous.txt", "previous release")?;
     Repository::open(&project.repo)?.reference(
@@ -530,7 +544,6 @@ fn background_worker_batches_divergent_changes_into_one_release_then_stops() -> 
     checked(project.command(&["pause"]))?;
     let mut commits = Vec::new();
     let mut ids = Vec::new();
-    let mut workflow: Value = serde_json::from_slice(&fs::read(project.root.join("telete.json"))?)?;
     for name in ["change-a", "change-b"] {
         checked(project.command(&["worktree", name]))?;
         let worktree = project.root.join(name);

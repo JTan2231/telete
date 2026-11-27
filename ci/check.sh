@@ -8,7 +8,7 @@ telete_tmp=${TMPDIR:-/tmp}
 TMPDIR=$(CDPATH= cd -- "$telete_tmp" && pwd -P)
 export TMPDIR
 cargo fmt --all --check
-cargo clippy --locked -p telete --all-targets -- -D warnings -D clippy::all -D clippy::pedantic
+cargo clippy --locked -p telete --features scenario-tests --all-targets -- -D warnings -D clippy::all -D clippy::pedantic
 # The inherited-lock fixtures must not share a process with concurrent tests.
-cargo test --locked -p telete -- --test-threads=1
+cargo test --locked -p telete --features scenario-tests -- --test-threads=1
 cargo build --locked --bin telete

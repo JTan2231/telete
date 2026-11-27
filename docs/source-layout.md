@@ -21,7 +21,11 @@ to `.telete/` for runtime state. `ci/check.sh` runs formatting, Clippy, tests, a
 CLI build. After checks succeed, `ci/install.sh` builds the release binary and
 installs it and the manual under `~/.local/`, or a selected `--prefix`. The same
 installer supports bootstrapping directly. The tests under `src/` check queue
-and execution behavior.
+and execution behavior. Run the full suite with
+`cargo test --locked --features scenario-tests -- --test-threads=1`.
+The cross-repository CLI scenario uses this test feature to give its workers
+a shared scheduler in a temporary directory, including when CI itself already
+holds the account's execution slot.
 
 `Cargo.toml` owns the package version. Before committing a release,
 `ci/bump-version.sh [patch|minor|major]` updates that version, its lockfile entry,
